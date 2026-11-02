@@ -1,0 +1,6 @@
+{
+  "name": "Hub — Панель управления скриптами и ботами",
+  "description": "Легковесная автономная веб-панель управления фоновыми сервисами (services) и периодическими задачами (jobs) для Ubuntu 24.04 chroot на Android.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

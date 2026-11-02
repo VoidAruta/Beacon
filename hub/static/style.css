@@ -1,0 +1,68 @@
+/* Стили автономной панели Hub (/opt/hub/hub/static/style.css) */
+:root {
+  --bg-canvas: #0f172a;
+  --bg-surface: #1e293b;
+  --bg-elevated: #0b1120;
+  --border-subtle: #334155;
+  --text-primary: #f8fafc;
+  --text-secondary: #94a3b8;
+  --accent-indigo: #6366f1;
+  --accent-emerald: #10b981;
+  --accent-amber: #f59e0b;
+  --accent-danger: #ef4444;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background-color: var(--bg-canvas);
+  color: var(--text-primary);
+  font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  line-height: 1.5;
+}
+
+.font-mono, .tabular-nums {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.cm-editor-wrapper {
+  position: relative;
+  display: flex;
+  height: 100%;
+  min-height: 360px;
+  background: #0b1120;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.cm-gutter {
+  width: 48px;
+  padding: 12px 8px;
+  background: #090d16;
+  color: #475569;
+  text-align: right;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  user-select: none;
+  border-right: 1px solid #1e293b;
+}
+
+.cm-textarea {
+  flex: 1;
+  background: transparent;
+  color: #e2e8f0;
+  border: none;
+  outline: none;
+  padding: 12px 14px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  resize: none;
+  tab-size: 4;
+}
