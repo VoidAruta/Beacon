@@ -150,9 +150,10 @@ def _build_process_env(project: dict[str, Any], run_token: str, settings: dict[s
     existing_node = env.get("NODE_PATH", "")
     env["NODE_PATH"] = f"{SDK_NODE_DIR}:{existing_node}" if existing_node else str(SDK_NODE_DIR)
 
-    # Прокси проекта (127.0.0.1:10808)
+    # Прокси проекта: индивидуальный CUSTOM_PROXY_URL или системный 127.0.0.1:10808
+    custom_proxy = str(env.get("CUSTOM_PROXY_URL", "")).strip()
     if int(project.get("use_proxy", 0)) == 1:
-        proxy_url = settings.get("proxy_url", "http://127.0.0.1:10808").strip()
+        proxy_url = custom_proxy if custom_proxy else settings.get("proxy_url", "http://127.0.0.1:10808").strip()
         for pk in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
             env[pk] = proxy_url
         env["NO_PROXY"] = "127.0.0.1,localhost"
@@ -278,6 +279,7 @@ async def start_project_run(
     # КРИТИЧЕСКОЕ ПРАВИЛО #2:
     # Никаких subprocess.PIPE! Открываем лог-файл с buffering=0, передаём дескриптор дочернему процессу
     # и сразу закрываем дескриптор в родительском процессе Hub.
+    # Для интерактивного ввода в консоль (stdin) используем именованный FIFO-канал с O_RDWR (безопасно при рестарте Hub).
     log_fd = open(log_path, "ab", buffering=0)
     header_line = (
         f"=== [Hub Run #{run_id}] Started at {time.strftime('%Y-%m-%d %H:%M:%S')} | "
@@ -285,12 +287,22 @@ async def start_project_run(
     ).encode("utf-8")
     log_fd.write(header_line)
 
+    stdin_fifo_path = proj_log_dir / f"stdin_{run_id}.fifo"
+    stdin_fd: Optional[int] = None
+    try:
+        if stdin_fifo_path.exists():
+            stdin_fifo_path.unlink()
+        os.mkfifo(stdin_fifo_path, 0o600)
+        stdin_fd = os.open(str(stdin_fifo_path), os.O_RDWR | os.O_NONBLOCK)
+    except Exception:
+        stdin_fd = None
+
     try:
         proc = subprocess.Popen(
             cmd_args,
             cwd=str(workdir),
             env=env,
-            stdin=subprocess.DEVNULL,
+            stdin=stdin_fd if stdin_fd is not None else subprocess.DEVNULL,
             stdout=log_fd,
             stderr=log_fd,
             close_fds=True,
@@ -299,6 +311,11 @@ async def start_project_run(
     except Exception as e:
         log_fd.write(f"\n[Hub Launch Error]: {e}\n".encode("utf-8"))
         log_fd.close()
+        if stdin_fd is not None:
+            try:
+                os.close(stdin_fd)
+            except OSError:
+                pass
         execute_sql(
             "UPDATE runs SET status = 'failed', finished_at = ?, exit_code = -1, error_summary = ? WHERE id = ?",
             (int(time.time()), str(e), run_id),
@@ -307,6 +324,11 @@ async def start_project_run(
     finally:
         if not log_fd.closed:
             log_fd.close()
+        if stdin_fd is not None:
+            try:
+                os.close(stdin_fd)
+            except OSError:
+                pass
 
     pid = proc.pid
     try:
@@ -335,6 +357,7 @@ async def start_project_run(
         "proc_create_time": proc_create_time,
         "started_at": now,
         "log_path": str(log_path),
+        "stdin_fifo": str(stdin_fifo_path),
         "popen": proc,
         "rss_mb": 0.0,
         "cpu_percent": 0.0,
@@ -342,6 +365,39 @@ async def start_project_run(
     }
 
     return query_one("SELECT * FROM runs WHERE id = ?", (run_id,)) or {"id": run_id, "pid": pid, "pgid": pgid}
+
+
+def send_stdin_to_run(run_id: int, text: str) -> bool:
+    """
+    Отправляет строку пользовательского ввода в stdin работающего процесса через именованный FIFO
+    и дублирует эхо команды в лог-файл запуска.
+    """
+    row = query_one("SELECT r.*, p.name AS project_name FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.id = ?", (run_id,))
+    if not row or row["status"] not in ("running", "waiting_input"):
+        return False
+
+    log_path = Path(row["log_path"])
+    fifo_path = LOGS_DIR / row["project_name"] / f"stdin_{run_id}.fifo"
+
+    clean_line = text.rstrip("\r\n")
+    try:
+        if log_path.exists():
+            with open(log_path, "ab", buffering=0) as lf:
+                lf.write(f"[Ввод в консоль stdin >>>] {clean_line}\n".encode("utf-8"))
+    except OSError:
+        pass
+
+    if fifo_path.exists():
+        try:
+            fd = os.open(str(fifo_path), os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                os.write(fd, (clean_line + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
+            return True
+        except OSError:
+            pass
+    return True
 
 
 async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str = "") -> bool:

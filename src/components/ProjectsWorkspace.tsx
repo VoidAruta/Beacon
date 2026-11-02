@@ -26,8 +26,13 @@ import {
   AlertTriangle,
   CheckCircle2,
   HelpCircle,
+  Globe,
+  ShieldCheck,
+  GitBranch,
+  CornerDownLeft,
+  XCircle,
 } from 'lucide-react';
-import { FileTreeNode, ProjectItem, RunItem, SecretItem } from '../types/hub';
+import { FileTreeNode, ProjectItem, RunItem, SecretItem, WebAuthSession } from '../types/hub';
 import {
   describeScheduleHuman,
   formatBytes,
@@ -35,7 +40,7 @@ import {
   validateScheduleConfig,
 } from '../utils/hubLogic';
 
-export type WorkspaceSubTab = 'editor' | 'cookies_tg' | 'simple_cfg' | 'advanced_cfg';
+export type WorkspaceSubTab = 'editor' | 'cookies_tg' | 'terminal_git' | 'simple_cfg' | 'advanced_cfg';
 
 interface ProjectsWorkspaceProps {
   projects: ProjectItem[];
@@ -49,6 +54,7 @@ interface ProjectsWorkspaceProps {
   onRestartProject: (id: number) => Promise<any>;
   onUpdateProject: (id: number, payload: Record<string, any>) => Promise<ProjectItem>;
   onDeleteProject: (id: number) => Promise<void>;
+  onCloneProject?: (id: number) => Promise<void>;
   onRefreshAll: () => Promise<void>;
   apiFetch: (path: string, options?: RequestInit) => Promise<Response>;
 }
@@ -80,6 +86,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   onRestartProject,
   onUpdateProject,
   onDeleteProject,
+  onCloneProject,
   onRefreshAll,
   apiFetch,
 }) => {
@@ -106,6 +113,8 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
 
   // Поля конфигурации проекта (Простые + Расширенные)
   const [cfgDescription, setCfgDescription] = useState<string>('');
+  const [cfgGroupTag, setCfgGroupTag] = useState<string>('Мои проекты');
+  const [cfgCustomProxy, setCfgCustomProxy] = useState<string>('');
   const [cfgCmd, setCfgCmd] = useState<string>('');
   const [cfgType, setCfgType] = useState<'job' | 'service'>('service');
   const [cfgRuntime, setCfgRuntime] = useState<'python' | 'node' | 'bash' | 'custom'>('python');
@@ -142,6 +151,22 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   const [projApiId, setProjApiId] = useState<string>('');
   const [projApiHash, setProjApiHash] = useState<string>('');
   const [projTgMsg, setProjTgMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  // Интерактивная авторизация прямо на сайте (Антибот / Капча / Cloudflare)
+  const [webAuthTargetUrl, setWebAuthTargetUrl] = useState<string>('https://fragment.com/login');
+  const [webAuthSession, setWebAuthSession] = useState<WebAuthSession | null>(null);
+  const [webAuthLogin, setWebAuthLogin] = useState<string>('poco_user@example.com');
+  const [webAuthPassword, setWebAuthPassword] = useState<string>('••••••••••••');
+  const [webAuthOtp, setWebAuthOtp] = useState<string>('');
+  const [webAuthBusy, setWebAuthBusy] = useState<boolean>(false);
+  const [webAuthMsg, setWebAuthMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  // Терминал проекта (CLI-команды + интерактивный stdin)
+  const [cliCommandInput, setCliCommandInput] = useState<string>('pip install -r requirements.txt');
+  const [cliRunning, setCliRunning] = useState<boolean>(false);
+  const [cliMsg, setCliMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [stdinText, setStdinText] = useState<string>('');
+  const [stdinSending, setStdinSending] = useState<boolean>(false);
 
   const logContainerRef = useRef<HTMLPreElement | null>(null);
   const sseRef = useRef<EventSource | null>(null);
@@ -183,6 +208,8 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   const syncConfigState = (proj: ProjectItem) => {
     const envObj = proj.env || {};
     setCfgDescription(String(envObj.PROJECT_DESCRIPTION || proj.description || ''));
+    setCfgGroupTag(String(envObj.PROJECT_GROUP || proj.group_tag || 'Мои проекты'));
+    setCfgCustomProxy(String(envObj.CUSTOM_PROXY_URL || proj.custom_proxy || ''));
     setCfgCmd(proj.cmd);
     setCfgType(proj.type);
     setCfgRuntime(proj.runtime);
@@ -210,6 +237,9 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     setProjApiHash(String(envObj.TG_API_HASH || ''));
     setProjCookieMsg(null);
     setProjTgMsg(null);
+    setWebAuthSession(null);
+    setWebAuthMsg(null);
+    setCliMsg(null);
 
     // Определяем пресет конструктора расписания
     if (proj.schedule_type === 'manual') {
@@ -464,6 +494,140 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     if (res?.run?.id) setSelectedRunId(res.run.id);
   };
 
+  // Интерактивная авторизация прямо на сайте (Антибот / Cloudflare / Капча)
+  const handleStartWebAuth = async () => {
+    if (!activeProj) return;
+    setWebAuthBusy(true);
+    setWebAuthMsg(null);
+    try {
+      const res = await apiFetch(`/api/projects/${activeProj.id}/web_auth/start`, {
+        method: 'POST',
+        body: JSON.stringify({ target_url: webAuthTargetUrl }),
+      });
+      const data = await res.json();
+      if (res.ok && data.session) {
+        setWebAuthSession(data.session);
+      } else {
+        setWebAuthMsg({ type: 'err', text: data.detail || 'Не удалось запустить браузерную сессию' });
+      }
+    } finally {
+      setWebAuthBusy(false);
+    }
+  };
+
+  const handleWebAuthAction = async (action: string, extra: Record<string, string> = {}) => {
+    if (!activeProj) return;
+    setWebAuthBusy(true);
+    try {
+      const res = await apiFetch(`/api/projects/${activeProj.id}/web_auth/action`, {
+        method: 'POST',
+        body: JSON.stringify({
+          action,
+          login: webAuthLogin,
+          password: webAuthPassword,
+          otp_code: webAuthOtp,
+          url: webAuthTargetUrl,
+          ...extra,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data.session) {
+        setWebAuthSession(data.session);
+      }
+    } finally {
+      setWebAuthBusy(false);
+    }
+  };
+
+  const handleSaveWebAuth = async () => {
+    if (!activeProj) return;
+    setWebAuthBusy(true);
+    setWebAuthMsg(null);
+    try {
+      const res = await apiFetch(`/api/projects/${activeProj.id}/web_auth/save`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setWebAuthSession(null);
+        await onRefreshAll();
+        await loadFilesAndRuns(activeProj);
+        setWebAuthMsg({
+          type: 'ok',
+          text: `Сессия с сайта (${data.domain}) успешно захвачена! Сохранены cookies.json (${data.cookies_count} шт., включая cf_clearance) + storage_state.json (localStorage). Процесс браузера полностью выгружен из ОЗУ (0 МБ).`,
+        });
+      } else {
+        setWebAuthMsg({ type: 'err', text: data.detail || 'Ошибка сохранения сессии' });
+      }
+    } finally {
+      setWebAuthBusy(false);
+    }
+  };
+
+  const handleCancelWebAuth = async () => {
+    if (!activeProj) return;
+    await apiFetch(`/api/projects/${activeProj.id}/web_auth/cancel`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    setWebAuthSession(null);
+  };
+
+  // Выполнение произвольной команды в терминале проекта (git pull, pip install, chmod +x и т.д.)
+  const handleExecCommand = async (cmdToRun?: string) => {
+    if (!activeProj) return;
+    const finalCmd = (cmdToRun ?? cliCommandInput).trim();
+    if (!finalCmd) return;
+    setCliRunning(true);
+    setCliMsg(null);
+    try {
+      const res = await apiFetch(`/api/projects/${activeProj.id}/exec`, {
+        method: 'POST',
+        body: JSON.stringify({ command: finalCmd }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        const runsRes = await apiFetch(`/api/projects/${activeProj.id}/runs`);
+        if (runsRes.ok) setRuns(await runsRes.json());
+        if (data.run?.id) setSelectedRunId(data.run.id);
+        await loadFilesAndRuns(activeProj);
+        await onRefreshAll();
+        setCliMsg({
+          type: 'ok',
+          text: `Команда «${finalCmd}» запущена (Запуск #${data.run?.id}). Вывод отображается в живом логе внизу.`,
+        });
+      } else {
+        setCliMsg({ type: 'err', text: data.detail || 'Ошибка запуска команды' });
+      }
+    } finally {
+      setCliRunning(false);
+    }
+  };
+
+  // Отправка строки в интерактивный stdin запущенного процесса
+  const handleSendStdin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedRunId || !stdinText.trim()) return;
+    setStdinSending(true);
+    try {
+      const res = await apiFetch(`/api/runs/${selectedRunId}/stdin`, {
+        method: 'POST',
+        body: JSON.stringify({ text: stdinText }),
+      });
+      if (res.ok) {
+        setStdinText('');
+        const logRes = await apiFetch(`/api/runs/${selectedRunId}/log`);
+        if (logRes.ok) {
+          const d = await logRes.json();
+          setLogText(d.log || '');
+        }
+      }
+    } finally {
+      setStdinSending(false);
+    }
+  };
+
   // Сохранение индивидуальных куки именно этого проекта
   const handleSaveProjectCookies = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -495,7 +659,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     }
   };
 
-  // Сохранение индивидуальных настроек Telegram этого проекта
+  // Сохранение индивидуальных настроек Telegram и индивидуального прокси этого проекта
   const handleSaveProjectTelegram = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeProj) return;
@@ -519,6 +683,9 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     if (projApiHash.trim()) parsedEnv.TG_API_HASH = projApiHash.trim();
     else delete parsedEnv.TG_API_HASH;
 
+    if (cfgCustomProxy.trim()) parsedEnv.CUSTOM_PROXY_URL = cfgCustomProxy.trim();
+    else delete parsedEnv.CUSTOM_PROXY_URL;
+
     try {
       const updated = await onUpdateProject(activeProj.id, {
         env: parsedEnv,
@@ -527,7 +694,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
       setCfgEnvJson(updated.env_json);
       setProjTgMsg({
         type: 'ok',
-        text: `Индивидуальные данные Telegram для проекта «${activeProj.name}» сохранены и будут переданы скрипту при запуске.`,
+        text: `Индивидуальные данные Telegram и прокси для проекта «${activeProj.name}» сохранены и будут переданы скрипту при запуске.`,
       });
     } catch (err: any) {
       setProjTgMsg({ type: 'err', text: err?.message || 'Ошибка сохранения данных Telegram' });
@@ -585,6 +752,14 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
 
     if (cfgDescription.trim()) {
       parsedEnv.PROJECT_DESCRIPTION = cfgDescription.trim();
+    }
+    if (cfgGroupTag.trim()) {
+      parsedEnv.PROJECT_GROUP = cfgGroupTag.trim();
+    }
+    if (cfgCustomProxy.trim()) {
+      parsedEnv.CUSTOM_PROXY_URL = cfgCustomProxy.trim();
+    } else {
+      delete parsedEnv.CUSTOM_PROXY_URL;
     }
 
     try {
@@ -856,7 +1031,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
             </div>
           </div>
 
-          {/* 4 ПОНЯТНЫЕ ВКЛАДКИ ВНУТРИ ПРОЕКТА */}
+          {/* 5 ПОНЯТНЫХ ВКЛАДОК ВНУТРИ ПРОЕКТА */}
           <div className="pt-2 border-t border-slate-800 flex flex-wrap items-center gap-1.5">
             <button
               type="button"
@@ -881,10 +1056,23 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
               }`}
             >
               <Cookie className="w-3.5 h-3.5 text-amber-400" />
-              2. Куки и Telegram скрипта
+              2. Куки, Вход на сайте и ТГ
               {cookieStatus?.is_expired === 1 && (
                 <span className="w-2 h-2 rounded-full bg-red-400" />
               )}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setSubTab('terminal_git')}
+              className={`px-3.5 py-2 text-xs font-medium rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer ${
+                subTab === 'terminal_git'
+                  ? 'bg-indigo-600 text-white'
+                  : 'bg-slate-900/70 text-slate-300 hover:text-white'
+              }`}
+            >
+              <Terminal className="w-3.5 h-3.5 text-sky-400" />
+              3. Терминал и GitHub (Команды)
             </button>
 
             <button
@@ -897,7 +1085,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
               }`}
             >
               <Clock className="w-3.5 h-3.5 text-emerald-400" />
-              3. Расписание и Простые настройки
+              4. Расписание и Простые настройки
             </button>
 
             <button
@@ -910,7 +1098,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
               }`}
             >
               <Sliders className="w-3.5 h-3.5 text-slate-400" />
-              4. Расширенные (Для профи)
+              5. Расширенные (Для профи)
             </button>
           </div>
         </div>
@@ -923,7 +1111,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
               <div className="flex items-center justify-between">
                 <span className="text-xs text-slate-300 flex items-center gap-1.5">
                   <HelpCircle className="w-3.5 h-3.5 text-indigo-400" />
-                  Подсказка: как в коде этого проекта прочитать его индивидуальные куки, Telegram-токен или запросить СМС-код?
+                  Подсказка: как в коде этого проекта прочитать его индивидуальные куки, storage_state.json или запросить СМС-код?
                 </span>
                 <button
                   type="button"
@@ -936,7 +1124,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
               {showSdkHints && (
                 <div className="mt-2.5 pt-2.5 border-t border-slate-800 grid grid-cols-1 md:grid-cols-3 gap-3 text-[11px] font-mono text-slate-200">
                   <div className="p-2.5 bg-[#0f172a] rounded-lg border border-slate-800">
-                    <div className="text-indigo-300 font-sans font-semibold mb-1">1. Прочитать куки этого проекта:</div>
+                    <div className="text-indigo-300 font-sans font-semibold mb-1">1. Прочитать куки или сессию сайта:</div>
                     <code>import hub</code>
                     <br />
                     <code>cookies = hub.secret("{activeProj.name}_cookies")</code>
@@ -1103,184 +1291,451 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
           </div>
         )}
 
-        {/* СОДЕРЖИМОЕ ВКЛАДКИ 2: ИНДИВИДУАЛЬНЫЕ КУКИ И TELEGRAM ЭТОГО СКРИПТА */}
+        {/* СОДЕРЖИМОЕ ВКЛАДКИ 2: ИНТЕРАКТИВНЫЙ ВХОД НА САЙТЕ (АНТИБОТ/КАПЧА), КУКИ И TELEGRAM ЭТОГО СКРИПТА */}
         {subTab === 'cookies_tg' && (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            {/* Блок А: Индивидуальные Куки этого проекта */}
-            <form
-              onSubmit={handleSaveProjectCookies}
-              className="bg-[#1e293b] border border-slate-800 rounded-xl p-5 space-y-4"
-            >
-              <div className="flex items-start justify-between gap-2 pb-3 border-b border-slate-800">
+          <div className="space-y-4">
+            {/* БЛОК 0: Интерактивная авторизация прямо на сайте (когда обычные куки не подходят из-за Cloudflare / Антибот / TLS-отпечатка) */}
+            <div className="bg-[#1e293b] border border-indigo-500/40 rounded-xl p-5 space-y-4">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 pb-3 border-b border-slate-800">
                 <div>
-                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                    <Cookie className="w-4 h-4 text-amber-400" />
-                    Индивидуальные куки проекта «{activeProj.name}»
-                  </h3>
-                  <p className="text-xs text-slate-400 mt-0.5">
-                    Эти куки привязаны конкретно к этому скрипту (<code className="font-mono text-indigo-300">{activeProj.name}_cookies</code>) и также сохраняются в файл <code className="font-mono text-slate-300">cookies.json</code> в папке проекта.
+                  <div className="flex items-center gap-2">
+                    <Globe className="w-4 h-4 text-indigo-400" />
+                    <h3 className="text-sm font-bold text-white">
+                      Авторизация прямо на сайте (Обход Антибот / Cloudflare Turnstile / Капчи)
+                    </h3>
+                    {activeProj.has_browser_profile && (
+                      <span className="px-2 py-0.5 text-[11px] font-semibold bg-emerald-950/70 text-emerald-300 border border-emerald-500/40 rounded">
+                        Профиль storage_state.json сохранён
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-300 mt-1">
+                    Если куки, скопированные с домашнего ПК, не работают из-за привязки к IP/User-Agent или защиты Cloudflare — откройте временный браузер прямо с Poco X3 NFC (через его прокси), пройдите капчу/вход и нажмите <strong>«Сохранить сессию»</strong>. После сохранения браузер полностью выгружается из ОЗУ (<code className="font-mono text-emerald-300">0 МБ</code>).
                   </p>
                 </div>
               </div>
 
-              <div className="p-3 bg-slate-900/70 border border-slate-800 rounded-lg text-xs flex items-center justify-between">
-                <div>
-                  <span className="text-slate-400">Текущий статус куки скрипта: </span>
-                  {cookieStatus?.has_cookies ? (
-                    cookieStatus.is_expired ? (
-                      <span className="text-red-400 font-semibold inline-flex items-center gap-1">
-                        <AlertTriangle className="w-3.5 h-3.5" />
-                        Истекли ({cookieStatus.expired_note || 'нужна замена'})
-                      </span>
-                    ) : (
-                      <span className="text-emerald-400 font-semibold">
-                        Загружены и актуальны ({formatBytes(cookieStatus.size_bytes)})
-                      </span>
-                    )
-                  ) : (
-                    <span className="text-slate-400">Ещё не загружены</span>
-                  )}
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs text-slate-300 mb-1">
-                  Вставьте JSON-массив куки из браузерного расширения <strong>Cookie-Editor</strong>:
-                </label>
-                <textarea
-                  rows={6}
-                  value={projCookieJson}
-                  onChange={(e) => setProjCookieJson(e.target.value)}
-                  className="w-full bg-[#0f172a] border border-slate-700 rounded-lg p-3 font-mono text-xs text-white"
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+                <input
+                  type="text"
+                  value={webAuthTargetUrl}
+                  onChange={(e) => setWebAuthTargetUrl(e.target.value)}
+                  placeholder="https://fragment.com/login или адрес нужного сайта"
+                  className="flex-1 bg-[#0f172a] border border-slate-700 rounded-lg px-3.5 py-2 text-xs font-mono text-white"
                 />
+                {!webAuthSession ? (
+                  <button
+                    type="button"
+                    disabled={webAuthBusy}
+                    onClick={handleStartWebAuth}
+                    className="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
+                  >
+                    <Globe className="w-3.5 h-3.5" />
+                    {webAuthBusy ? 'Запуск браузера...' : 'Открыть сайт для входа'}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleCancelWebAuth}
+                    className="px-3.5 py-2 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
+                  >
+                    <XCircle className="w-3.5 h-3.5 text-red-400" />
+                    Закрыть без сохранения
+                  </button>
+                )}
               </div>
 
-              {projCookieMsg && (
+              {webAuthMsg && (
                 <div
                   className={`p-3 rounded-lg text-xs ${
-                    projCookieMsg.type === 'ok'
+                    webAuthMsg.type === 'ok'
                       ? 'bg-emerald-950/60 border border-emerald-500/40 text-emerald-200'
                       : 'bg-red-950/60 border border-red-500/40 text-red-200'
                   }`}
                 >
-                  {projCookieMsg.text}
+                  {webAuthMsg.text}
                 </div>
               )}
 
-              <button
-                type="submit"
-                className="w-full py-2.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
+              {webAuthSession && (
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 pt-2">
+                  <div className="lg:col-span-7 bg-[#0b1120] border border-slate-800 rounded-xl p-3 space-y-2">
+                    <div className="flex items-center justify-between text-[11px] font-mono text-slate-400">
+                      <span>Интерактивное окно браузера ({webAuthSession.domain})</span>
+                      <span className="text-indigo-300">Прокси: {webAuthSession.proxy}</span>
+                    </div>
+                    <img
+                      src={webAuthSession.screenshot_data_uri}
+                      alt="Окно авторизации на сайте"
+                      className="w-full rounded-lg border border-slate-800"
+                    />
+                  </div>
+
+                  <div className="lg:col-span-5 bg-[#0f172a] border border-slate-800 rounded-xl p-4 flex flex-col justify-between space-y-3">
+                    <div className="space-y-3">
+                      <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                        <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                        Шаги прохождения защиты и входа:
+                      </div>
+
+                      <button
+                        type="button"
+                        disabled={webAuthBusy}
+                        onClick={() => handleWebAuthAction('solve_cloudflare')}
+                        className="w-full py-2 px-3 text-xs font-semibold bg-amber-600/20 hover:bg-amber-600/30 text-amber-200 border border-amber-500/40 rounded-lg text-left cursor-pointer"
+                      >
+                        1. Пройти антибот-проверку Cloudflare Turnstile (клик по чекбоксу)
+                      </button>
+
+                      <div className="space-y-2 pt-1 border-t border-slate-800">
+                        <label className="block text-[11px] text-slate-300">
+                          2. Введите логин / пароль на сайте (если требуется):
+                        </label>
+                        <input
+                          type="text"
+                          value={webAuthLogin}
+                          onChange={(e) => setWebAuthLogin(e.target.value)}
+                          placeholder="Логин / Email / Телефон"
+                          className="w-full bg-[#1e293b] border border-slate-700 rounded px-2.5 py-1.5 text-xs text-white"
+                        />
+                        <input
+                          type="password"
+                          value={webAuthPassword}
+                          onChange={(e) => setWebAuthPassword(e.target.value)}
+                          placeholder="Пароль"
+                          className="w-full bg-[#1e293b] border border-slate-700 rounded px-2.5 py-1.5 text-xs text-white"
+                        />
+                        <button
+                          type="button"
+                          disabled={webAuthBusy}
+                          onClick={() => handleWebAuthAction('fill_credentials')}
+                          className="w-full py-1.5 px-3 text-xs font-medium bg-indigo-600/30 hover:bg-indigo-600/40 text-indigo-200 border border-indigo-500/40 rounded-lg cursor-pointer"
+                        >
+                          Отправить логин и пароль на страницу
+                        </button>
+                      </div>
+
+                      <div className="flex items-center gap-2 pt-1 border-t border-slate-800">
+                        <input
+                          type="text"
+                          value={webAuthOtp}
+                          onChange={(e) => setWebAuthOtp(e.target.value)}
+                          placeholder="Код 2FA / СМС (если сайт спросил)"
+                          className="flex-1 bg-[#1e293b] border border-slate-700 rounded px-2.5 py-1.5 text-xs font-mono text-white"
+                        />
+                        <button
+                          type="button"
+                          disabled={webAuthBusy || !webAuthOtp.trim()}
+                          onClick={() => handleWebAuthAction('submit_2fa')}
+                          className="px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg cursor-pointer"
+                        >
+                          Ввести 2FA
+                        </button>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      disabled={webAuthBusy}
+                      onClick={handleSaveWebAuth}
+                      className="w-full py-2.5 px-3 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <CheckCircle2 className="w-4 h-4" />
+                      Сохранить сессию (cookies.json + storage_state.json) и закрыть браузер
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              {/* Блок А: Индивидуальные Куки этого проекта */}
+              <form
+                onSubmit={handleSaveProjectCookies}
+                className="bg-[#1e293b] border border-slate-800 rounded-xl p-5 space-y-4"
               >
-                <CheckCircle2 className="w-4 h-4" />
-                Сохранить индивидуальные куки для «{activeProj.name}»
-              </button>
-            </form>
-
-            {/* Блок Б: Индивидуальные данные Telegram этого скрипта */}
-            <form
-              onSubmit={handleSaveProjectTelegram}
-              className="bg-[#1e293b] border border-slate-800 rounded-xl p-5 space-y-4"
-            >
-              <div className="pb-3 border-b border-slate-800">
-                <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                  <Send className="w-4 h-4 text-indigo-400" />
-                  Данные Telegram для самого скрипта «{activeProj.name}»
-                </h3>
-                <p className="text-xs text-slate-400 mt-0.5">
-                  Используются <strong>внутри кода вашего проекта</strong> (если этот скрипт сам является Telegram-ботом или юзерботом). Системный бот для уведомлений самой панели настраивается отдельно во вкладке «Настройки».
-                </p>
-              </div>
-
-              <div className="space-y-3">
-                <div>
-                  <label className="block text-xs text-slate-300 mb-1">
-                    Токен бота этого проекта (<code className="font-mono text-indigo-300">BOT_TOKEN</code> из @BotFather)
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="7100223344:AAH..."
-                    value={projBotToken}
-                    onChange={(e) => setProjBotToken(e.target.value)}
-                    className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs text-slate-300 mb-1">
-                    ID чата / администратора (<code className="font-mono text-indigo-300">TG_CHAT_ID</code>)
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="Например: 192837465"
-                    value={projChatId}
-                    onChange={(e) => setProjChatId(e.target.value)}
-                    className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                  />
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                <div className="flex items-start justify-between gap-2 pb-3 border-b border-slate-800">
                   <div>
-                    <label className="block text-xs text-slate-300 mb-1">
-                      API_ID (для Telethon / Pyrogram)
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="2040"
-                      value={projApiId}
-                      onChange={(e) => setProjApiId(e.target.value)}
-                      className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-slate-300 mb-1">
-                      API_HASH (my.telegram.org)
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="b18441a1ff..."
-                      value={projApiHash}
-                      onChange={(e) => setProjApiHash(e.target.value)}
-                      className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                    />
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      <Cookie className="w-4 h-4 text-amber-400" />
+                      Ручная вставка JSON-куки проекта «{activeProj.name}»
+                    </h3>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Привязаны конкретно к этому скрипту (<code className="font-mono text-indigo-300">{activeProj.name}_cookies</code>) и лежат в <code className="font-mono text-slate-300">cookies.json</code> в папке проекта.
+                    </p>
                   </div>
                 </div>
 
-                <div className="pt-1">
-                  <label className="flex items-center gap-2 text-xs text-slate-200 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={cfgUseProxy}
-                      onChange={(e) => setCfgUseProxy(e.target.checked)}
-                    />
-                    Включить прокси <code className="font-mono text-indigo-300">127.0.0.1:10808</code> для работы Telegram в этом проекте
-                  </label>
+                <div className="p-3 bg-slate-900/70 border border-slate-800 rounded-lg text-xs flex items-center justify-between">
+                  <div>
+                    <span className="text-slate-400">Текущий статус куки скрипта: </span>
+                    {cookieStatus?.has_cookies ? (
+                      cookieStatus.is_expired ? (
+                        <span className="text-red-400 font-semibold inline-flex items-center gap-1">
+                          <AlertTriangle className="w-3.5 h-3.5" />
+                          Истекли ({cookieStatus.expired_note || 'нужна замена'})
+                        </span>
+                      ) : (
+                        <span className="text-emerald-400 font-semibold">
+                          Загружены и актуальны ({formatBytes(cookieStatus.size_bytes)})
+                        </span>
+                      )
+                    ) : (
+                      <span className="text-slate-400">Ещё не загружены</span>
+                    )}
+                  </div>
                 </div>
-              </div>
 
-              {projTgMsg && (
-                <div
-                  className={`p-3 rounded-lg text-xs ${
-                    projTgMsg.type === 'ok'
-                      ? 'bg-emerald-950/60 border border-emerald-500/40 text-emerald-200'
-                      : 'bg-red-950/60 border border-red-500/40 text-red-200'
-                  }`}
+                <div>
+                  <label className="block text-xs text-slate-300 mb-1">
+                    Вставьте JSON-массив куки из браузерного расширения <strong>Cookie-Editor</strong>:
+                  </label>
+                  <textarea
+                    rows={6}
+                    value={projCookieJson}
+                    onChange={(e) => setProjCookieJson(e.target.value)}
+                    className="w-full bg-[#0f172a] border border-slate-700 rounded-lg p-3 font-mono text-xs text-white"
+                  />
+                </div>
+
+                {projCookieMsg && (
+                  <div
+                    className={`p-3 rounded-lg text-xs ${
+                      projCookieMsg.type === 'ok'
+                        ? 'bg-emerald-950/60 border border-emerald-500/40 text-emerald-200'
+                        : 'bg-red-950/60 border border-red-500/40 text-red-200'
+                    }`}
+                  >
+                    {projCookieMsg.text}
+                  </div>
+                )}
+
+                <button
+                  type="submit"
+                  className="w-full py-2.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
                 >
-                  {projTgMsg.text}
-                </div>
-              )}
+                  <CheckCircle2 className="w-4 h-4" />
+                  Сохранить индивидуальные куки для «{activeProj.name}»
+                </button>
+              </form>
 
-              <button
-                type="submit"
-                className="w-full py-2.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
+              {/* Блок Б: Индивидуальные данные Telegram и прокси этого скрипта */}
+              <form
+                onSubmit={handleSaveProjectTelegram}
+                className="bg-[#1e293b] border border-slate-800 rounded-xl p-5 space-y-4"
               >
-                <Save className="w-4 h-4" />
-                Сохранить данные Telegram для этого проекта
-              </button>
-            </form>
+                <div className="pb-3 border-b border-slate-800">
+                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                    <Send className="w-4 h-4 text-indigo-400" />
+                    Данные Telegram и Прокси для скрипта «{activeProj.name}»
+                  </h3>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    Используются <strong>внутри кода вашего проекта</strong>. Системный бот для уведомлений самой панели настраивается отдельно во вкладке «Настройки».
+                  </p>
+                </div>
+
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-xs text-slate-300 mb-1">
+                      Токен бота этого проекта (<code className="font-mono text-indigo-300">BOT_TOKEN</code> из @BotFather)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="7100223344:AAH..."
+                      value={projBotToken}
+                      onChange={(e) => setProjBotToken(e.target.value)}
+                      className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs text-slate-300 mb-1">
+                      ID чата / администратора (<code className="font-mono text-indigo-300">TG_CHAT_ID</code>)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="Например: 192837465"
+                      value={projChatId}
+                      onChange={(e) => setProjChatId(e.target.value)}
+                      className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                    <div>
+                      <label className="block text-xs text-slate-300 mb-1">
+                        API_ID (для Telethon / Pyrogram)
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="2040"
+                        value={projApiId}
+                        onChange={(e) => setProjApiId(e.target.value)}
+                        className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-slate-300 mb-1">
+                        API_HASH (my.telegram.org)
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="b18441a1ff..."
+                        value={projApiHash}
+                        onChange={(e) => setProjApiHash(e.target.value)}
+                        className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="pt-1 space-y-2">
+                    <label className="flex items-center gap-2 text-xs text-slate-200 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={cfgUseProxy}
+                        onChange={(e) => setCfgUseProxy(e.target.checked)}
+                      />
+                      Включить системный прокси <code className="font-mono text-indigo-300">127.0.0.1:10808</code>
+                    </label>
+
+                    <div>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Или укажите индивидуальный прокси только для этого проекта (мульти-аккаунт):
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="socks5://user:pass@ip:port (пусто = 127.0.0.1:10808)"
+                        value={cfgCustomProxy}
+                        onChange={(e) => setCfgCustomProxy(e.target.value)}
+                        className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {projTgMsg && (
+                  <div
+                    className={`p-3 rounded-lg text-xs ${
+                      projTgMsg.type === 'ok'
+                        ? 'bg-emerald-950/60 border border-emerald-500/40 text-emerald-200'
+                        : 'bg-red-950/60 border border-red-500/40 text-red-200'
+                    }`}
+                  >
+                    {projTgMsg.text}
+                  </div>
+                )}
+
+                <button
+                  type="submit"
+                  className="w-full py-2.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <Save className="w-4 h-4" />
+                  Сохранить данные Telegram и Прокси для проекта
+                </button>
+              </form>
+            </div>
           </div>
         )}
 
-        {/* СОДЕРЖИМОЕ ВКЛАДКИ 3: ПРОСТЫЕ НАСТРОЙКИ И КОНСТРУКТОР РАСПИСАНИЯ */}
+        {/* СОДЕРЖИМОЕ ВКЛАДКИ 3: ТЕРМИНАЛ ПРОЕКТА И GITHUB (ВЫПОЛНЕНИЕ КОМАНД И ЗАВИСИМОСТЕЙ) */}
+        {subTab === 'terminal_git' && (
+          <div className="bg-[#1e293b] border border-slate-800 rounded-xl p-5 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-800">
+              <div>
+                <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                  <Terminal className="w-4 h-4 text-sky-400" />
+                  Встроенный терминал папки проекта «{activeProj.name}»
+                </h3>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Выполняйте любые команды установки из инструкций GitHub (<code className="font-mono text-slate-300">git pull</code>, <code className="font-mono text-slate-300">pip install</code>, <code className="font-mono text-slate-300">npm install</code>, <code className="font-mono text-slate-300">python3 main.py --setup</code>) прямо в рабочей папке <code className="font-mono text-indigo-300">{activeProj.workdir}</code>.
+                </p>
+              </div>
+              {activeProj.git_repo_url && (
+                <span className="px-2.5 py-1 text-xs font-mono bg-sky-950/60 text-sky-300 border border-sky-500/30 rounded-lg inline-flex items-center gap-1.5 shrink-0">
+                  <GitBranch className="w-3.5 h-3.5" />
+                  {activeProj.git_repo_url}
+                </span>
+              )}
+            </div>
+
+            {/* Быстрые кнопки частых команд GitHub-проектов */}
+            <div>
+              <div className="text-xs font-medium text-slate-300 mb-2">
+                Быстрые команды в 1 клик (выполняются в папке проекта):
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                {[
+                  { label: 'git pull (Обновить из GitHub)', cmd: 'git pull' },
+                  { label: 'pip install -r requirements.txt', cmd: 'pip install -r requirements.txt' },
+                  { label: 'Создать .venv (Python)', cmd: 'python3 -m venv .venv' },
+                  { label: 'Список файлов (ls -la)', cmd: 'ls -la' },
+                  { label: 'Права на запуск (chmod +x *.sh)', cmd: 'chmod +x *.sh || true' },
+                  { label: 'Проверка Python и пакета', cmd: 'python3 --version && pip --version' },
+                ].map((item) => (
+                  <button
+                    key={item.cmd}
+                    type="button"
+                    disabled={cliRunning}
+                    onClick={() => {
+                      setCliCommandInput(item.cmd);
+                      handleExecCommand(item.cmd);
+                    }}
+                    className="px-3 py-1.5 text-xs font-mono bg-[#0f172a] hover:bg-slate-800 text-slate-200 border border-slate-700 rounded-lg transition-colors cursor-pointer"
+                  >
+                    $ {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Произвольная команда */}
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleExecCommand();
+              }}
+              className="space-y-2"
+            >
+              <label className="block text-xs text-slate-300">
+                Введите свою команду из README репозитория GitHub:
+              </label>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <div className="flex-1 flex items-center bg-[#0f172a] border border-slate-700 rounded-lg px-3">
+                  <span className="text-xs font-mono text-emerald-400 mr-2">$</span>
+                  <input
+                    type="text"
+                    value={cliCommandInput}
+                    onChange={(e) => setCliCommandInput(e.target.value)}
+                    placeholder="Например: pip install telethon requests или python3 setup.py"
+                    className="w-full py-2 bg-transparent text-xs font-mono text-white focus:outline-none"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={cliRunning || !cliCommandInput.trim()}
+                  className="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
+                >
+                  <Play className="w-3.5 h-3.5" />
+                  {cliRunning ? 'Выполнение...' : 'Выполнить в папке проекта'}
+                </button>
+              </div>
+            </form>
+
+            {cliMsg && (
+              <div
+                className={`p-3 rounded-lg text-xs ${
+                  cliMsg.type === 'ok'
+                    ? 'bg-emerald-950/60 border border-emerald-500/40 text-emerald-200'
+                    : 'bg-red-950/60 border border-red-500/40 text-red-200'
+                }`}
+              >
+                {cliMsg.text}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* СОДЕРЖИМОЕ ВКЛАДКИ 4: ПРОСТЫЕ НАСТРОЙКИ И КОНСТРУКТОР РАСПИСАНИЯ */}
         {subTab === 'simple_cfg' && (
           <form
             onSubmit={handleSaveProjectConfig}
@@ -1292,7 +1747,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                   Простые настройки запуска и расписания («{activeProj.name}»)
                 </h3>
                 <p className="text-xs text-slate-400">
-                  Понятные настройки без сложных команд. Для тонких технических лимитов есть вкладка «4. Расширенные».
+                  Понятные настройки без сложных команд. Для тонких технических лимитов есть вкладка «5. Расширенные».
                 </p>
               </div>
               <button
@@ -1315,17 +1770,31 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
               </div>
             )}
 
-            <div>
-              <label className="block text-xs font-medium text-slate-200 mb-1">
-                Описание проекта (понятная заметка для вас)
-              </label>
-              <input
-                type="text"
-                value={cfgDescription}
-                onChange={(e) => setCfgDescription(e.target.value)}
-                placeholder="Что именно делает этот проект?"
-                className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3.5 py-2 text-xs text-white"
-              />
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="sm:col-span-2">
+                <label className="block text-xs font-medium text-slate-200 mb-1">
+                  Описание проекта (понятная заметка для вас)
+                </label>
+                <input
+                  type="text"
+                  value={cfgDescription}
+                  onChange={(e) => setCfgDescription(e.target.value)}
+                  placeholder="Что именно делает этот проект?"
+                  className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3.5 py-2 text-xs text-white"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-200 mb-1">
+                  Группа / Категория
+                </label>
+                <input
+                  type="text"
+                  value={cfgGroupTag}
+                  onChange={(e) => setCfgGroupTag(e.target.value)}
+                  placeholder="Например: Боты ТГ, Парсеры"
+                  className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3.5 py-2 text-xs text-white"
+                />
+              </div>
             </div>
 
             {/* Выбор категории с объяснением */}
@@ -1612,7 +2081,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
           </form>
         )}
 
-        {/* СОДЕРЖИМОЕ ВКЛАДКИ 4: РАСШИРЕННЫЕ НАСТРОЙКИ (ДЛЯ ПРОДВИНУТЫХ ПОЛЬЗОВАТЕЛЕЙ) */}
+        {/* СОДЕРЖИМОЕ ВКЛАДКИ 5: РАСШИРЕННЫЕ НАСТРОЙКИ (ДЛЯ ПРОДВИНУТЫХ ПОЛЬЗОВАТЕЛЕЙ) */}
         {subTab === 'advanced_cfg' && (
           <form
             onSubmit={handleSaveProjectConfig}
@@ -1628,6 +2097,16 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                 </p>
               </div>
               <div className="flex items-center gap-2">
+                {onCloneProject && (
+                  <button
+                    type="button"
+                    onClick={() => onCloneProject(activeProj.id)}
+                    className="px-3 py-2 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Copy className="w-3.5 h-3.5 text-indigo-400" />
+                    Клонировать проект
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => onDeleteProject(activeProj.id)}
@@ -1812,7 +2291,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
           </form>
         )}
 
-        {/* НИЖНЯЯ КОНСОЛЬ ЖИВЫХ ЛОГОВ ПРОЕКТА */}
+        {/* НИЖНЯЯ КОНСОЛЬ ЖИВЫХ ЛОГОВ ПРОЕКТА + ИНТЕРАКТИВНЫЙ ВВОД STDIN */}
         <section
           aria-label="Консоль живых логов"
           className="bg-[#1e293b] border border-slate-800 rounded-xl overflow-hidden"
@@ -1820,7 +2299,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
           <div className="px-4 py-2.5 bg-slate-900/80 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-xs">
               <Terminal className="w-4 h-4 text-emerald-400" />
-              <span className="font-semibold text-white">Живой журнал вывода (Лог запуска)</span>
+              <span className="font-semibold text-white">Живой журнал вывода (Лог запуска и интерактивный stdin)</span>
               {isStreaming && (
                 <span className="font-mono text-emerald-400">· LIVE STREAM (обновление каждые 300мс)</span>
               )}
@@ -1862,6 +2341,31 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
           >
             {logText || '// Лог пуст'}
           </pre>
+
+          {/* Строка отправки интерактивного ввода (stdin) в запущенный процесс */}
+          {selectedRunId && (
+            <form
+              onSubmit={handleSendStdin}
+              className="px-3 py-2 bg-[#0b1120] border-t border-slate-800 flex items-center gap-2"
+            >
+              <span className="text-xs font-mono text-indigo-400 shrink-0">stdin &gt;</span>
+              <input
+                type="text"
+                value={stdinText}
+                onChange={(e) => setStdinText(e.target.value)}
+                placeholder="Если программа в консоли ждёт ответ (номер телефона, y/n, токен) — введите здесь и нажмите Enter..."
+                className="flex-1 bg-transparent text-xs font-mono text-white focus:outline-none"
+              />
+              <button
+                type="submit"
+                disabled={stdinSending || !stdinText.trim()}
+                className="px-3 py-1 text-xs font-medium bg-indigo-600/80 hover:bg-indigo-500 disabled:opacity-40 text-white rounded inline-flex items-center gap-1 cursor-pointer shrink-0"
+              >
+                <CornerDownLeft className="w-3 h-3" />
+                Отправить в консоль
+              </button>
+            </form>
+          )}
         </section>
       </div>
     </div>

@@ -199,7 +199,34 @@ export function App() {
   };
 
   const handleCreateProject = async (payload: Record<string, any>) => {
-    const { initial_cookies_json, ...projectPayload } = payload;
+    const { initial_cookies_json, create_from_github, ...projectPayload } = payload;
+
+    if (create_from_github) {
+      const res = await apiFetch('/api/projects/git_clone', {
+        method: 'POST',
+        body: JSON.stringify(projectPayload),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Ошибка клонирования GitHub-репозитория');
+      }
+      const created: ProjectItem = await res.json();
+      if (initial_cookies_json) {
+        await apiFetch(`/api/projects/${created.id}/cookies`, {
+          method: 'POST',
+          body: JSON.stringify({
+            name: `${created.name}_cookies`,
+            cookies_json: initial_cookies_json,
+          }),
+        });
+      }
+      await loadAllData();
+      setSelectedProject(created);
+      setWorkspaceSubTab('terminal_git');
+      setActiveTab('projects');
+      return;
+    }
+
     const res = await apiFetch('/api/projects', {
       method: 'POST',
       body: JSON.stringify(projectPayload),
@@ -225,6 +252,20 @@ export function App() {
     setSelectedProject(created);
     setWorkspaceSubTab('editor');
     setActiveTab('projects');
+  };
+
+  const handleCloneProject = async (id: number) => {
+    const res = await apiFetch(`/api/projects/${id}/clone`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    if (res.ok) {
+      const cloned: ProjectItem = await res.json();
+      await loadAllData();
+      setSelectedProject(cloned);
+      setWorkspaceSubTab('cookies_tg');
+      setActiveTab('projects');
+    }
   };
 
   const handleUpdateProject = async (id: number, payload: Record<string, any>) => {
@@ -420,7 +461,7 @@ export function App() {
             <div className="px-2 pt-1 flex items-center justify-between border-b border-slate-800/80 pb-3.5">
               <div>
                 <div className="text-base font-bold tracking-tight text-white">Hub Control Panel</div>
-                <div className="text-[11px] text-slate-400">Панель управления скриптами</div>
+                <div className="text-[11px] text-slate-400">Poco X3 NFC · Ubuntu chroot</div>
               </div>
               <span className="text-xs font-mono text-indigo-300 bg-indigo-950/60 border border-indigo-500/30 px-2 py-0.5 rounded">
                 :8050
@@ -445,7 +486,7 @@ export function App() {
                       activeTab === 'dashboard' ? 'text-indigo-100' : 'text-slate-400'
                     }`}
                   >
-                    Все программы 24/7, задачи и диск
+                    Программы 24/7, задачи, Poco X3 (45–55%)
                   </div>
                 </div>
               </button>
@@ -467,7 +508,7 @@ export function App() {
                       activeTab === 'projects' ? 'text-indigo-100' : 'text-slate-400'
                     }`}
                   >
-                    Файлы, свои куки и ТГ скрипта, расписание
+                    Код, вход на сайте, терминал GitHub, ТГ
                   </div>
                 </div>
               </button>
@@ -542,7 +583,7 @@ export function App() {
 
           <div className="pt-4 border-t border-slate-800 space-y-2">
             <div className="px-2 text-[11px] font-mono text-slate-400">
-              Ubuntu 24.04 chroot · aarch64
+              Poco X3 NFC (surya) · Root 45–55%
             </div>
             <button
               type="button"
@@ -570,6 +611,14 @@ export function App() {
             <div className="flex items-center gap-3 shrink-0">
               {dashboard?.system && (
                 <div className="hidden md:flex items-center gap-3 text-xs font-mono text-slate-300 bg-[#1e293b] border border-slate-800 px-3 py-1.5 rounded-lg">
+                  {dashboard.hardware && (
+                    <>
+                      <span className="text-emerald-300">
+                        Аккум.: {dashboard.hardware.battery.capacity_pct}% (45–55%)
+                      </span>
+                      <span className="text-slate-600">·</span>
+                    </>
+                  )}
                   <span>ОЗУ Hub: {dashboard.system.hub_rss_mb} МБ</span>
                   <span className="text-slate-600">·</span>
                   <span>Диск своб.: {dashboard.system.disk.free_mb} МБ</span>
@@ -594,6 +643,7 @@ export function App() {
                 onStartProject={handleStartProject}
                 onStopProject={handleStopProject}
                 onRestartProject={handleRestartProject}
+                onCloneProject={handleCloneProject}
                 onOpenProjectWorkspace={(p, subTab = 'editor') => {
                   setSelectedProject(p);
                   setWorkspaceSubTab(subTab);
@@ -620,6 +670,7 @@ export function App() {
                 onRestartProject={handleRestartProject}
                 onUpdateProject={handleUpdateProject}
                 onDeleteProject={handleDeleteProject}
+                onCloneProject={handleCloneProject}
                 onRefreshAll={() => loadAllData()}
                 apiFetch={apiFetch}
               />

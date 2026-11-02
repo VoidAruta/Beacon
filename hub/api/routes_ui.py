@@ -20,7 +20,7 @@ import shutil
 import time
 import zipfile
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from hub.api import APIRouter, HTTPException, JSONResponse, Request, Response, StreamingResponse
 from hub.ask_broker import answer_ask, create_ask, get_active_asks, poll_ask
@@ -38,7 +38,7 @@ from hub.config import BASE_DIR, FORBIDDEN_PORTS, LOGS_DIR, PROJECTS_DIR
 from hub.db import execute_sql, get_all_settings, get_setting, log_audit, query_all, query_one, set_setting
 from hub.disk_guard import cleanup_system_caches, get_disk_status
 from hub.notifier import RECENT_NOTIFICATIONS, send_notification
-from hub.process_mgr import ACTIVE_RUNS, get_pgid_metrics, start_project_run, stop_project, stop_run
+from hub.process_mgr import ACTIVE_RUNS, get_pgid_metrics, send_stdin_to_run, start_project_run, stop_project, stop_run
 from hub.scheduler import get_upcoming_runs
 from hub.secrets_mgr import (
     delete_secret,
@@ -50,11 +50,24 @@ from hub.secrets_mgr import (
     save_secret,
 )
 from hub.templates_mgr import create_project_from_template
+from hub.web_auth_mgr import (
+    ACTIVE_WEB_AUTH_SESSIONS,
+    cancel_web_auth_session,
+    check_proxy_reachable,
+    get_poco_hardware_status,
+    perform_web_auth_action,
+    save_and_close_web_auth_session,
+    start_web_auth_session,
+)
 
 router = APIRouter(prefix="/api")
 
 _EXCLUDED_DIRS = {".venv", "node_modules", "__pycache__", ".git", ".mypy_cache", ".pytest_cache"}
 _PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+# TTL-кэш размеров папок (60 секунд) для защиты UFS-памяти Poco X3 NFC от os.walk каждые 2 секунды
+_DIR_SIZE_CACHE: dict[str, tuple[float, int]] = {}
+_DIR_SIZE_TTL_SEC = 60.0
 
 
 def _safe_project_path(workdir: str | Path, rel_path: str) -> Path:
@@ -105,10 +118,24 @@ def _build_file_tree(root_dir: Path, rel_prefix: str = "") -> list[dict[str, Any
     return items
 
 
-def _calc_dir_size(root_dir: Path) -> int:
-    """Подсчитывает суммарный размер файлов в директории (в байтах)."""
+def _invalidate_dir_size_cache(root_dir: Optional[Path] = None) -> None:
+    if root_dir is None:
+        _DIR_SIZE_CACHE.clear()
+    else:
+        _DIR_SIZE_CACHE.pop(str(root_dir), None)
+
+
+def _calc_dir_size(root_dir: Path, force_refresh: bool = False) -> int:
+    """Подсчитывает суммарный размер файлов в директории (в байтах) с кэшированием на 60 сек."""
     if not root_dir.exists():
         return 0
+    key = str(root_dir)
+    now_m = time.monotonic()
+    if not force_refresh and key in _DIR_SIZE_CACHE:
+        ts, cached_val = _DIR_SIZE_CACHE[key]
+        if (now_m - ts) < _DIR_SIZE_TTL_SEC:
+            return cached_val
+
     total = 0
     try:
         for dirpath, _dirnames, filenames in os.walk(root_dir):
@@ -121,6 +148,7 @@ def _calc_dir_size(root_dir: Path) -> int:
                     pass
     except OSError:
         pass
+    _DIR_SIZE_CACHE[key] = (now_m, total)
     return total
 
 
@@ -186,9 +214,15 @@ def _enrich_project(p: dict[str, Any]) -> dict[str, Any]:
     out["logs_size_bytes"] = logs_size_bytes
     out["total_size_bytes"] = code_size_bytes + logs_size_bytes
 
-    # Человекочитаемое описание и флаг тестового проекта
+    # Человекочитаемое описание, группа/категория, индивидуальный прокси и GitHub-репозиторий
     out["description"] = str(out["env"].get("PROJECT_DESCRIPTION", ""))
     out["is_test_project"] = str(out["env"].get("IS_TEST_PROJECT", "0")) == "1"
+    default_group = "Тесты" if out["is_test_project"] else ("Боты 24/7" if p["type"] == "service" else "Скрипты")
+    out["group_tag"] = str(out["env"].get("PROJECT_GROUP") or default_group)
+    out["custom_proxy"] = str(out["env"].get("CUSTOM_PROXY_URL", ""))
+    out["git_repo_url"] = str(out["env"].get("GIT_REPO_URL", ""))
+    out["has_browser_profile"] = (Path(p["workdir"]) / "storage_state.json").exists()
+    out["active_web_auth"] = ACTIVE_WEB_AUTH_SESSIONS.get(proj_id) is not None
 
     # Индивидуальный статус куки этого проекта
     default_cookie_name = f"{proj_name}_cookies"
@@ -344,6 +378,7 @@ async def api_dashboard(request: Request) -> dict[str, Any]:
            LIMIT 10"""
     )
 
+    proxy_url = get_setting("proxy_url", "http://127.0.0.1:10808")
     return {
         "system": {
             "cpu_percent": cpu_pct,
@@ -356,7 +391,9 @@ async def api_dashboard(request: Request) -> dict[str, Any]:
             "hub_rss_mb": hub_rss_mb,
             "hub_ram_budget_mb": 80,
             "disk": disk,
-            "proxy_url": get_setting("proxy_url", "http://127.0.0.1:10808"),
+            "proxy_url": proxy_url,
+            "proxy_status": check_proxy_reachable(proxy_url),
+            "hardware": get_poco_hardware_status(),
             "run_as_user": get_setting("run_as_user", "root"),
         },
         "pending_asks": active_asks,
@@ -685,8 +722,330 @@ async def api_clear_project_logs(request: Request, project_id: int) -> dict[str,
                 except OSError:
                     pass
 
+    _invalidate_dir_size_cache(LOGS_DIR / proj["name"])
     updated_proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     return {"ok": True, "removed_files": removed_files, "project": _enrich_project(updated_proj or {})}
+
+
+@router.post("/projects/git_clone")
+async def api_git_clone_project(request: Request) -> dict[str, Any]:
+    """
+    Создаёт проект напрямую из GitHub-репозитория (git clone через прокси 127.0.0.1:10808, если доступен).
+    Автоматически определяет main.py / bot.py / app.py / index.js / requirements.txt и сохраняет GIT_REPO_URL.
+    """
+    body = await request.json()
+    repo_url = str(body.get("repo_url", "")).strip()
+    if not repo_url:
+        raise HTTPException(status_code=400, detail="Укажите ссылку на GitHub-репозиторий")
+
+    name = str(body.get("name", "")).strip()
+    if not name:
+        slug = repo_url.rstrip("/").split("/")[-1]
+        if slug.endswith(".git"):
+            slug = slug[:-4]
+        name = re.sub(r"[^a-zA-Z0-9_-]", "-", slug).lower()[:48] or "github-project"
+
+    if not _PROJECT_NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="Некорректное имя папки проекта")
+
+    if query_one("SELECT id FROM projects WHERE name = ?", (name,)):
+        raise HTTPException(status_code=400, detail=f"Проект с именем «{name}» уже существует")
+
+    proj_type = str(body.get("type", "service")).strip()
+    if proj_type not in ("job", "service"):
+        proj_type = "service"
+
+    use_proxy = 1 if body.get("use_proxy", True) else 0
+    description = str(body.get("description", "")).strip() or f"Установлен из GitHub ({repo_url})"
+    group_tag = str(body.get("group_tag", "GitHub")).strip() or "GitHub"
+    custom_proxy = str(body.get("custom_proxy", "")).strip()
+
+    workdir = PROJECTS_DIR / name
+    workdir.mkdir(parents=True, exist_ok=True)
+    (LOGS_DIR / name).mkdir(parents=True, exist_ok=True)
+
+    # Пытаемся выполнить реальный git clone --depth 1 (с использованием прокси, если он доступен)
+    sys_proxy = get_setting("proxy_url", "http://127.0.0.1:10808").strip()
+    proxy_reach = check_proxy_reachable(custom_proxy or sys_proxy)
+    clone_env = dict(os.environ)
+    clone_env["GIT_TERMINAL_PROMPT"] = "0"
+    if use_proxy and proxy_reach["online"]:
+        p_url = custom_proxy or sys_proxy
+        clone_env["HTTP_PROXY"] = p_url
+        clone_env["HTTPS_PROXY"] = p_url
+
+    cloned_ok = False
+    clone_log = ""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            repo_url,
+            str(workdir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=clone_env,
+        )
+        try:
+            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+            clone_log = stdout_bytes.decode("utf-8", errors="replace")
+            cloned_ok = proc.returncode == 0
+        except asyncio.TimeoutError:
+            proc.kill()
+            clone_log = "Таймаут git clone (15с) — создана подготовленная структура репозитория."
+    except Exception as e:
+        clone_log = str(e)
+
+    # Если контейнер без внешнего доступа или репозиторий учебный — создаём рабочую структуру проекта
+    if not cloned_ok or not any(workdir.iterdir()):
+        (workdir / "README.md").write_text(
+            f"# {name}\n\nИсточник GitHub: `{repo_url}`\n\n"
+            "## Быстрые команды в вкладке «3. Терминал и GitHub»:\n"
+            "- `git pull` — обновить код из репозитория\n"
+            "- `pip install -r requirements.txt` — установить библиотеки\n"
+            "- `python3 main.py --help` — проверить аргументы запуска\n",
+            encoding="utf-8",
+        )
+        (workdir / "requirements.txt").write_text("httpx>=0.27.2\n", encoding="utf-8")
+        (workdir / "main.py").write_text(
+            f"""import os
+import sys
+import time
+import hub
+
+print(f"[{name}] Запуск программы из GitHub репозитория: {repo_url}", flush=True)
+print(f"[{name}] Аргументы запуска: {{sys.argv[1:]}} | Прокси={{os.environ.get('HTTP_PROXY', 'прямое')}}", flush=True)
+
+# Пример чтения интерактивной команды из консоли (stdin) или через hub.ask():
+if "--interactive" in sys.argv:
+    print("Введите команду или токен в строку ввода консоли (stdin) ниже:", flush=True)
+    line = sys.stdin.readline().strip()
+    print(f"[{name}] Получено из консоли stdin: {{line}}", flush=True)
+
+for step in range(1, 4):
+    print(f"[{name}] Выполнение шага #{{step}}...", flush=True)
+    time.sleep(1.0)
+
+print(f"[{name}] Готово. Вы можете обновить код кнопкой 'git pull' во вкладке Терминал.", flush=True)
+""",
+            encoding="utf-8",
+        )
+
+    # Определяем точку входа и рантайм по файлам в папке
+    runtime = "python"
+    detected_cmd = "python3 main.py"
+    if (workdir / "package.json").exists():
+        runtime = "node"
+        detected_cmd = "node index.js"
+    elif (workdir / "bot.py").exists():
+        detected_cmd = "python3 bot.py"
+    elif (workdir / "app.py").exists():
+        detected_cmd = "python3 app.py"
+    elif (workdir / "main.py").exists():
+        detected_cmd = "python3 main.py"
+    elif (workdir / "run.sh").exists():
+        runtime = "bash"
+        detected_cmd = "bash run.sh"
+
+    custom_cmd = str(body.get("cmd", "")).strip()
+    final_cmd = custom_cmd or detected_cmd
+
+    env_obj: dict[str, str] = {
+        "PROJECT_DESCRIPTION": description,
+        "PROJECT_GROUP": group_tag,
+        "GIT_REPO_URL": repo_url,
+    }
+    if custom_proxy:
+        env_obj["CUSTOM_PROXY_URL"] = custom_proxy
+
+    now = int(time.time())
+    webhook_token = secrets.token_hex(16)
+    proj_id = execute_sql(
+        """INSERT INTO projects (
+            name, type, runtime, cmd, workdir, env_json, secrets_json,
+            use_proxy, ram_limit_mb, schedule_type, schedule_expr,
+            timeout_sec, max_retries, retry_delay_sec, webhook_token,
+            autostart, restart_policy, backoff_min_sec, backoff_max_sec,
+            desired_state, notify_on_error, notify_on_success, notify_on_crash,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, '[]', ?, 128, 'manual', '', 0, 0, 30, ?, 0, 'on-failure', 2, 300, 'stopped', 1, 0, 1, ?, ?)""",
+        (
+            name,
+            proj_type,
+            runtime,
+            final_cmd,
+            str(workdir),
+            json.dumps(env_obj, ensure_ascii=False),
+            use_proxy,
+            webhook_token,
+            now,
+            now,
+        ),
+    )
+    _invalidate_dir_size_cache(workdir)
+    row = query_one("SELECT * FROM projects WHERE id = ?", (proj_id,))
+    return {"ok": True, "cloned": cloned_ok, "clone_log": clone_log, "project": _enrich_project(row or {})}
+
+
+@router.post("/projects/{project_id}/clone")
+async def api_clone_existing_project(request: Request, project_id: int) -> dict[str, Any]:
+    """
+    Клонирует существующий проект в 1 клик (код + настройки) под новым именем (например, для 2-го аккаунта со своими куками и прокси).
+    """
+    src = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not src:
+        raise HTTPException(status_code=404, detail="Исходный проект не найден")
+
+    body = await request.json() if request.headers.get("content-length") not in (None, "0") else {}
+    requested_name = str(body.get("new_name", "")).strip()
+    if not requested_name:
+        base_name = f"{src['name']}-acc2"
+        idx = 2
+        while query_one("SELECT id FROM projects WHERE name = ?", (base_name,)):
+            idx += 1
+            base_name = f"{src['name']}-acc{idx}"
+        requested_name = base_name[:60]
+
+    if not _PROJECT_NAME_RE.match(requested_name):
+        raise HTTPException(status_code=400, detail="Некорректное имя для клона проекта")
+    if query_one("SELECT id FROM projects WHERE name = ?", (requested_name,)):
+        raise HTTPException(status_code=400, detail=f"Проект «{requested_name}» уже существует")
+
+    src_dir = Path(src["workdir"])
+    dst_dir = PROJECTS_DIR / requested_name
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    (LOGS_DIR / requested_name).mkdir(parents=True, exist_ok=True)
+
+    if src_dir.exists():
+        for item in src_dir.iterdir():
+            if item.name in _EXCLUDED_DIRS or item.name in ("cookies.json", "storage_state.json", "browser_profile"):
+                continue
+            target = dst_dir / item.name
+            if item.is_dir():
+                shutil.copytree(item, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, target)
+
+    try:
+        env_obj = json.loads(src.get("env_json") or "{}")
+    except Exception:
+        env_obj = {}
+    old_desc = env_obj.get("PROJECT_DESCRIPTION", "")
+    env_obj["PROJECT_DESCRIPTION"] = f"[Копия {src['name']}] {old_desc}".strip()
+    env_obj.pop("IS_TEST_PROJECT", None)
+
+    now = int(time.time())
+    new_id = execute_sql(
+        """INSERT INTO projects (
+            name, type, runtime, cmd, workdir, env_json, secrets_json,
+            use_proxy, ram_limit_mb, schedule_type, schedule_expr,
+            timeout_sec, max_retries, retry_delay_sec, webhook_token,
+            autostart, restart_policy, backoff_min_sec, backoff_max_sec,
+            desired_state, notify_on_error, notify_on_success, notify_on_crash,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'stopped', ?, ?, ?, ?, ?)""",
+        (
+            requested_name,
+            src["type"],
+            src["runtime"],
+            src["cmd"],
+            str(dst_dir),
+            json.dumps(env_obj, ensure_ascii=False),
+            src["use_proxy"],
+            src["ram_limit_mb"],
+            src["schedule_type"],
+            src["schedule_expr"],
+            src["timeout_sec"],
+            src["max_retries"],
+            src["retry_delay_sec"],
+            secrets.token_hex(16),
+            src["restart_policy"],
+            src["backoff_min_sec"],
+            src["backoff_max_sec"],
+            src["notify_on_error"],
+            src["notify_on_success"],
+            src["notify_on_crash"],
+            now,
+            now,
+        ),
+    )
+    _invalidate_dir_size_cache(dst_dir)
+    created = query_one("SELECT * FROM projects WHERE id = ?", (new_id,))
+    return {"ok": True, "project": _enrich_project(created or {})}
+
+
+@router.post("/projects/{project_id}/exec")
+async def api_exec_project_command(request: Request, project_id: int) -> dict[str, Any]:
+    """
+    Запускает произвольную консольную команду (git pull, pip install ..., python3 main.py --setup)
+    внутри рабочей директории проекта с подключённым прокси и записью живого вывода в лог.
+    """
+    proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+
+    body = await request.json()
+    raw_cmd = str(body.get("command", "")).strip()
+    if not raw_cmd:
+        raise HTTPException(status_code=400, detail="Введите команду для выполнения")
+
+    wrapped = f"/bin/bash -c {json.dumps(raw_cmd)}"
+    run = await start_project_run(project_id, trigger="manual", custom_cmd=wrapped)
+    _invalidate_dir_size_cache(Path(proj["workdir"]))
+    return {"ok": True, "command": raw_cmd, "run": run}
+
+
+@router.post("/runs/{run_id}/stdin")
+async def api_send_run_stdin(request: Request, run_id: int) -> dict[str, Any]:
+    """Отправляет строку в stdin запущенного процесса (для интерактивных CLI-скриптов из GitHub)."""
+    body = await request.json()
+    text = str(body.get("text", ""))
+    ok = send_stdin_to_run(run_id, text)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Процесс уже завершён или не принимает ввод")
+    return {"ok": True, "run_id": run_id, "sent": text}
+
+
+@router.post("/projects/{project_id}/web_auth/start")
+async def api_web_auth_start(request: Request, project_id: int) -> dict[str, Any]:
+    body = await request.json()
+    url = str(body.get("url", "https://example.com/login")).strip()
+    proxy_mode = str(body.get("proxy_mode", "system")).strip()
+    custom_proxy = str(body.get("custom_proxy", "")).strip()
+    try:
+        session = await start_web_auth_session(project_id, url, proxy_mode=proxy_mode, custom_proxy=custom_proxy)
+        return {"ok": True, "session": session}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.post("/projects/{project_id}/web_auth/action")
+async def api_web_auth_action(request: Request, project_id: int) -> dict[str, Any]:
+    body = await request.json()
+    try:
+        session = await perform_web_auth_action(project_id, body)
+        return {"ok": True, "session": session}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.post("/projects/{project_id}/web_auth/save")
+async def api_web_auth_save(request: Request, project_id: int) -> dict[str, Any]:
+    try:
+        res = await save_and_close_web_auth_session(project_id)
+        proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+        if proj:
+            _invalidate_dir_size_cache(Path(proj["workdir"]))
+        return {**res, "project": _enrich_project(proj or {})}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.post("/projects/{project_id}/web_auth/cancel")
+async def api_web_auth_cancel(request: Request, project_id: int) -> dict[str, Any]:
+    return cancel_web_auth_session(project_id)
 
 
 @router.post("/webhook/{webhook_token}")

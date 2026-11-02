@@ -1,3 +1,28 @@
+export interface PocoHardwareStatus {
+  device_model: string;
+  battery_percent: number;
+  raw_status: string;
+  power_plugged: boolean;
+  min_target_pct: number;
+  max_target_pct: number;
+  alert_below_pct: number;
+  cycle_state: 'cycle_ok' | 'charging_to_target' | 'power_loss' | 'critical_low';
+  cycle_label: string;
+  should_alert: boolean;
+  battery_temp_c: number;
+  cpu_temp_c: number;
+  thermal_warning: boolean;
+  is_real_sysfs: boolean;
+}
+
+export interface ProxyReachabilityStatus {
+  configured: boolean;
+  online: boolean;
+  host: string;
+  port: number;
+  latency_ms: number;
+}
+
 export interface SystemStatus {
   cpu_percent: number;
   ram_total_mb: number;
@@ -19,7 +44,39 @@ export interface SystemStatus {
     can_start_runs: boolean;
   };
   proxy_url: string;
+  proxy_status?: ProxyReachabilityStatus;
+  hardware?: PocoHardwareStatus;
   run_as_user: string;
+}
+
+export interface WebAuthSession {
+  project_id: number;
+  project_name: string;
+  current_url: string;
+  domain: string;
+  page_title: string;
+  http_status: number;
+  proxy_mode: string;
+  proxy_used: string;
+  user_agent: string;
+  antibot_passed: boolean;
+  logged_in: boolean;
+  form_login: string;
+  form_password?: string;
+  form_2fa: string;
+  cookies: Array<{
+    domain: string;
+    name: string;
+    value: string;
+    path?: string;
+    httpOnly?: boolean;
+    secure?: boolean;
+  }>;
+  local_storage: Record<string, string>;
+  profile_dir: string;
+  started_at: number;
+  last_action: string;
+  preview_data_url: string;
 }
 
 export interface PendingAsk {
@@ -110,6 +167,11 @@ export interface ProjectItem {
   total_size_bytes: number;
   description: string;
   is_test_project: boolean;
+  group_tag?: string;
+  custom_proxy?: string;
+  git_repo_url?: string;
+  has_browser_profile?: boolean;
+  active_web_auth?: boolean;
   cookie_status: ProjectCookieStatus;
 }
 

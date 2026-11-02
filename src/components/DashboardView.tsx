@@ -18,6 +18,11 @@ import {
   Bot,
   FlaskConical,
   FolderOpen,
+  BatteryCharging,
+  CopyPlus,
+  Search,
+  Globe,
+  GitBranch,
 } from 'lucide-react';
 import { DashboardData, ProjectItem } from '../types/hub';
 import { describeScheduleHuman, formatBytes, formatDurationSec } from '../utils/hubLogic';
@@ -27,7 +32,11 @@ interface DashboardViewProps {
   onStartProject: (id: number) => Promise<void>;
   onStopProject: (id: number) => Promise<void>;
   onRestartProject: (id: number) => Promise<void>;
-  onOpenProjectWorkspace: (project: ProjectItem, initialSubTab?: 'editor' | 'cookies_tg' | 'simple_cfg' | 'advanced_cfg') => void;
+  onCloneProject?: (id: number) => Promise<void>;
+  onOpenProjectWorkspace: (
+    project: ProjectItem,
+    initialSubTab?: 'editor' | 'cookies_tg' | 'terminal_git' | 'simple_cfg' | 'advanced_cfg'
+  ) => void;
   onOpenCreateModal: () => void;
   onTriggerDemoAsk: () => Promise<void>;
   onTriggerDemoExpiredCookie: () => Promise<void>;
@@ -47,6 +56,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onStartProject,
   onStopProject,
   onRestartProject,
+  onCloneProject,
   onOpenProjectWorkspace,
   onOpenCreateModal,
   onTriggerDemoAsk,
@@ -57,6 +67,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [busyProjectId, setBusyProjectId] = useState<number | null>(null);
   const [testingRestart, setTestingRestart] = useState(false);
   const [filter, setFilter] = useState<ProjectFilter>('all');
+  const [searchQuery, setSearchQuery] = useState('');
 
   if (!data) {
     return (
@@ -75,9 +86,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const totalProjectsBytes = projects.reduce((acc, p) => acc + (p.total_size_bytes || 0), 0);
 
   const filteredProjects = projects.filter((p) => {
-    if (filter === 'service') return p.type === 'service';
-    if (filter === 'job') return p.type === 'job';
-    if (filter === 'test') return p.is_test_project;
+    if (filter === 'service' && p.type !== 'service') return false;
+    if (filter === 'job' && p.type !== 'job') return false;
+    if (filter === 'test' && !p.is_test_project) return false;
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      const matchName = p.name.toLowerCase().includes(q);
+      const matchDesc = (p.description || '').toLowerCase().includes(q);
+      const matchGroup = (p.group_tag || '').toLowerCase().includes(q);
+      return matchName || matchDesc || matchGroup;
+    }
     return true;
   });
 
@@ -210,20 +228,23 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
         <div className="bg-[#1e293b] border border-slate-800 rounded-xl p-4">
           <div className="flex items-center justify-between text-xs text-slate-400">
-            <span>Активные процессы и Прокси</span>
-            <ShieldCheck className="w-4 h-4 text-emerald-400" />
+            <span>Poco X3 NFC (Root 45–55%) и Прокси</span>
+            <BatteryCharging className="w-4 h-4 text-emerald-400" />
           </div>
           <div className="mt-2 flex items-baseline gap-2">
             <span className="text-2xl font-bold text-white font-mono tabular-nums">
-              {runningCount} из {projects.length}
+              {system.hardware ? `${system.hardware.battery_percent}%` : `${runningCount}/${projects.length}`}
             </span>
-            <span className="text-xs text-slate-400">сейчас в работе</span>
+            <span className="text-xs text-emerald-300 font-mono truncate">
+              {system.hardware ? `· ${system.hardware.battery_temp_c}°C (CPU ${system.hardware.cpu_temp_c}°C)` : 'сейчас в работе'}
+            </span>
           </div>
-          <p className="mt-2 text-xs text-slate-300 font-mono truncate">
-            Прокси: {system.proxy_url}
+          <p className="mt-1.5 text-[11px] text-slate-200 truncate" title={system.hardware?.cycle_label}>
+            {system.hardware?.cycle_label || 'Контроллер заряда 45%–55% активен'}
           </p>
-          <p className="mt-1 text-[11px] text-slate-400">
-            Программ 24/7: <strong>{servicesCount}</strong> · Скриптов по расписанию: <strong>{jobsCount}</strong>
+          <p className="mt-1 text-[11px] text-slate-400 font-mono flex items-center justify-between">
+            <span>Прокси 10808: {system.proxy_status?.online ? 'Онлайн' : 'Ожидание туннеля'}</span>
+            <span>Рабочих: {runningCount}/{projects.length}</span>
           </p>
         </div>
       </section>
@@ -316,6 +337,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
+              <div className="relative">
+                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2" />
+                <input
+                  type="text"
+                  placeholder="Поиск проекта или группы..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="bg-slate-900 border border-slate-700 rounded-lg pl-8 pr-3 py-1 text-xs text-white focus:border-indigo-500 focus:outline-none w-48"
+                />
+              </div>
+
               <button
                 type="button"
                 onClick={onTriggerDemoAsk}
@@ -380,7 +412,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 return (
                   <tr key={p.id} className="hover:bg-slate-800/40 transition-colors align-top">
                     {/* 1. Название и понятное описание */}
-                    <td className="py-3.5 px-4 max-w-[300px]">
+                    <td className="py-3.5 px-4 max-w-[260px]">
                       <div className="flex items-center gap-2 flex-wrap">
                         <button
                           type="button"
@@ -392,6 +424,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                         <span className="text-[11px] font-mono text-slate-400 bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800">
                           {p.runtime}
                         </span>
+                        {p.group_tag && (
+                          <span className="text-[10px] text-indigo-300 bg-indigo-950/60 border border-indigo-500/30 px-1.5 py-0.5 rounded">
+                            {p.group_tag}
+                          </span>
+                        )}
+                        {p.git_repo_url && (
+                          <span className="text-[10px] text-emerald-300 bg-emerald-950/60 border border-emerald-500/30 px-1.5 py-0.5 rounded inline-flex items-center gap-1">
+                            <GitBranch className="w-2.5 h-2.5" />
+                            GitHub
+                          </span>
+                        )}
                         {p.is_test_project && (
                           <span className="text-[11px] text-amber-300 bg-amber-950/60 border border-amber-500/30 px-1.5 py-0.5 rounded">
                             Тестовый пример
@@ -399,7 +442,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                         )}
                       </div>
                       {p.description ? (
-                        <p className="mt-1 text-xs text-slate-300 leading-relaxed">{p.description}</p>
+                        <p className="mt-1 text-xs text-slate-300 leading-relaxed line-clamp-2" title={p.description}>
+                          {p.description}
+                        </p>
                       ) : (
                         <div className="mt-1 text-xs text-slate-400 font-mono truncate">{p.cmd}</div>
                       )}
@@ -463,8 +508,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                           </div>
                         )}
 
+                        {p.has_browser_profile && (
+                          <div className="text-[11px] text-emerald-300 flex items-center gap-1">
+                            <Globe className="w-3 h-3 shrink-0" />
+                            Профиль Антибот/Storage сохранён
+                          </div>
+                        )}
+
                         {p.use_proxy === 1 && (
-                          <div className="text-[11px] text-slate-400 font-mono">Прокси: 127.0.0.1:10808</div>
+                          <div className="text-[11px] text-slate-400 font-mono truncate max-w-[180px]">
+                            Прокси: {p.custom_proxy || '127.0.0.1:10808'}
+                          </div>
                         )}
                       </div>
                     </td>
@@ -520,6 +574,19 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                               <RotateCcw className="w-3.5 h-3.5" />
                             </button>
                           </>
+                        )}
+
+                        {onCloneProject && (
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            aria-label={`Клонировать ${p.name}`}
+                            title="Клонировать проект в 1 клик (например, под 2-й аккаунт со своими куками и прокси)"
+                            onClick={() => handleAction(p.id, onCloneProject)}
+                            className="p-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-lg transition-colors cursor-pointer"
+                          >
+                            <CopyPlus className="w-3.5 h-3.5" />
+                          </button>
                         )}
 
                         <button

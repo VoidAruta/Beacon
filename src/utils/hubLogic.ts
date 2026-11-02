@@ -262,3 +262,85 @@ export function describeScheduleHuman(
   }
   return `По расписанию Cron: ${expr}`;
 }
+
+/**
+ * Оценивает состояние батареи для Xiaomi Poco X3 NFC с Root-контроллером удержания заряда (45% — 55%).
+ * Когда контроллер отключает ток на 55% и телефон плавно разряжается до 45%, это штатный цикл (без тревоги).
+ * Тревога срабатывает только при падении заряда ниже alertBelowPct (по умолчанию < 40%).
+ */
+export function evaluatePocoBatteryCycle(
+  percent: number,
+  status: string,
+  minTarget: number = 45,
+  maxTarget: number = 55,
+  alertBelowPct: number = 40
+): {
+  state: 'cycle_ok' | 'charging_to_target' | 'power_loss' | 'critical_low';
+  label: string;
+  shouldAlert: boolean;
+} {
+  const pct = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  if (pct < 20) {
+    return {
+      state: 'critical_low',
+      label: `Критический разряд ${pct}% (< 20%) — сбой питания!`,
+      shouldAlert: true,
+    };
+  }
+  if (pct < alertBelowPct) {
+    return {
+      state: 'power_loss',
+      label: `Внимание: заряд ${pct}% ниже порога ${alertBelowPct}% (проверьте питание / Root-контроллер)`,
+      shouldAlert: true,
+    };
+  }
+  if (status === 'Charging') {
+    return {
+      state: 'charging_to_target',
+      label: `Зарядка до ${maxTarget}% (сейчас ${pct}%, цикл ${minTarget}–${maxTarget}%)`,
+      shouldAlert: false,
+    };
+  }
+  return {
+    state: 'cycle_ok',
+    label: `Удержание ${minTarget}–${maxTarget}% в норме (${pct}%, плавный спуск до ${minTarget}%)`,
+    shouldAlert: false,
+  };
+}
+
+/**
+ * Проверяет ссылку на GitHub-репозиторий и извлекает рекомендуемое имя папки проекта.
+ */
+export function parseGitHubRepoUrl(rawUrl: string): {
+  valid: boolean;
+  cleanUrl: string;
+  suggestedName: string;
+  owner?: string;
+  repo?: string;
+  error?: string;
+} {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) {
+    return { valid: false, cleanUrl: '', suggestedName: '', error: 'Введите ссылку на GitHub-репозиторий' };
+  }
+  const match = trimmed.match(/^https?:\/\/(?:www\.)?github\.com\/([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+?)(?:\.git|\/)?$/i);
+  if (!match) {
+    return {
+      valid: false,
+      cleanUrl: trimmed,
+      suggestedName: '',
+      error: 'Ссылка должна иметь вид https://github.com/автор/репозиторий',
+    };
+  }
+  const owner = match[1];
+  const repo = match[2];
+  const safeName = repo.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase().slice(0, 48) || 'github-app';
+  return {
+    valid: true,
+    cleanUrl: `https://github.com/${owner}/${repo}.git`,
+    suggestedName: safeName,
+    owner,
+    repo,
+  };
+}
+

@@ -9,6 +9,8 @@ import {
   formatDurationSec,
   formatBytes,
   describeScheduleHuman,
+  evaluatePocoBatteryCycle,
+  parseGitHubRepoUrl,
 } from './hubLogic';
 
 test('calculateBackoffDelay computes exponential backoff and respects max cap', () => {
@@ -88,3 +90,32 @@ test('formatBytes and describeScheduleHuman format disk usage and human schedule
     describeScheduleHuman('service', 'manual', '', 'always', 1).includes('Работает 24/7 в фоне')
   );
 });
+
+test('evaluatePocoBatteryCycle treats 45-55% discharging cycle as normal without false alerts', () => {
+  const normalDrift = evaluatePocoBatteryCycle(50, 'Discharging', 45, 55, 40);
+  assert.equal(normalDrift.state, 'cycle_ok');
+  assert.equal(normalDrift.shouldAlert, false);
+
+  const charging = evaluatePocoBatteryCycle(48, 'Charging', 45, 55, 40);
+  assert.equal(charging.state, 'charging_to_target');
+  assert.equal(charging.shouldAlert, false);
+
+  const powerLoss = evaluatePocoBatteryCycle(37, 'Discharging', 45, 55, 40);
+  assert.equal(powerLoss.state, 'power_loss');
+  assert.equal(powerLoss.shouldAlert, true);
+
+  const critical = evaluatePocoBatteryCycle(15, 'Discharging', 45, 55, 40);
+  assert.equal(critical.state, 'critical_low');
+  assert.equal(critical.shouldAlert, true);
+});
+
+test('parseGitHubRepoUrl validates GitHub URLs and extracts clean project slug', () => {
+  const ok = parseGitHubRepoUrl('https://github.com/pyrogram/pyrogram');
+  assert.equal(ok.valid, true);
+  assert.equal(ok.suggestedName, 'pyrogram');
+  assert.equal(ok.cleanUrl, 'https://github.com/pyrogram/pyrogram.git');
+
+  const bad = parseGitHubRepoUrl('not-a-url');
+  assert.equal(bad.valid, false);
+});
+
