@@ -55,6 +55,7 @@ async def security_and_auth_middleware(request: Request, call_next: Callable[[Re
     if (
         path in ("/", "/index.html", "/favicon.ico", "/api/auth/login", "/api/auth/me")
         or path.startswith("/static/")
+        or path.startswith("/assets/")
         or path.startswith("/api/webhook/")
     ):
         return await call_next(request)
@@ -84,6 +85,15 @@ async def serve_spa_index(request: Request) -> Any:
     if index_file.exists():
         return FileResponse(index_file, media_type="text/html; charset=utf-8")
     return HTMLResponse("<h1>Hub Control Panel</h1>")
+
+
+@app.get("/assets/{subpath}")
+async def serve_static_assets(request: Request, subpath: str) -> Any:
+    assets_dir = (STATIC_DIR / "assets").resolve()
+    target = (assets_dir / subpath).resolve()
+    if os.path.commonpath([str(assets_dir), str(target)]) != str(assets_dir):
+        return JSONResponse({"detail": "Forbidden"}, status_code=403)
+    return FileResponse(target)
 
 
 @app.get("/static/{subpath}")

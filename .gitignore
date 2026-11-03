@@ -1,8 +1,42 @@
+# Node / Frontend build artifacts
 node_modules/
 build/
 dist/
 coverage/
+.playwright-cli/
+
+# Python virtual environments & bytecode
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# SQLite databases & runtime locks/IPC
+*.db
+*.db-wal
+*.db-shm
+*.fifo
+
+# Runtime data (secrets, logs, local DB, initial_password)
+data/*
+!data/.gitkeep
+
+# User projects (keep only .gitkeep and reference examples)
+projects/*
+!projects/.gitkeep
+!projects/examples/
+!projects/examples/**
+
+# AI Studio & IDE metadata
+.aistudio/
+metadata.json
+public/assets/aistudio/
 .DS_Store
 *.log
 .env*
 !.env.example
+
