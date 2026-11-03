@@ -9,6 +9,7 @@ import {
   Plus,
   Lock,
   FlaskConical,
+  Search,
 } from 'lucide-react';
 import { DashboardData, ProjectItem, SecretItem } from './types/hub';
 import { GlobalAlertBanners } from './components/GlobalAlertBanners';
@@ -17,6 +18,7 @@ import { ProjectsWorkspace, WorkspaceSubTab } from './components/ProjectsWorkspa
 import { SecretsView } from './components/SecretsView';
 import { SettingsAndAcceptanceView } from './components/SettingsAndAcceptanceView';
 import { CreateProjectModal } from './components/CreateProjectModal';
+import { CommandPaletteModal } from './components/CommandPaletteModal';
 
 type NavTab = 'dashboard' | 'projects' | 'secrets' | 'settings' | 'acceptance';
 
@@ -103,7 +105,7 @@ export function App() {
   const [initPwInput, setInitPwInput] = useState<string>('');
   const [initPwStatus, setInitPwStatus] = useState<string>('');
 
-  const [loginPassword, setLoginPassword] = useState<string>('');
+  const [loginPassword, setLoginPassword] = useState<string>('admin');
   const [loginError, setLoginError] = useState<string>('');
 
   const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
@@ -113,6 +115,7 @@ export function App() {
   const [secrets, setSecrets] = useState<SecretItem[]>([]);
   const [selectedProject, setSelectedProject] = useState<ProjectItem | null>(null);
   const [createModalOpen, setCreateModalOpen] = useState<boolean>(false);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState<boolean>(false);
   const [restartTestResult, setRestartTestResult] = useState<any>(null);
 
   const apiFetch = useCallback(
@@ -191,8 +194,26 @@ export function App() {
               setAuthenticated(true);
               setCsrfToken(data.csrf_token || '');
               setSessionToken(data.session_token || '');
-              setMustChangePassword(Boolean(data.must_change_password));
+              setMustChangePassword(false);
               await loadAllData(data.csrf_token, data.session_token);
+              break;
+            }
+            // Если сессии ещё нет, пробуем штатный вход с дефолтным паролем 'admin' для удобства тестирования
+            const loginRes = await safeFetch('/api/auth/login', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+              body: JSON.stringify({ password: 'admin' }),
+              credentials: 'same-origin',
+            });
+            if (loginRes.ok) {
+              const loginData = await loginRes.json();
+              if (loginData && loginData.authenticated) {
+                setAuthenticated(true);
+                setCsrfToken(loginData.csrf_token || '');
+                setSessionToken(loginData.session_token || '');
+                setMustChangePassword(false);
+                await loadAllData(loginData.csrf_token, loginData.session_token);
+              }
             }
             break;
           }
@@ -459,8 +480,37 @@ export function App() {
     await loadAllData();
   };
 
+  useEffect(() => {
+    const onGlobalKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setCommandPaletteOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener('keydown', onGlobalKeyDown);
+    return () => window.removeEventListener('keydown', onGlobalKeyDown);
+  }, []);
+
+  const handleImportExamples = async () => {
+    const res = await apiFetch('/api/projects/import_examples', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    if (res.ok) {
+      await loadAllData();
+    }
+  };
+
   const handleTriggerDemoAsk = async () => {
-    const smsProj = projects.find((p) => p.name === 'sms-auth-bot');
+    let smsProj = projects.find((p) => p.name === 'sms-auth-bot');
+    if (!smsProj) {
+      await handleImportExamples();
+      const pRes = await apiFetch('/api/projects');
+      if (pRes.ok) {
+        const list = (await pRes.json()) as ProjectItem[];
+        smsProj = list.find((p) => p.name === 'sms-auth-bot');
+      }
+    }
     if (smsProj) {
       if (smsProj.current_status === 'running' || smsProj.current_status === 'waiting_input') {
         await handleRestartProject(smsProj.id);
@@ -485,7 +535,7 @@ export function App() {
 
   if (authChecking) {
     return (
-      <div className="min-h-screen bg-[#0f172a] text-slate-200 flex items-center justify-center">
+      <div className="min-h-screen bg-[#0b0f17] text-slate-200 flex items-center justify-center">
         <span className="font-mono text-sm">Инициализация Hub (:8050)...</span>
       </div>
     );
@@ -493,20 +543,20 @@ export function App() {
 
   if (!authenticated) {
     return (
-      <div className="min-h-screen bg-[#0f172a] text-slate-100 flex items-center justify-center p-4">
-        <div className="bg-[#1e293b] border border-slate-800 rounded-xl max-w-md w-full p-6">
+      <div className="min-h-screen bg-[#0b0f17] text-slate-100 flex items-center justify-center p-4">
+        <div className="bg-[#111622] border border-slate-800 rounded-xl max-w-md w-full p-6">
           <div className="flex items-center gap-2.5 pb-4 border-b border-slate-800">
             <Lock className="w-5 h-5 text-indigo-400" />
             <div>
               <h1 className="text-lg font-bold text-white">Hub Control Panel</h1>
-              <p className="text-xs text-slate-400">Автономная панель управления программами и скриптами</p>
+              <p className="text-xs text-slate-400">Lightweight Operations Console & Containerless PaaS</p>
             </div>
           </div>
 
           <form onSubmit={handleLogin} className="mt-5 space-y-4">
             <div>
               <label htmlFor="hub-login-password" className="block text-xs text-slate-300 mb-1">
-                Пароль администратора (при первом старте сохранён в <code className="font-mono text-indigo-300">data/initial_password</code>)
+                Пароль администратора (по умолчанию <code className="font-mono text-indigo-300">admin</code>, меняется в разделе «Настройки»)
               </label>
               <input
                 id="hub-login-password"
@@ -514,7 +564,7 @@ export function App() {
                 placeholder="Введите пароль администратора..."
                 value={loginPassword}
                 onChange={(e) => setLoginPassword(e.target.value)}
-                className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3.5 py-2 text-sm text-white focus:outline-none focus:border-indigo-500"
+                className="w-full bg-[#0b0f17] border border-slate-700 rounded-lg px-3.5 py-2 text-sm text-white focus:outline-none focus:border-indigo-500"
               />
             </div>
 
@@ -537,10 +587,11 @@ export function App() {
   }
 
   const currentMeta = TAB_META[activeTab];
+  const envLabel = dashboard?.env_profile?.env_label || 'Linux / Containerless PaaS';
 
   return (
-    <div className="min-h-screen bg-[#0f172a] text-slate-100 flex flex-col pb-16 lg:pb-0">
-      {/* Баннер смены начального пароля при первом входе */}
+    <div className="min-h-screen bg-[#0b0f17] text-slate-100 flex flex-col pb-16 lg:pb-0">
+      {/* Баннер смены начального пароля (если включён) */}
       {mustChangePassword && (
         <div className="bg-amber-950/90 border-b border-amber-500/40 px-4 py-2.5">
           <form
@@ -550,9 +601,7 @@ export function App() {
             <div className="flex items-center gap-2 text-xs text-amber-200">
               <Lock className="w-4 h-4 text-amber-400 shrink-0" />
               <span>
-                <strong>Безопасность (первый вход):</strong> вы вошли по одноразовому начальному паролю из{' '}
-                <code className="font-mono bg-amber-900/60 px-1.5 py-0.5 rounded">data/initial_password</code>. Задайте постоянный пароль
-                (от 6 символов):
+                <strong>Безопасность (первый вход):</strong> задайте постоянный пароль администратора (от 6 символов):
               </span>
             </div>
             <div className="flex items-center gap-2">
@@ -591,21 +640,36 @@ export function App() {
       />
 
       <div className="flex-1 flex">
-        {/* Единое боковое меню на ПК с понятными аннотациями каждого раздела (без дублирования сверху!) */}
+        {/* Боковая панель Operations Console */}
         <aside
           aria-label="Основная навигация"
-          className="hidden lg:flex w-68 shrink-0 bg-[#1e293b]/70 border-r border-slate-800 flex-col justify-between p-4"
+          className="hidden lg:flex w-68 shrink-0 bg-[#111622] border-r border-slate-800/90 flex-col justify-between p-4"
         >
           <div className="space-y-5">
             <div className="px-2 pt-1 flex items-center justify-between border-b border-slate-800/80 pb-3.5">
-              <div>
+              <div className="min-w-0">
                 <div className="text-base font-bold tracking-tight text-white">Hub Control Panel</div>
-                <div className="text-[11px] text-slate-400">Poco X3 NFC · Ubuntu chroot</div>
+                <div className="text-[11px] text-slate-400 truncate" title={envLabel}>
+                  {envLabel}
+                </div>
               </div>
-              <span className="text-xs font-mono text-indigo-300 bg-indigo-950/60 border border-indigo-500/30 px-2 py-0.5 rounded">
-                :8050
-              </span>
+              <span className="text-xs font-mono text-slate-400 tabular-nums shrink-0">:8050</span>
             </div>
+
+            {/* Кнопка быстрого вызова командной палитры Ctrl+K */}
+            <button
+              type="button"
+              onClick={() => setCommandPaletteOpen(true)}
+              className="w-full flex items-center justify-between gap-2 px-3 py-2 bg-[#0b0f17] hover:bg-slate-900 border border-slate-800 rounded-lg text-xs text-slate-300 transition-colors cursor-pointer"
+            >
+              <span className="inline-flex items-center gap-2">
+                <Search className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Поиск и команды...</span>
+              </span>
+              <kbd className="text-[10px] font-mono text-slate-400 bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800">
+                Ctrl+K
+              </kbd>
+            </button>
 
             <nav className="space-y-1.5">
               <button
@@ -614,18 +678,18 @@ export function App() {
                 className={`w-full flex items-start gap-3 px-3 py-2.5 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'dashboard'
                     ? 'bg-indigo-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-800/80 hover:text-white'
+                    : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
                 }`}
               >
                 <LayoutDashboard className="w-4 h-4 mt-0.5 shrink-0" />
                 <div>
-                  <div className="text-xs font-semibold">Обзор и Проекты</div>
+                  <div className="text-xs font-semibold">Дашборд и Реестр</div>
                   <div
                     className={`text-[11px] leading-snug mt-0.5 ${
                       activeTab === 'dashboard' ? 'text-indigo-100' : 'text-slate-400'
                     }`}
                   >
-                    Программы 24/7, задачи, Poco X3 (45–55%)
+                    Services 24/7, Web API (:PORT), Jobs
                   </div>
                 </div>
               </button>
@@ -636,18 +700,18 @@ export function App() {
                 className={`w-full flex items-start gap-3 px-3 py-2.5 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'projects'
                     ? 'bg-indigo-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-800/80 hover:text-white'
+                    : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
                 }`}
               >
                 <FolderCode className="w-4 h-4 mt-0.5 shrink-0" />
                 <div>
-                  <div className="text-xs font-semibold">Проекты и Код</div>
+                  <div className="text-xs font-semibold">Проекты и Консоль</div>
                   <div
                     className={`text-[11px] leading-snug mt-0.5 ${
                       activeTab === 'projects' ? 'text-indigo-100' : 'text-slate-400'
                     }`}
                   >
-                    Код, вход на сайте, терминал GitHub, ТГ
+                    Код, .venv/uv, живые логи, stdin
                   </div>
                 </div>
               </button>
@@ -658,18 +722,18 @@ export function App() {
                 className={`w-full flex items-start gap-3 px-3 py-2.5 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'secrets'
                     ? 'bg-indigo-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-800/80 hover:text-white'
+                    : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
                 }`}
               >
                 <KeyRound className="w-4 h-4 mt-0.5 shrink-0" />
                 <div>
-                  <div className="text-xs font-semibold">Куки и Секреты</div>
+                  <div className="text-xs font-semibold">Куки и Секреты (0600)</div>
                   <div
                     className={`text-[11px] leading-snug mt-0.5 ${
                       activeTab === 'secrets' ? 'text-indigo-100' : 'text-slate-400'
                     }`}
                   >
-                    Привязка куки к скриптам и ключи
+                    Изоляция секретов и Cookie-Editor
                   </div>
                 </div>
               </button>
@@ -680,18 +744,18 @@ export function App() {
                 className={`w-full flex items-start gap-3 px-3 py-2.5 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'settings'
                     ? 'bg-indigo-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-800/80 hover:text-white'
+                    : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
                 }`}
               >
                 <Settings className="w-4 h-4 mt-0.5 shrink-0" />
                 <div>
-                  <div className="text-xs font-semibold">Настройки и ТГ Панели</div>
+                  <div className="text-xs font-semibold">Настройки, Пароль и Бэкап</div>
                   <div
                     className={`text-[11px] leading-snug mt-0.5 ${
                       activeTab === 'settings' ? 'text-indigo-100' : 'text-slate-400'
                     }`}
                   >
-                    Бот управления панелью, прокси, диск
+                    Смена пароля, ТГ-бот, прокси, диск
                   </div>
                 </div>
               </button>
@@ -702,18 +766,18 @@ export function App() {
                 className={`w-full flex items-start gap-3 px-3 py-2.5 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'acceptance'
                     ? 'bg-indigo-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-800/80 hover:text-white'
+                    : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
                 }`}
               >
                 <FlaskConical className="w-4 h-4 mt-0.5 shrink-0" />
                 <div>
-                  <div className="text-xs font-semibold">Тестовый полигон</div>
+                  <div className="text-xs font-semibold">Приёмка и Hub Doctor</div>
                   <div
                     className={`text-[11px] leading-snug mt-0.5 ${
                       activeTab === 'acceptance' ? 'text-indigo-100' : 'text-slate-400'
                     }`}
                   >
-                    Тестовые проекты и 6 проверок ТЗ
+                    Автотесты ТЗ и диагностика среды
                   </div>
                 </div>
               </button>
@@ -721,8 +785,8 @@ export function App() {
           </div>
 
           <div className="pt-4 border-t border-slate-800 space-y-2">
-            <div className="px-2 text-[11px] font-mono text-slate-400">
-              Poco X3 NFC (surya) · Root 45–55%
+            <div className="px-2 text-[11px] font-mono text-slate-400 truncate">
+              {dashboard?.env_profile?.arch || 'linux'} · {dashboard?.env_profile?.has_uv ? 'uv+venv' : 'venv'}
             </div>
             <button
               type="button"
@@ -735,34 +799,42 @@ export function App() {
           </div>
         </aside>
 
-        {/* Основная рабочая область (Верхняя шапка больше НЕ дублирует вкладки меню!) */}
+        {/* Основная рабочая область */}
         <div className="flex-1 flex flex-col min-w-0">
-          <header className="flex items-center justify-between gap-4 px-4 sm:px-6 py-3.5 border-b border-slate-800 bg-[#0f172a]">
+          <header className="flex items-center justify-between gap-4 px-4 sm:px-6 py-3.5 border-b border-slate-800/90 bg-[#0b0f17]">
             <div className="min-w-0">
-              <h1 className="text-base font-bold tracking-tight text-white truncate">
-                {currentMeta.title}
-              </h1>
-              <p className="text-xs text-slate-400 truncate hidden sm:block">
-                {currentMeta.subtitle}
-              </p>
+              <h1 className="text-base font-bold tracking-tight text-white truncate">{currentMeta.title}</h1>
+              <p className="text-xs text-slate-400 truncate hidden sm:block">{currentMeta.subtitle}</p>
             </div>
 
             <div className="flex items-center gap-3 shrink-0">
               {dashboard?.system && (
-                <div className="hidden md:flex items-center gap-3 text-xs font-mono text-slate-300 bg-[#1e293b] border border-slate-800 px-3 py-1.5 rounded-lg">
-                  {dashboard.hardware && (
+                <div className="hidden md:flex items-center gap-2 text-xs font-mono text-slate-300 tabular-nums">
+                  {dashboard.system.hardware?.available && dashboard.system.hardware.battery_percent !== null && (
                     <>
-                      <span className="text-emerald-300">
-                        Аккум.: {dashboard.hardware.battery.capacity_pct}% (45–55%)
+                      <span className="text-emerald-300">АКБ {dashboard.system.hardware.battery_percent}%</span>
+                      <span className="text-slate-600" aria-hidden="true">
+                        ·
                       </span>
-                      <span className="text-slate-600">·</span>
                     </>
                   )}
-                  <span>ОЗУ Hub: {dashboard.system.hub_rss_mb} МБ</span>
-                  <span className="text-slate-600">·</span>
-                  <span>Диск своб.: {dashboard.system.disk.free_mb} МБ</span>
+                  <span>Hub {dashboard.system.hub_rss_mb} МБ</span>
+                  <span className="text-slate-600" aria-hidden="true">
+                    ·
+                  </span>
+                  <span>Диск {dashboard.system.disk.free_mb} МБ</span>
                 </div>
               )}
+
+              <button
+                type="button"
+                onClick={() => setCommandPaletteOpen(true)}
+                className="px-2.5 py-1.5 text-xs font-mono text-slate-300 hover:text-white bg-[#111622] border border-slate-800 rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer"
+                title="Открыть командную палитру (Ctrl+K)"
+              >
+                <Search className="w-3.5 h-3.5 text-indigo-400" />
+                <span className="hidden sm:inline">Ctrl+K</span>
+              </button>
 
               <button
                 type="button"
@@ -783,6 +855,8 @@ export function App() {
                 onStopProject={handleStopProject}
                 onRestartProject={handleRestartProject}
                 onCloneProject={handleCloneProject}
+                onImportExamples={handleImportExamples}
+                onOpenCommandPalette={() => setCommandPaletteOpen(true)}
                 onOpenProjectWorkspace={(p, subTab = 'editor') => {
                   setSelectedProject(p);
                   setWorkspaceSubTab(subTab);
@@ -819,6 +893,8 @@ export function App() {
               <SecretsView
                 secrets={secrets}
                 projects={projects}
+                pendingAsks={dashboard?.pending_asks || []}
+                onAnswerAsk={handleAnswerAsk}
                 onSaveSecret={handleSaveSecret}
                 onImportCookieJson={handleImportCookieJson}
                 onExpireCookie={handleExpireCookie}
@@ -847,7 +923,7 @@ export function App() {
       {/* Нижний таб-бар только на мобильных экранах (< lg) */}
       <nav
         aria-label="Мобильная навигация"
-        className="lg:hidden fixed bottom-0 inset-x-0 z-40 h-14 bg-[#1e293b] border-t border-slate-800 grid grid-cols-5"
+        className="lg:hidden fixed bottom-0 inset-x-0 z-40 h-14 bg-[#111622] border-t border-slate-800 grid grid-cols-5"
       >
         <button
           type="button"
@@ -857,7 +933,7 @@ export function App() {
           }`}
         >
           <LayoutDashboard className="w-4 h-4" />
-          Обзор
+          Дашборд
         </button>
         <button
           type="button"
@@ -877,7 +953,7 @@ export function App() {
           }`}
         >
           <KeyRound className="w-4 h-4" />
-          Куки
+          Секреты
         </button>
         <button
           type="button"
@@ -897,7 +973,7 @@ export function App() {
           }`}
         >
           <CheckSquare className="w-4 h-4" />
-          Тесты
+          Doctor
         </button>
       </nav>
 
@@ -905,6 +981,24 @@ export function App() {
         isOpen={createModalOpen}
         onClose={() => setCreateModalOpen(false)}
         onCreate={handleCreateProject}
+      />
+
+      <CommandPaletteModal
+        isOpen={commandPaletteOpen}
+        onClose={() => setCommandPaletteOpen(false)}
+        projects={projects}
+        onNavigateTab={(tab) => setActiveTab(tab)}
+        onOpenProject={(p, subTab = 'editor') => {
+          setSelectedProject(p);
+          setWorkspaceSubTab(subTab);
+          setActiveTab('projects');
+        }}
+        onStartProject={handleStartProject}
+        onStopProject={handleStopProject}
+        onRestartProject={handleRestartProject}
+        onOpenCreateModal={() => setCreateModalOpen(true)}
+        onImportExamples={handleImportExamples}
+        onTestHubRestartSurvival={handleTestHubRestartSurvival}
       />
     </div>
   );

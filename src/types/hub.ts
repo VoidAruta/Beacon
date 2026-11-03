@@ -61,6 +61,17 @@ export interface SystemStatus {
   proxy_url: string;
   proxy_status?: ProxyReachabilityStatus;
   hardware?: PocoHardwareStatus;
+  env_profile?: {
+    env_mode: string;
+    env_label: string;
+    arch: string;
+    kernel: string;
+    is_android_chroot: boolean;
+    is_container: boolean;
+    has_systemd: boolean;
+    has_battery: boolean;
+    has_uv: boolean;
+  };
   run_as_user: string;
 }
 
@@ -144,7 +155,7 @@ export interface ProjectCookieStatus {
 export interface ProjectItem {
   id: number;
   name: string;
-  type: 'job' | 'service';
+  type: 'job' | 'service' | 'web';
   runtime: 'python' | 'node' | 'bash' | 'custom';
   cmd: string;
   workdir: string;
@@ -154,6 +165,11 @@ export interface ProjectItem {
   secrets: string[];
   use_proxy: number;
   ram_limit_mb: number;
+  port?: number;
+  healthcheck_url?: string;
+  healthcheck_interval_sec?: number;
+  health_status?: string;
+  has_venv?: boolean;
   schedule_type: 'manual' | 'cron' | 'interval';
   schedule_expr: string;
   timeout_sec: number;

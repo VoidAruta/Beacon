@@ -150,6 +150,22 @@ def main() -> None:
     if port in FORBIDDEN_PORTS:
         port = 8050
 
+    if len(sys.argv) > 1 and sys.argv[1] in ("systemd", "--systemd"):
+        from hub.config import BASE_DIR
+        from hub.env_detect import generate_systemd_unit
+
+        unit_text = generate_systemd_unit(BASE_DIR, port=port, user=get_setting("run_as_user", "root"))
+        unit_file = BASE_DIR / "scripts" / "hub.service"
+        try:
+            unit_file.parent.mkdir(parents=True, exist_ok=True)
+            unit_file.write_text(unit_text, encoding="utf-8")
+        except OSError:
+            pass
+        print(unit_text)
+        print(f"# Сохранено в {unit_file}. Для установки в systemd выполните:")
+        print(f"# cp {unit_file} /etc/systemd/system/hub.service && systemctl daemon-reload && systemctl enable --now hub")
+        sys.exit(0)
+
     if HAS_NATIVE_FASTAPI:
         try:
             import uvicorn  # type: ignore

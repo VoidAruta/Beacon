@@ -153,14 +153,38 @@ async def check_disk_and_maintain() -> None:
 
 
 def cleanup_system_caches() -> dict[str, Any]:
-    """Очищает кэш pip, npm, старые логи и выполняет чекпоинт SQLite WAL."""
+    """Очищает кэш pip, uv, npm, временные папки проектов (<workdir>/.tmp), старые логи и выполняет чекпоинт SQLite WAL."""
+    import shutil
+
     prune_stats = rotate_and_prune_logs()
     wal_stats = checkpoint_wal(truncate_threshold_mb=0.0)
     outputs: list[str] = [
         f"SQLite WAL checkpoint ({wal_stats['mode']}): {wal_stats['wal_size_before_kb']} КБ -> {wal_stats['wal_size_after_kb']} КБ"
     ]
 
-    for cmd in (["pip", "cache", "purge"], ["python3", "-m", "pip", "cache", "purge"], ["npm", "cache", "clean", "--force"]):
+    # Очищаем <workdir>/.tmp для остановленных проектов
+    cleaned_tmp_dirs = 0
+    for proj in query_all("SELECT id, workdir FROM projects"):
+        tmp_dir = Path(proj["workdir"]) / ".tmp"
+        if tmp_dir.exists():
+            try:
+                for item in tmp_dir.iterdir():
+                    if item.is_dir() and not item.is_symlink():
+                        shutil.rmtree(item, ignore_errors=True)
+                    else:
+                        item.unlink(missing_ok=True)
+                cleaned_tmp_dirs += 1
+            except OSError:
+                pass
+    if cleaned_tmp_dirs > 0:
+        outputs.append(f"Очищены временные каталоги .tmp у {cleaned_tmp_dirs} проектов")
+
+    for cmd in (
+        ["uv", "cache", "clean"],
+        ["pip", "cache", "purge"],
+        ["python3", "-m", "pip", "cache", "purge"],
+        ["npm", "cache", "clean", "--force"],
+    ):
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
             if res.returncode == 0:

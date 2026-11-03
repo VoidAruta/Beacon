@@ -126,9 +126,25 @@ async function ask(prompt, timeout = 300) {
   throw new Error(`Timeout waiting for hub.ask('${prompt}')`);
 }
 
+const state = {
+  async get(key, defaultVal = null) {
+    const res = await requestJson('GET', `/kv/${encodeURIComponent(String(key))}`);
+    return res.found ? res.value : defaultVal;
+  },
+  async set(key, value) {
+    const res = await requestJson('PUT', `/kv/${encodeURIComponent(String(key))}`, { value });
+    return Boolean(res.ok ?? true);
+  },
+  async delete(key) {
+    const res = await requestJson('DELETE', `/kv/${encodeURIComponent(String(key))}`);
+    return Boolean(res.ok ?? true);
+  },
+};
+
 module.exports = {
   notify,
   secret,
   cookies_expired,
   ask,
+  state,
 };

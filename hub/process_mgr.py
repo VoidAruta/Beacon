@@ -1,11 +1,12 @@
 """
-Жизненный цикл процессов:
+Жизненный цикл процессов и легковесная «контейнеризация без Docker» (hub/process_mgr.py):
 - Запуск через os.setsid() с направлением stdout/stderr напрямую в файловый дескриптор лога (БЕЗ subprocess.PIPE!).
 - RLIMIT_CORE=(0,0) и RLIMIT_NOFILE=(4096,4096) без RLIMIT_AS.
 - Опциональный запуск от hub-runner с группами Android aid_inet (3003) и aid_net_raw (3004).
-- Чистое завершение дерева процессов по PGID (SIGTERM -> 5с -> SIGKILL).
+- Изоляция окружений (.venv / uv, node_modules/.bin в PATH) и ФС (TMPDIR=<workdir>/.tmp, HOME=<workdir>/.home, XDG_CACHE_HOME).
+- Маркировка процессов _HUB_PROJECT_ID / _HUB_RUN_ID и отлов осиротевших процессов в /proc/*/environ.
+- Поддержка веб-бэкендов ($PORT, проверка свободного порта, HTTP/TCP Healthchecks с авто-рестартом после 3 сбоев).
 - Восстановление выживших процессов после рестарта панели по pid + proc_create_time (±0.5с) с учётом ECHILD.
-- Фоновый сторож процессов (RSS памяти группы PGID, CPU%, OOM killer и таймауты).
 """
 
 import asyncio
@@ -18,14 +19,18 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Optional
 
 from hub.auth import get_internal_token
 from hub.compat import psutil
-from hub.config import LOGS_DIR, SDK_NODE_DIR, SDK_PYTHON_DIR
+from hub.config import FORBIDDEN_PORTS, LOGS_DIR, SDK_NODE_DIR, SDK_PYTHON_DIR
 from hub.db import execute_sql, get_all_settings, query_all, query_one
 from hub.disk_guard import can_start_new_run
 from hub.notifier import send_notification
@@ -36,9 +41,12 @@ from hub.secrets_mgr import get_secret_raw, redact_log_text
 #   "run_id": int, "project_id": int, "pid": int, "pgid": int,
 #   "proc_create_time": float, "started_at": int, "log_path": str,
 #   "stdin_fifo": str, "stdin_keepalive_fd": Optional[int],
-#   "popen": Optional[subprocess.Popen], "rss_mb": float, "cpu_percent": float
+#   "popen": Optional[subprocess.Popen], "rss_mb": float, "cpu_percent": float,
+#   "hc_failures": int, "last_hc_ts": float
 # }
 ACTIVE_RUNS: dict[int, dict[str, Any]] = {}
+
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # Коллбэк в планировщик при завершении процесса
 _ON_FINISH_CALLBACK: Optional[Callable[[dict[str, Any], int, str, str], Coroutine[Any, Any, None]]] = None
@@ -72,6 +80,161 @@ def _get_pgid_processes(pgid: int) -> list[Any]:
         except (ProcessLookupError, PermissionError, psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     return procs
+
+
+def kill_orphan_processes_by_project_id(project_id: int, exclude_pids: Optional[set[int]] = None) -> int:
+    """
+    Сканирует /proc/*/environ через psutil и находит процессы-сироты с меткой _HUB_PROJECT_ID=<project_id>,
+    которые могли сменить группу через собственный os.setsid(), и принудительно завершает их.
+    """
+    target_val = str(project_id)
+    my_pid = os.getpid()
+    excluded = (exclude_pids or set()) | {my_pid}
+    orphan_pids: list[int] = []
+
+    for p in psutil.process_iter():
+        try:
+            if p.pid in excluded or not p.is_running() or p.status() == "zombie":
+                continue
+            env = p.environ()
+            if env and env.get("_HUB_PROJECT_ID") == target_val:
+                orphan_pids.append(p.pid)
+        except (ProcessLookupError, PermissionError, psutil.NoSuchProcess, psutil.AccessDenied, Exception):
+            continue
+
+    for opid in orphan_pids:
+        try:
+            os.kill(opid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    if orphan_pids:
+        time.sleep(0.15)
+        for opid in orphan_pids:
+            try:
+                os.kill(opid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        _reap_zombies()
+
+    return len(orphan_pids)
+
+
+def cleanup_project_tmp_dir(workdir: str | Path) -> int:
+    """Очищает содержимое изолированной директории <workdir>/.tmp проекта."""
+    tmp_dir = Path(workdir) / ".tmp"
+    removed = 0
+    if not tmp_dir.exists():
+        return 0
+    try:
+        for item in tmp_dir.iterdir():
+            try:
+                if item.is_dir() and not item.is_symlink():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return removed
+
+
+def is_tcp_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    """Проверяет, занят ли TCP-порт локальным процессом."""
+    if port <= 0:
+        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        return s.connect_ex((host, int(port))) == 0
+
+
+def check_endpoint_health(healthcheck_url: str, fallback_port: int = 0, timeout: float = 2.5) -> tuple[bool, str]:
+    """
+    Проверяет доступность сервиса по HTTP/HTTPS (ожидается код 200..399) или TCP (tcp://host:port).
+    Если healthcheck_url пуст, но задан fallback_port > 0, проверяет TCP-соединение с 127.0.0.1:<fallback_port>.
+    """
+    url = (healthcheck_url or "").strip()
+    if not url and fallback_port > 0:
+        url = f"tcp://127.0.0.1:{int(fallback_port)}"
+    if not url:
+        return True, "not_configured"
+
+    if url.startswith("tcp://"):
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or fallback_port
+        if not port:
+            return False, "invalid_tcp_port"
+        try:
+            with socket.create_connection((host, int(port)), timeout=timeout):
+                return True, f"TCP {host}:{port} OK"
+        except OSError as e:
+            return False, f"TCP {host}:{port} failed: {e}"
+
+    if not url.startswith(("http://", "https://")):
+        url = f"http://{url}"
+
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "Hub-Healthcheck/2.0"})
+    try:
+        with _NO_PROXY_OPENER.open(req, timeout=timeout) as resp:
+            code = getattr(resp, "status", 200)
+            if 200 <= int(code) < 400:
+                return True, f"HTTP {code} OK"
+            return False, f"HTTP {code}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except Exception as e:
+        return False, str(e)
+
+
+def build_install_deps_command(workdir: Path, runtime: str) -> str:
+    """
+    Формирует команду изолированной установки зависимостей проекта:
+    - Для Node.js: npm install --no-audit --no-fund
+    - Для Python:
+      1) Если установлен `uv` (shutil.which("uv")), использует `uv venv .venv` и `uv pip install --python .venv/bin/python -r requirements.txt` (с кэшем хардлинков).
+      2) Если `uv` нет — создаёт полноценный `python3 -m venv .venv` (с fallback на `--without-pip` + `ensurepip` или установкой через системный `pip3 --python .venv/bin/python` / `--prefix .venv`), чтобы пакеты ставились строго внутрь `.venv` проекта.
+    """
+    if runtime == "node" or (workdir / "package.json").exists() and not (workdir / "requirements.txt").exists():
+        return (
+            "/bin/bash -c '"
+            'echo "[deps] Установка npm-пакетов в локальный node_modules..."; '
+            "npm install --no-audit --no-fund 2>&1 || echo \"[deps] Завершено\"'"
+        )
+
+    return (
+        "/bin/bash -c '"
+        "set -e; "
+        "if command -v uv >/dev/null 2>&1; then "
+        '  echo "[deps] Обнаружен пакетный менеджер uv — создаём изолированное окружение .venv..."; '
+        "  if [ ! -x .venv/bin/python ]; then uv venv .venv 2>&1; fi; "
+        "  if [ -f requirements.txt ]; then "
+        '    echo "[deps] Установка зависимостей через uv pip install -r requirements.txt..."; '
+        "    uv pip install --python .venv/bin/python -r requirements.txt 2>&1; "
+        "  fi; "
+        "else "
+        '  echo "[deps] Настройка изолированного Python окружения .venv..."; '
+        "  if [ ! -x .venv/bin/python ]; then "
+        "    python3 -m venv .venv 2>&1 || python3 -m venv --without-pip .venv 2>&1; "
+        "  fi; "
+        "  if [ ! -x .venv/bin/pip ]; then "
+        "    .venv/bin/python -m ensurepip --upgrade 2>/dev/null || true; "
+        "  fi; "
+        "  if [ -f requirements.txt ]; then "
+        "    if [ -x .venv/bin/pip ]; then "
+        '      echo "[deps] Установка пакетов в .venv/bin/pip..."; '
+        "      .venv/bin/pip install --no-input -r requirements.txt 2>&1; "
+        "    elif command -v pip3 >/dev/null 2>&1; then "
+        '      echo "[deps] Установка пакетов в .venv через системный pip3..."; '
+        "      pip3 install --python .venv/bin/python --no-input -r requirements.txt 2>&1 || "
+        "      pip3 install --prefix .venv --no-input -r requirements.txt 2>&1; "
+        "    fi; "
+        "  fi; "
+        "fi; "
+        'echo "[deps] Окружение .venv готово ($(.venv/bin/python --version 2>&1 || python3 --version))."\''
+    )
 
 
 def collect_all_pgid_metrics(target_pgids: set[int]) -> dict[int, tuple[float, float, int]]:
@@ -158,7 +321,6 @@ def read_log_tail_bytes(log_path: str | Path, max_bytes: int = 131072, max_lines
         raw_text = raw_bytes.decode("utf-8", errors="replace")
         lines = raw_text.splitlines()
         if start_pos > 0 and len(lines) > 1:
-            # Отбрасываем потенциально обрезанную первую строку при чтении со смещением
             lines = lines[1:]
         if max_lines > 0 and len(lines) > max_lines:
             lines = lines[-max_lines:]
@@ -206,10 +368,56 @@ def _build_command_args(project: dict[str, Any], custom_cmd: Optional[str] = Non
     return parts
 
 
-def _build_process_env(project: dict[str, Any], run_token: str, settings: dict[str, str]) -> dict[str, str]:
+def _build_process_env(
+    project: dict[str, Any],
+    run_token: str,
+    settings: dict[str, str],
+    run_id: Optional[int] = None,
+) -> dict[str, str]:
     env = dict(os.environ)
+    workdir = Path(project.get("workdir", "")).resolve()
 
-    # Переменные из project.env_json
+    # 1. Изоляция ФС проекта: собственные каталоги .tmp, .home и .home/.cache
+    tmp_dir = workdir / ".tmp"
+    home_dir = workdir / ".home"
+    cache_dir = home_dir / ".cache"
+    try:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        home_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    env["TMPDIR"] = str(tmp_dir)
+    env["TEMP"] = str(tmp_dir)
+    env["TMP"] = str(tmp_dir)
+    env["HOME"] = str(home_dir)
+    env["XDG_CACHE_HOME"] = str(cache_dir)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    # 2. Изоляция окружения PATH: <workdir>/.venv/bin и <workdir>/node_modules/.bin в начале PATH
+    venv_dir = workdir / ".venv"
+    venv_bin = venv_dir / "bin"
+    node_bin = workdir / "node_modules" / ".bin"
+    orig_path = env.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    path_parts = [str(venv_bin), str(node_bin), orig_path]
+    env["PATH"] = ":".join(p for p in path_parts if p)
+    if venv_dir.exists():
+        env["VIRTUAL_ENV"] = str(venv_dir)
+
+    # 3. Маркировка процессов для отлова сирот (_HUB_PROJECT_ID и _HUB_RUN_ID)
+    if project.get("id") is not None:
+        env["_HUB_PROJECT_ID"] = str(project["id"])
+    if run_id is not None:
+        env["_HUB_RUN_ID"] = str(run_id)
+
+    # 4. Проброс переменной PORT для веб-бэкендов и сервисов
+    proj_port = int(project.get("port") or 0)
+    if proj_port > 0:
+        env["PORT"] = str(proj_port)
+
+    # 5. Пользовательские переменные из project.env_json
     try:
         proj_env = json.loads(project.get("env_json") or "{}")
         if isinstance(proj_env, dict):
@@ -218,11 +426,10 @@ def _build_process_env(project: dict[str, Any], run_token: str, settings: dict[s
     except Exception:
         pass
 
-    port = settings.get("port", "8050")
-    env["HUB_API_URL"] = f"http://127.0.0.1:{port}/internal"
+    hub_port = settings.get("port", "8050")
+    env["HUB_API_URL"] = f"http://127.0.0.1:{hub_port}/internal"
     env["HUB_RUN_TOKEN"] = run_token
     env["HUB_INTERNAL_TOKEN"] = get_internal_token()
-    env["PYTHONUNBUFFERED"] = "1"
 
     # Подключение SDK через PYTHONPATH и NODE_PATH
     existing_py = env.get("PYTHONPATH", "")
@@ -241,7 +448,6 @@ def _build_process_env(project: dict[str, Any], run_token: str, settings: dict[s
         env["no_proxy"] = "127.0.0.1,localhost"
 
     # Привязанные секреты проекта: НЕ передаём сырые значения текстовых секретов в /proc/<pid>/environ!
-    # Секреты читаются через SDK (/internal/secret/{name}) или через защищённый файл с правами 0600.
     try:
         sec_names = json.loads(project.get("secrets_json") or "[]")
         if isinstance(sec_names, list):
@@ -287,7 +493,6 @@ def _make_preexec_fn(run_as_user: str) -> Callable[[], None]:
 
         if target_uid is not None and target_gid is not None:
             try:
-                # Обязательно добавляем Android группы aid_inet (3003) и aid_net_raw (3004)
                 os.setgroups([target_gid, 3003, 3004])
                 os.setgid(target_gid)
                 os.setuid(target_uid)
@@ -313,10 +518,20 @@ async def start_project_run(
     if not project:
         raise ValueError(f"Проект id={project_id} не найден")
 
-    # Если проект уже запущен (и это не системный запуск), сначала проверим
     for r_id, info in list(ACTIVE_RUNS.items()):
         if info["project_id"] == project_id and custom_cmd is None:
             raise RuntimeError(f"Проект «{project['name']}» уже выполняется (run_id={r_id}, PID={info['pid']})")
+
+    # Если у проекта задан сетевой порт (port > 0) и это штатный запуск (не install_deps):
+    proj_port = int(project.get("port") or 0)
+    if proj_port > 0 and custom_cmd is None:
+        if proj_port in FORBIDDEN_PORTS:
+            raise RuntimeError(f"Порт {proj_port} зарезервирован системой ({sorted(list(FORBIDDEN_PORTS))})")
+        if is_tcp_port_in_use(proj_port):
+            # Сначала пробуем зачистить возможные осиротевшие процессы этого же проекта
+            kill_orphan_processes_by_project_id(project_id)
+            if is_tcp_port_in_use(proj_port):
+                raise RuntimeError(f"Порт {proj_port} уже занят другим процессом в системе")
 
     settings = get_all_settings()
     run_as_user = settings.get("run_as_user", "root").strip()
@@ -329,7 +544,6 @@ async def start_project_run(
     now = int(time.time())
     run_token = secrets.token_hex(24)
 
-    # Сначала создаём запись в таблице runs, чтобы получить run_id для имени лог-файла <run_id>.log
     temp_log_path = str(proj_log_dir / f"pending_{now}.log")
     run_id = execute_sql(
         """INSERT INTO runs (
@@ -342,13 +556,15 @@ async def start_project_run(
     log_path = proj_log_dir / f"{run_id}.log"
     execute_sql("UPDATE runs SET log_path = ? WHERE id = ?", (str(log_path), run_id))
 
-    if project["type"] == "service" and custom_cmd is None:
-        execute_sql("UPDATE projects SET desired_state = 'running', updated_at = ? WHERE id = ?", (now, project_id))
+    if project["type"] in ("service", "web") and custom_cmd is None:
+        execute_sql(
+            "UPDATE projects SET desired_state = 'running', health_status = 'starting', updated_at = ? WHERE id = ?",
+            (now, project_id),
+        )
 
     cmd_args = _build_command_args(project, custom_cmd=custom_cmd)
-    env = _build_process_env(project, run_token, settings)
+    env = _build_process_env(project, run_token, settings, run_id=run_id)
 
-    # Если выбран запуск от hub-runner, выдаём права на директорию проекта и лог
     if run_as_user and run_as_user != "root" and os.geteuid() == 0:
         try:
             pw = pwd.getpwnam(run_as_user)
@@ -356,11 +572,6 @@ async def start_project_run(
         except KeyError:
             pass
 
-    # КРИТИЧЕСКОЕ ПРАВИЛО #2:
-    # Никаких subprocess.PIPE! Открываем лог-файл с buffering=0, передаём дескриптор дочернему процессу
-    # и сразу закрываем дескриптор в родительском процессе Hub.
-    # Для интерактивного ввода в консоль (stdin) открываем читающий конец FIFO в блокирующем режиме
-    # и удерживаем пишущий конец открытым в родителе до завершения процесса (без BlockingIOError и без EOF).
     log_fd = open(log_path, "ab", buffering=0)
     header_line = (
         f"=== [Hub Run #{run_id}] Started at {time.strftime('%Y-%m-%d %H:%M:%S')} | "
@@ -377,7 +588,6 @@ async def start_project_run(
         os.mkfifo(stdin_fifo_path, 0o600)
         stdin_r_fd = os.open(str(stdin_fifo_path), os.O_RDONLY | os.O_NONBLOCK)
         stdin_w_fd = os.open(str(stdin_fifo_path), os.O_WRONLY | os.O_NONBLOCK)
-        # Переводим читающий дескриптор для дочернего процесса в стандартный блокирующий режим
         r_flags = fcntl.fcntl(stdin_r_fd, fcntl.F_GETFL)
         fcntl.fcntl(stdin_r_fd, fcntl.F_SETFL, r_flags & ~os.O_NONBLOCK)
     except Exception:
@@ -469,6 +679,8 @@ async def start_project_run(
         "rss_mb": 0.0,
         "cpu_percent": 0.0,
         "is_deps_install": custom_cmd is not None,
+        "hc_failures": 0,
+        "last_hc_ts": float(now),
     }
 
     return query_one("SELECT * FROM runs WHERE id = ?", (run_id,)) or {"id": run_id, "pid": pid, "pgid": pgid}
@@ -519,21 +731,17 @@ def send_stdin_to_run(run_id: int, text: str) -> bool:
 
 async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str = "") -> bool:
     """
-    Останавливает дерево процессов по PGID:
-    1. Проверяет через psutil, что процесс жив и create_time совпадает (±0.5с).
-    2. Отправляет os.killpg(pgid, signal.SIGTERM).
-    3. Ждёт до 5 секунд (проверяя каждые 200 мс наличие живых процессов с этим pgid).
-    4. Если процессы остались — отправляет os.killpg(pgid, signal.SIGKILL).
+    Останавливает дерево процессов по PGID + добивает сирот по _HUB_PROJECT_ID и очищает <workdir>/.tmp.
     """
     row = query_one("SELECT * FROM runs WHERE id = ?", (run_id,))
     if not row:
         return False
 
-    project_id = row["project_id"]
+    project_id = int(row["project_id"])
     proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
-    if proj and proj["type"] == "service" and final_status == "stopped":
+    if proj and proj["type"] in ("service", "web") and final_status == "stopped":
         execute_sql(
-            "UPDATE projects SET desired_state = 'stopped', updated_at = ? WHERE id = ?",
+            "UPDATE projects SET desired_state = 'stopped', health_status = 'stopped', updated_at = ? WHERE id = ?",
             (int(time.time()), project_id),
         )
 
@@ -553,7 +761,6 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
                 if expected_ctime is None or abs(p.create_time() - float(expected_ctime)) <= 0.5:
                     can_signal = True
             except psutil.NoSuchProcess:
-                # Лидер группы мог завершиться, но дочерние процессы в группе pgid ещё живы
                 if _get_pgid_processes(int(pgid)):
                     can_signal = True
 
@@ -563,7 +770,6 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
             except (ProcessLookupError, PermissionError):
                 pass
 
-            # Ждём до 5 секунд (25 итераций по 200 мс)
             for _ in range(25):
                 if popen_obj is not None:
                     popen_obj.poll()
@@ -573,7 +779,6 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
                     break
                 await asyncio.sleep(0.2)
 
-            # Если остались живые процессы в группе — добиваем SIGKILL
             if _get_pgid_processes(int(pgid)):
                 try:
                     os.killpg(int(pgid), signal.SIGKILL)
@@ -583,6 +788,11 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
                 if popen_obj is not None:
                     popen_obj.poll()
                 _reap_zombies()
+
+    # Дополнительно отлавливаем осиротевшие процессы по метке _HUB_PROJECT_ID в /proc/*/environ
+    kill_orphan_processes_by_project_id(project_id)
+    if proj and proj.get("workdir"):
+        cleanup_project_tmp_dir(proj["workdir"])
 
     now = int(time.time())
     log_path = row.get("log_path", "")
@@ -607,15 +817,23 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
 
 
 async def stop_project(project_id: int) -> bool:
-    """Останавливает активный запуск проекта и переводит desired_state в 'stopped'."""
+    """Останавливает активный запуск проекта, убивает сирот по _HUB_PROJECT_ID и очищает .tmp."""
     now = int(time.time())
-    execute_sql("UPDATE projects SET desired_state = 'stopped', updated_at = ? WHERE id = ?", (now, project_id))
+    execute_sql(
+        "UPDATE projects SET desired_state = 'stopped', health_status = 'stopped', updated_at = ? WHERE id = ?",
+        (now, project_id),
+    )
     active = query_all(
         "SELECT id FROM runs WHERE project_id = ? AND status IN ('running', 'waiting_input')",
         (project_id,),
     )
     for r in active:
         await stop_run(r["id"], final_status="stopped", reason_note="Остановлено пользователем")
+
+    kill_orphan_processes_by_project_id(project_id)
+    proj = query_one("SELECT workdir FROM projects WHERE id = ?", (project_id,))
+    if proj and proj.get("workdir"):
+        cleanup_project_tmp_dir(proj["workdir"])
     return True
 
 
@@ -625,7 +843,7 @@ def recover_running_processes() -> dict[str, int]:
     При старте Hub выбирает из БД все runs со статусом 'running' или 'waiting_input'.
     Проверяет psutil.Process(pid) и abs(proc.create_time() - run.proc_create_time) < 0.5.
     Если жив — добавляет в ACTIVE_RUNS в режиме psutil-пуллинга (popen=None, без waitpid!).
-    Если мёртв — переводит запись run в статус 'failed' (exit_code = -1, finished_at = now).
+    Если мёртв — зачищает возможные осиротевшие подпроцессы по _HUB_PROJECT_ID и переводит run в 'failed'.
     """
     rows = query_all(
         """SELECT r.*, p.name AS project_name, p.type AS project_type
@@ -673,14 +891,17 @@ def recover_running_processes() -> dict[str, int]:
                 "log_path": r["log_path"],
                 "stdin_fifo": str(fifo_path),
                 "stdin_keepalive_fd": keep_fd,
-                "popen": None,  # ECHILD-safe: процесс усыновлён init (PID 1), мониторим только через psutil!
+                "popen": None,
                 "rss_mb": 0.0,
                 "cpu_percent": 0.0,
                 "is_deps_install": False,
+                "hc_failures": 0,
+                "last_hc_ts": float(now),
             }
             recovered += 1
         else:
             _cleanup_run_fifo(run_id, None, r["project_name"])
+            kill_orphan_processes_by_project_id(int(r["project_id"]))
             execute_sql(
                 """UPDATE runs
                    SET status = 'failed', exit_code = -1, finished_at = ?,
@@ -703,6 +924,7 @@ async def watch_processes_loop() -> None:
     - Неблокирующе собирает осиротевших зомби (os.waitpid(-1, os.WNOHANG)).
     - Проверяет завершение всех ACTIVE_RUNS.
     - За ОДИН проход по psutil.process_iter() считает суммарный RSS и CPU% для всех активных PGID.
+    - Проверяет HTTP/TCP Healthchecks для веб-бэкендов и сервисов (3 ошибки подряд -> рестарт).
     - При превышении project.ram_limit_mb убивает группу, ставит killed_oom и шлёт уведомление.
     - При превышении project.timeout_sec для job убивает группу и ставит timeout.
     """
@@ -710,6 +932,7 @@ async def watch_processes_loop() -> None:
         try:
             _reap_zombies()
             now = int(time.time())
+            now_f = time.time()
             target_pgids = {int(info["pgid"]) for info in ACTIVE_RUNS.values() if info.get("pgid")}
             pgid_metrics_map = collect_all_pgid_metrics(target_pgids)
 
@@ -734,7 +957,6 @@ async def watch_processes_loop() -> None:
                     else:
                         exit_code = int(rc)
                 else:
-                    # Процесс подхвачен после рестарта панели (родитель = PID 1)
                     try:
                         p = psutil.Process(pid)
                         if (
@@ -749,13 +971,14 @@ async def watch_processes_loop() -> None:
                         exit_code = 0
 
                 if not still_alive:
-                    # Добиваем возможные осиротевшие дочерние процессы группы PGID
                     leftover = _get_pgid_processes(pgid)
                     if leftover:
                         try:
                             os.killpg(pgid, signal.SIGTERM)
                         except Exception:
                             pass
+                    kill_orphan_processes_by_project_id(int(project["id"]))
+                    cleanup_project_tmp_dir(project["workdir"])
 
                     mem_info = ACTIVE_RUNS.pop(run_id, None)
                     _cleanup_run_fifo(run_id, mem_info, project["name"])
@@ -826,6 +1049,44 @@ async def watch_processes_loop() -> None:
                     if _ON_FINISH_CALLBACK and not info.get("is_deps_install"):
                         await _ON_FINISH_CALLBACK(project, -15, "timeout", tail)
                     continue
+
+                # 5. HTTP / TCP Healthcheck для веб-бэкендов и сервисов
+                hc_url = str(project.get("healthcheck_url") or "").strip()
+                proj_port = int(project.get("port") or 0)
+                if not info.get("is_deps_install") and (hc_url or (project["type"] == "web" and proj_port > 0)):
+                    hc_interval = max(5, int(project.get("healthcheck_interval_sec") or 30))
+                    last_hc = float(info.get("last_hc_ts") or info["started_at"])
+                    if (now - info["started_at"]) >= 5 and (now_f - last_hc) >= hc_interval:
+                        info["last_hc_ts"] = now_f
+                        hc_ok, hc_detail = await asyncio.to_thread(
+                            check_endpoint_health, hc_url, proj_port, 2.5
+                        )
+                        if hc_ok:
+                            info["hc_failures"] = 0
+                            if project.get("health_status") != "healthy":
+                                execute_sql(
+                                    "UPDATE projects SET health_status = 'healthy' WHERE id = ?",
+                                    (project["id"],),
+                                )
+                        else:
+                            fails = int(info.get("hc_failures") or 0) + 1
+                            info["hc_failures"] = fails
+                            execute_sql(
+                                "UPDATE projects SET health_status = 'unhealthy' WHERE id = ?",
+                                (project["id"],),
+                            )
+                            if fails >= 3:
+                                hc_msg = f"Healthcheck не прошёл 3 раза подряд ({hc_detail}) — выполняется перезапуск"
+                                await stop_run(run_id, final_status="failed", reason_note=hc_msg)
+                                tail = _read_log_tail(info["log_path"], max_lines=15)
+                                await send_notification(
+                                    f"Сервис «{project['name']}» завис ({hc_msg}). Выполнен автоматический перезапуск.",
+                                    level="error",
+                                    project_name=project["name"],
+                                    log_tail=tail,
+                                )
+                                await start_project_run(int(project["id"]), trigger="healthcheck")
+                                continue
 
         except Exception:
             pass

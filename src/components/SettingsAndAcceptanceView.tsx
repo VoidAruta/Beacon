@@ -16,6 +16,8 @@ import {
   ChevronDown,
   ChevronUp,
   Sliders,
+  Download,
+  Terminal,
 } from 'lucide-react';
 import { AcceptanceCheckItem, AuditEntry, ProjectItem } from '../types/hub';
 import { describeScheduleHuman, formatBytes, isPortAllowed } from '../utils/hubLogic';
@@ -48,8 +50,10 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
   const [tgCmdPreview, setTgCmdPreview] = useState<string>('');
   const [auditLogs, setAuditLogs] = useState<AuditEntry[]>([]);
   const [showAdvancedSystem, setShowAdvancedSystem] = useState<boolean>(false);
+  const [systemdInfo, setSystemdInfo] = useState<{ path: string; content: string } | null>(null);
+  const [downloadingBackup, setDownloadingBackup] = useState<boolean>(false);
 
-  // Самодиагностика Android Chroot (hub doctor)
+  // Самодиагностика среды (hub doctor)
   const [doctorReport, setDoctorReport] = useState<any | null>(null);
   const [runningDoctor, setRunningDoctor] = useState(false);
 
@@ -218,21 +222,50 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
     }
   };
 
+  const handleGenerateSystemd = async () => {
+    const res = await apiFetch('/api/system/systemd_unit');
+    if (res.ok) {
+      const data = await res.json();
+      setSystemdInfo({ path: data.path, content: data.content });
+    }
+  };
+
+  const handleDownloadBackup = async () => {
+    setDownloadingBackup(true);
+    try {
+      const res = await apiFetch('/api/system/backup');
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `hub_backup_${new Date().toISOString().slice(0, 10)}.zip`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        setCleanupMsg('Архив бэкапа (.zip: SQLite БД + data/secrets/ + код проектов без .venv) успешно сформирован и скачан.');
+      }
+    } finally {
+      setDownloadingBackup(false);
+    }
+  };
+
   if (mode === 'acceptance') {
     const testProjects = projects.filter((p) => p.is_test_project);
 
     return (
       <div className="space-y-6">
-        {/* 0. Самодиагностика Android Chroot (hub doctor) */}
-        <section className="bg-[#1e293b] border border-slate-800 rounded-xl p-6">
+        {/* 0. Адаптивная самодиагностика среды (hub doctor) */}
+        <section className="bg-[#111622] border border-slate-800 rounded-xl p-6">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-800">
             <div>
               <h2 className="text-base font-bold text-white flex items-center gap-2">
                 <Shield className="w-5 h-5 text-emerald-400" />
-                Самодиагностика Android Chroot (<code className="font-mono text-indigo-300">python3 -m hub doctor</code>)
+                Адаптивная самодиагностика среды (<code className="font-mono text-indigo-300">python3 -m hub doctor</code>)
               </h2>
               <p className="text-xs text-slate-400 mt-1">
-                Проверяет 8 узлов Android-сервера: сетевые группы ядра <code className="font-mono">3003/3004</code>, точки монтирования <code className="font-mono">/proc, /sys, /dev/pts</code>, права <code className="font-mono">0700/0600</code> на секреты, чекпоинт SQLite WAL, прокси <code className="font-mono">127.0.0.1:10808</code> и термозащиту батареи.
+                Автоматически определяет профиль ОС (Android Chroot vs Standard Linux) и проверяет точки монтирования, права <code className="font-mono">0700/0600</code> на секреты, чекпоинт SQLite WAL, наличие <code className="font-mono">uv</code>, прокси и датчики.
               </p>
             </div>
             <button
@@ -242,12 +275,28 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
               className="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg inline-flex items-center gap-2 shrink-0 cursor-pointer"
             >
               <RefreshCw className={`w-4 h-4 ${runningDoctor ? 'animate-spin' : ''}`} />
-              {runningDoctor ? 'Проверка chroot...' : 'Запустить hub doctor'}
+              {runningDoctor ? 'Проверка среды...' : 'Запустить hub doctor'}
             </button>
           </div>
 
           {doctorReport ? (
             <div className="mt-4 space-y-3">
+              {doctorReport.env_profile && (
+                <div className="p-3 bg-[#0b0f17] border border-slate-800 rounded-lg flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+                  <div className="text-slate-200">
+                    Профиль среды:{' '}
+                    <span className="text-indigo-300 font-semibold">{doctorReport.env_profile.env_label}</span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-3 text-slate-400">
+                    <span>Arch: {doctorReport.env_profile.arch}</span>
+                    <span>·</span>
+                    <span>uv: {doctorReport.env_profile.has_uv ? 'Доступен' : 'Fallback venv'}</span>
+                    <span>·</span>
+                    <span>systemd: {doctorReport.env_profile.has_systemd ? 'Да' : 'Chroot init'}</span>
+                  </div>
+                </div>
+              )}
+
               <div className="flex flex-wrap items-center gap-3 text-xs font-mono">
                 <span className="px-2.5 py-1 rounded bg-emerald-950/60 border border-emerald-500/40 text-emerald-300">
                   OK: {doctorReport.ok_count}
@@ -702,13 +751,13 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
 
           <div>
             <label className="block text-xs font-medium text-slate-200 mb-1">
-              Сменить пароль входа в веб-панель
+              Сменить пароль входа в веб-панель (по умолчанию <code className="font-mono text-indigo-300">admin</code>)
             </label>
             <input
               type="password"
               value={newPassword}
               onChange={(e) => setNewPassword(e.target.value)}
-              placeholder="Оставьте пустым, чтобы не менять"
+              placeholder="Новый пароль (оставьте пустым, чтобы не менять)"
               className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
             />
           </div>
@@ -723,6 +772,60 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
               Очистить кэш pip / npm, логи и SQLite WAL
             </button>
           </div>
+        </div>
+
+        {/* БЛОК 3.5: Резервное копирование (.zip) и генератор systemd unit (hub.service) */}
+        <div className="p-5 bg-slate-900/70 border border-slate-800 rounded-xl space-y-4">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <Download className="w-4 h-4 text-indigo-400" />
+                3. Резервное копирование (.zip) и автозапуск в Linux (<code className="font-mono text-indigo-300">systemd</code>)
+              </h3>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Полный архив включает SQLite БД (<code className="font-mono">hub.db</code> после WAL checkpoint), файлы секретов (<code className="font-mono">0600</code>) и исходники всех проектов (без тяжёлых папок <code className="font-mono">.venv / node_modules</code>).
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                disabled={downloadingBackup}
+                onClick={handleDownloadBackup}
+                className="px-3.5 py-2 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+              >
+                <Download className="w-3.5 h-3.5" />
+                {downloadingBackup ? 'Сборка архива...' : 'Скачать полный бэкап (.zip)'}
+              </button>
+              <button
+                type="button"
+                onClick={handleGenerateSystemd}
+                className="px-3.5 py-2 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+              >
+                <Terminal className="w-3.5 h-3.5 text-indigo-400" />
+                Сгенерировать hub.service (systemd)
+              </button>
+            </div>
+          </div>
+
+          {systemdInfo && (
+            <div className="space-y-2 pt-2 border-t border-slate-800">
+              <div className="flex items-center justify-between text-xs text-slate-300">
+                <span>
+                  Юнит сохранён в <code className="font-mono text-indigo-300">{systemdInfo.path}</code> (<code className="font-mono text-emerald-300">KillMode=process</code> сохраняет дочерние сервисы при рестарте Hub):
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setSystemdInfo(null)}
+                  className="text-slate-400 hover:text-white text-xs cursor-pointer"
+                >
+                  Скрыть
+                </button>
+              </div>
+              <pre className="p-3 bg-[#0b0f17] border border-slate-800 rounded-lg text-[11px] font-mono text-slate-200 overflow-x-auto">
+                {systemdInfo.content}
+              </pre>
+            </div>
+          )}
         </div>
 
         {(notifyMsg || cleanupMsg) && (

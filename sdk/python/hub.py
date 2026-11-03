@@ -6,6 +6,7 @@ Hub Python SDK (/opt/hub/sdk/python/hub.py)
   - hub.secret(name, as_path=False)
   - hub.cookies_expired(secret_name, note="")
   - hub.ask(prompt, timeout=300)
+  - hub.state.get(key, default=None) / hub.state.set(key, val) / hub.state.delete(key)
 """
 
 import json
@@ -98,13 +99,10 @@ def secret(name: str, as_path: bool = False) -> Any:
 
         return val
     except Exception:
-        # Резервное чтение из переменных окружения процесса, если были проброшены
+        # Резервное чтение из защищённого файла 0600, если путь передан в HUB_SECRET_FILE_<name>
         env_file = os.environ.get(f"HUB_SECRET_FILE_{name}")
         if as_path and env_file:
             return env_file
-        env_val = os.environ.get(f"HUB_SECRET_{name}")
-        if env_val is not None:
-            return env_val
         if env_file and os.path.exists(env_file):
             with open(env_file, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -159,3 +157,24 @@ def ask(prompt: str, timeout: int = 300) -> str:
         time.sleep(0.3)
 
     raise TimeoutError(f"Превышено время ожидания ответа на hub.ask('{prompt}')")
+
+
+class _StateStore:
+    """Персистентное Key-Value хранилище состояния для скриптов и парсеров в SQLite (hub.state)."""
+
+    def get(self, key: str, default: Any = None) -> Any:
+        res = _request_json("GET", f"/kv/{urllib.parse.quote(str(key))}")
+        if not res.get("found"):
+            return default
+        return res.get("value")
+
+    def set(self, key: str, value: Any) -> bool:
+        res = _request_json("PUT", f"/kv/{urllib.parse.quote(str(key))}", {"value": value})
+        return bool(res.get("ok", True))
+
+    def delete(self, key: str) -> bool:
+        res = _request_json("DELETE", f"/kv/{urllib.parse.quote(str(key))}")
+        return bool(res.get("ok", True))
+
+
+state = _StateStore()

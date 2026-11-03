@@ -5,16 +5,41 @@
   :root {
     font-family: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
     color-scheme: dark;
+    --hub-bg-canvas: #0b0f17;
+    --hub-bg-surface: #111622;
+    --hub-bg-elevated: #161d2b;
+    --hub-border: #1e2638;
   }
 
   body {
-    background-color: #0f172a;
+    background-color: #0b0f17;
     color: #f8fafc;
     overflow-x: hidden;
+    letter-spacing: 0.005em;
   }
 
   code, pre, .font-mono, .tabular-nums {
     font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     font-variant-numeric: tabular-nums;
   }
+
+  h1, h2, h3 {
+    text-wrap: balance;
+  }
+}
+
+/* Тонкие скроллбары в стиле серверной консоли */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0b0f17;
+}
+::-webkit-scrollbar-thumb {
+  background: #1e293b;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #334155;
 }

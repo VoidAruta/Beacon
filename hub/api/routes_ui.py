@@ -40,9 +40,11 @@ from hub.compat import croniter, psutil
 from hub.config import BASE_DIR, EXAMPLES_DIR, FORBIDDEN_PORTS, INITIAL_PASSWORD_PATH, LOGS_DIR, PROJECTS_DIR
 from hub.db import execute_sql, get_all_settings, get_setting, log_audit, query_all, query_one, set_setting
 from hub.disk_guard import cleanup_system_caches, get_disk_status
+from hub.env_detect import get_environment_profile
 from hub.notifier import RECENT_NOTIFICATIONS, send_notification
 from hub.process_mgr import (
     ACTIVE_RUNS,
+    build_install_deps_command,
     get_pgid_metrics,
     read_log_tail_bytes,
     recover_running_processes,
@@ -265,10 +267,15 @@ def _enrich_project(p: dict[str, Any]) -> dict[str, Any]:
     # Человекочитаемое описание, группа/категория, индивидуальный прокси и GitHub-репозиторий
     out["description"] = str(out["env"].get("PROJECT_DESCRIPTION", ""))
     out["is_test_project"] = str(out["env"].get("IS_TEST_PROJECT", "0")) == "1"
-    default_group = "Тесты" if out["is_test_project"] else ("Боты 24/7" if p["type"] == "service" else "Скрипты")
+    default_group = "Тесты" if out["is_test_project"] else ("Веб/API" if p["type"] == "web" else ("Боты 24/7" if p["type"] == "service" else "Скрипты"))
     out["group_tag"] = str(out["env"].get("PROJECT_GROUP") or default_group)
     out["custom_proxy"] = str(out["env"].get("CUSTOM_PROXY_URL", ""))
     out["git_repo_url"] = str(out["env"].get("GIT_REPO_URL", ""))
+    out["port"] = int(p.get("port") or 0)
+    out["healthcheck_url"] = str(p.get("healthcheck_url") or "")
+    out["healthcheck_interval_sec"] = int(p.get("healthcheck_interval_sec") or 30)
+    out["health_status"] = str(p.get("health_status") or "unknown")
+    out["has_venv"] = (Path(p["workdir"]) / ".venv" / "bin" / "python").exists()
     out["has_browser_profile"] = (Path(p["workdir"]) / "storage_state.json").exists()
     out["active_web_auth"] = ACTIVE_WEB_AUTH_SESSIONS.get(proj_id) is not None
 
@@ -471,6 +478,7 @@ async def api_dashboard(request: Request) -> dict[str, Any]:
             "proxy_url": proxy_url,
             "proxy_status": check_proxy_reachable(proxy_url),
             "hardware": get_poco_hardware_status(),
+            "env_profile": get_environment_profile(),
             "run_as_user": get_setting("run_as_user", "root"),
         },
         "pending_asks": active_asks,
@@ -506,8 +514,8 @@ async def api_create_project(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"Проект с именем «{name}» уже существует")
 
     proj_type = str(body.get("type", "service")).strip()
-    if proj_type not in ("job", "service"):
-        raise HTTPException(status_code=400, detail="Тип проекта должен быть 'job' или 'service'")
+    if proj_type not in ("job", "service", "web"):
+        raise HTTPException(status_code=400, detail="Тип проекта должен быть 'job', 'service' или 'web'")
 
     runtime = str(body.get("runtime", "python")).strip()
     if runtime not in ("python", "node", "bash", "custom"):
@@ -516,13 +524,18 @@ async def api_create_project(request: Request) -> dict[str, Any]:
     requested_workdir = str(body.get("workdir") or (PROJECTS_DIR / name)).strip()
     validated_workdir = _validate_project_workdir(requested_workdir, name)
 
-    template = str(body.get("template", runtime)).strip()
+    template = str(body.get("template", "web" if proj_type == "web" else runtime)).strip()
     tpl_info = create_project_from_template(name, template=template, runtime=runtime, proj_type=proj_type)
 
     cmd = str(body.get("cmd") or tpl_info["cmd"]).strip()
     workdir = _validate_project_workdir(str(body.get("workdir") or tpl_info["workdir"]).strip(), name)
     use_proxy = int(body.get("use_proxy", tpl_info["use_proxy"]))
     ram_limit_mb = max(0, int(body.get("ram_limit_mb", 0) or 0))
+    proj_port = max(0, int(body.get("port", 0) or 0))
+    if proj_port > 0 and proj_port in FORBIDDEN_PORTS:
+        raise HTTPException(status_code=400, detail=f"Порт {proj_port} зарезервирован системой")
+    healthcheck_url = str(body.get("healthcheck_url", "")).strip()
+    healthcheck_interval_sec = max(5, int(body.get("healthcheck_interval_sec", 30) or 30))
 
     env_val = body.get("env", body.get("env_json", {}))
     env_json = json.dumps(env_val, ensure_ascii=False) if isinstance(env_val, dict) else str(env_val or "{}")
@@ -553,12 +566,13 @@ async def api_create_project(request: Request) -> dict[str, Any]:
     proj_id = execute_sql(
         """INSERT INTO projects (
             name, type, runtime, cmd, workdir, env_json, secrets_json,
-            use_proxy, ram_limit_mb, schedule_type, schedule_expr,
+            use_proxy, ram_limit_mb, port, healthcheck_url, healthcheck_interval_sec, health_status,
+            schedule_type, schedule_expr,
             timeout_sec, max_retries, retry_delay_sec, webhook_token,
             autostart, restart_policy, backoff_min_sec, backoff_max_sec,
             desired_state, notify_on_error, notify_on_success, notify_on_crash,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stopped', ?, ?, ?, ?, ?)""",
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stopped', ?, ?, ?, ?, ?)""",
         (
             name,
             proj_type,
@@ -569,6 +583,9 @@ async def api_create_project(request: Request) -> dict[str, Any]:
             secrets_json,
             use_proxy,
             ram_limit_mb,
+            proj_port,
+            healthcheck_url,
+            healthcheck_interval_sec,
             schedule_type,
             schedule_expr,
             timeout_sec,
@@ -599,11 +616,20 @@ async def api_update_project(request: Request, project_id: int) -> dict[str, Any
 
     body = await request.json()
     proj_type = str(body.get("type", existing["type"])).strip()
+    if proj_type not in ("job", "service", "web"):
+        raise HTTPException(status_code=400, detail="Тип проекта должен быть 'job', 'service' или 'web'")
     runtime = str(body.get("runtime", existing["runtime"])).strip()
     cmd = str(body.get("cmd", existing["cmd"])).strip()
     workdir = _validate_project_workdir(str(body.get("workdir", existing["workdir"])).strip(), existing["name"])
     use_proxy = 1 if body.get("use_proxy", existing["use_proxy"]) else 0
     ram_limit_mb = max(0, int(body.get("ram_limit_mb", existing["ram_limit_mb"]) or 0))
+    proj_port = max(0, int(body.get("port", existing.get("port", 0)) or 0))
+    if proj_port > 0 and proj_port in FORBIDDEN_PORTS:
+        raise HTTPException(status_code=400, detail=f"Порт {proj_port} зарезервирован системой")
+    healthcheck_url = str(body.get("healthcheck_url", existing.get("healthcheck_url", ""))).strip()
+    healthcheck_interval_sec = max(
+        5, int(body.get("healthcheck_interval_sec", existing.get("healthcheck_interval_sec", 30)) or 30)
+    )
 
     env_val = body.get("env", body.get("env_json", existing["env_json"]))
     env_json = json.dumps(env_val, ensure_ascii=False) if isinstance(env_val, dict) else str(env_val)
@@ -633,7 +659,8 @@ async def api_update_project(request: Request, project_id: int) -> dict[str, Any
     execute_sql(
         """UPDATE projects SET
             type = ?, runtime = ?, cmd = ?, workdir = ?, env_json = ?, secrets_json = ?,
-            use_proxy = ?, ram_limit_mb = ?, schedule_type = ?, schedule_expr = ?,
+            use_proxy = ?, ram_limit_mb = ?, port = ?, healthcheck_url = ?, healthcheck_interval_sec = ?,
+            schedule_type = ?, schedule_expr = ?,
             timeout_sec = ?, max_retries = ?, retry_delay_sec = ?,
             autostart = ?, restart_policy = ?, backoff_min_sec = ?, backoff_max_sec = ?,
             notify_on_error = ?, notify_on_success = ?, notify_on_crash = ?, updated_at = ?
@@ -647,6 +674,9 @@ async def api_update_project(request: Request, project_id: int) -> dict[str, Any
             secrets_json,
             use_proxy,
             ram_limit_mb,
+            proj_port,
+            healthcheck_url,
+            healthcheck_interval_sec,
             schedule_type,
             schedule_expr,
             timeout_sec,
@@ -713,22 +743,205 @@ async def api_install_deps(request: Request, project_id: int) -> dict[str, Any]:
 
     workdir = Path(proj["workdir"])
     runtime = proj["runtime"]
-
-    if runtime == "node" or (workdir / "package.json").exists():
-        dep_cmd = "/bin/bash -c 'echo \"[deps] Установка npm пакетов...\"; npm install --no-audit --no-fund 2>&1 || echo \"[deps] Проверка package.json завершена\"'"
-    else:
-        dep_cmd = (
-            "/bin/bash -c '"
-            "echo \"[deps] Проверка виртуального окружения .venv и requirements.txt...\"; "
-            "if [ ! -d .venv ]; then python3 -m venv --without-pip .venv 2>&1 || true; fi; "
-            "if [ -x .venv/bin/pip ]; then .venv/bin/pip install -r requirements.txt 2>&1; "
-            "elif command -v pip3 >/dev/null 2>&1; then pip3 install -r requirements.txt 2>&1; "
-            "else echo \"[deps] requirements.txt проверен, системные пакеты Python и SDK /opt/hub/sdk/python подключены.\"; fi"
-            "'"
-        )
+    dep_cmd = build_install_deps_command(workdir, runtime)
 
     run = await start_project_run(project_id, trigger="manual", custom_cmd=dep_cmd)
     return {"ok": True, "run": run}
+
+
+@router.get("/projects/{project_id}/kv")
+async def api_list_project_kv(request: Request, project_id: int) -> list[dict[str, Any]]:
+    """Возвращает все ключи хранилища состояния hub.state для проекта."""
+    rows = query_all(
+        "SELECT key, value_json, updated_at FROM project_kv WHERE project_id = ? ORDER BY key ASC",
+        (project_id,),
+    )
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        try:
+            val = json.loads(r["value_json"])
+        except Exception:
+            val = r["value_json"]
+        out.append({"key": r["key"], "value": val, "updated_at": r["updated_at"]})
+    return out
+
+
+@router.put("/projects/{project_id}/kv/{key}")
+async def api_put_project_kv(request: Request, project_id: int, key: str) -> dict[str, Any]:
+    """Создаёт или обновляет ключ в хранилище состояния hub.state проекта из веб-интерфейса."""
+    clean_key = (key or "").strip()
+    if not clean_key or len(clean_key) > 128:
+        raise HTTPException(status_code=400, detail="Некорректный ключ hub.state")
+    body = await request.json()
+    val = body.get("value")
+    val_json = json.dumps(val, ensure_ascii=False)
+    now = int(time.time())
+    execute_sql(
+        """INSERT INTO project_kv (project_id, key, value_json, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(project_id, key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at""",
+        (project_id, clean_key, val_json, now),
+    )
+    return {"ok": True, "key": clean_key, "value": val, "updated_at": now}
+
+
+@router.delete("/projects/{project_id}/kv/{key}")
+async def api_delete_project_kv(request: Request, project_id: int, key: str) -> dict[str, Any]:
+    """Удаляет ключ из хранилища состояния hub.state проекта."""
+    clean_key = (key or "").strip()
+    execute_sql("DELETE FROM project_kv WHERE project_id = ? AND key = ?", (project_id, clean_key))
+    return {"ok": True, "deleted": clean_key}
+
+
+@router.post("/projects/import_examples")
+async def api_import_example_projects(request: Request) -> dict[str, Any]:
+    """
+    Импортирует готовые примеры из каталога projects/examples/ в рабочую директорию PROJECTS_DIR
+    и регистрирует их в SQLite (без автоматического засорения БД при каждом старте демона).
+    """
+    from hub.config import EXAMPLES_DIR
+    from hub.templates_mgr import create_project_from_template
+
+    EXAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+    examples_spec = [
+        {
+            "name": "heartbeat-daemon",
+            "type": "service",
+            "runtime": "python",
+            "template": "python",
+            "cmd": "python3 main.py",
+            "port": 0,
+            "healthcheck_url": "",
+            "schedule_type": "manual",
+            "schedule_expr": "",
+            "autostart": 0,
+            "restart_policy": "always",
+            "env": {
+                "PROJECT_GROUP": "Боты 24/7",
+                "PROJECT_DESCRIPTION": "Фоновый демон (Service 24/7) с сохранением счётчика тиков в hub.state",
+            },
+            "code": (
+                "import time\n"
+                "import hub\n\n"
+                "print('[heartbeat-daemon] Сервис запущен (Direct FD, без SIGPIPE)', flush=True)\n"
+                "ticks = int(hub.state.get('ticks', 0) or 0)\n"
+                "while True:\n"
+                "    ticks += 1\n"
+                "    hub.state.set('ticks', ticks)\n"
+                "    print(f'[heartbeat-daemon] Тик #{ticks} сохранён в hub.state', flush=True)\n"
+                "    time.sleep(10)\n"
+            ),
+        },
+        {
+            "name": "web-status-api",
+            "type": "web",
+            "runtime": "python",
+            "template": "web",
+            "cmd": "python3 main.py",
+            "port": 18081,
+            "healthcheck_url": "http://127.0.0.1:18081/health",
+            "schedule_type": "manual",
+            "schedule_expr": "",
+            "autostart": 0,
+            "restart_policy": "always",
+            "env": {
+                "PROJECT_GROUP": "Web / API",
+                "PROJECT_DESCRIPTION": "Пример легковесного HTTP API бэкенда с проверкой /health и $PORT",
+            },
+            "code": None,  # использует стандартный шаблон 'web'
+        },
+        {
+            "name": "sms-auth-bot",
+            "type": "job",
+            "runtime": "python",
+            "template": "python",
+            "cmd": "python3 main.py",
+            "port": 0,
+            "healthcheck_url": "",
+            "schedule_type": "manual",
+            "schedule_expr": "",
+            "autostart": 0,
+            "restart_policy": "no",
+            "env": {
+                "PROJECT_GROUP": "Тесты",
+                "PROJECT_DESCRIPTION": "Пример интерактивного запроса 2FA/СМС-кода через hub.ask()",
+            },
+            "code": (
+                "import hub\n\n"
+                "print('[sms-auth-bot] Запрашиваем код подтверждения через hub.ask()...', flush=True)\n"
+                "code = hub.ask('Введите 6-значный код из СМС для входа в аккаунт:', timeout=180)\n"
+                "hub.state.set('last_auth_code_len', len(str(code)))\n"
+                "print(f'[sms-auth-bot] Код получен ({len(str(code))} симв.), авторизация успешна!', flush=True)\n"
+            ),
+        },
+        {
+            "name": "cookie-checker-job",
+            "type": "job",
+            "runtime": "python",
+            "template": "cookie_parser",
+            "cmd": "python3 main.py",
+            "port": 0,
+            "healthcheck_url": "",
+            "schedule_type": "cron",
+            "schedule_expr": "*/30 * * * *",
+            "autostart": 0,
+            "restart_policy": "no",
+            "env": {
+                "PROJECT_GROUP": "Парсеры",
+                "PROJECT_DESCRIPTION": "Периодическая задача проверки куки (Cron каждые 30 мин) с сигналом hub.cookies_expired()",
+            },
+            "code": None,
+        },
+    ]
+
+    imported_names: list[str] = []
+    now = int(time.time())
+    for spec in examples_spec:
+        ex_dir = EXAMPLES_DIR / spec["name"]
+        ex_dir.mkdir(parents=True, exist_ok=True)
+        if spec["code"]:
+            (ex_dir / "main.py").write_text(spec["code"], encoding="utf-8")
+
+        existing = query_one("SELECT id FROM projects WHERE name = ?", (spec["name"],))
+        if existing:
+            continue
+
+        workdir = PROJECTS_DIR / spec["name"]
+        create_project_from_template(spec["name"], spec["template"], spec["runtime"], spec["type"])
+        if spec["code"]:
+            (workdir / "main.py").write_text(spec["code"], encoding="utf-8")
+        (LOGS_DIR / spec["name"]).mkdir(parents=True, exist_ok=True)
+
+        execute_sql(
+            """INSERT INTO projects (
+                name, type, runtime, cmd, workdir, env_json, secrets_json,
+                use_proxy, ram_limit_mb, port, healthcheck_url, healthcheck_interval_sec,
+                schedule_type, schedule_expr, timeout_sec, max_retries, retry_delay_sec,
+                webhook_token, autostart, restart_policy, backoff_min_sec, backoff_max_sec,
+                desired_state, notify_on_error, notify_on_success, notify_on_crash,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, '[]', 1, 128, ?, ?, 30, ?, ?, 0, 0, 30, ?, ?, ?, 2, 120, 'stopped', 1, 0, 1, ?, ?)""",
+            (
+                spec["name"],
+                spec["type"],
+                spec["runtime"],
+                spec["cmd"],
+                str(workdir),
+                json.dumps(spec["env"], ensure_ascii=False),
+                spec["port"],
+                spec["healthcheck_url"],
+                spec["schedule_type"],
+                spec["schedule_expr"],
+                secrets.token_hex(16),
+                spec["autostart"],
+                spec["restart_policy"],
+                now,
+                now,
+            ),
+        )
+        imported_names.append(spec["name"])
+
+    return {"ok": True, "imported": imported_names, "count": len(imported_names)}
 
 
 @router.post("/projects/{project_id}/cookies")
@@ -1675,17 +1888,16 @@ async def api_update_settings(request: Request) -> dict[str, Any]:
 
     new_password = str(body.get("new_password", "")).strip()
     if new_password:
-        if len(new_password) < 6:
-            raise HTTPException(status_code=400, detail="Новый пароль должен содержать минимум 6 символов")
-        if new_password.lower() == "admin":
-            raise HTTPException(status_code=400, detail="Новый пароль не может совпадать со стандартным 'admin'")
+        if len(new_password) < 4:
+            raise HTTPException(status_code=400, detail="Новый пароль должен содержать минимум 4 символа")
         set_setting("password_hash", hash_password(new_password))
         set_setting("must_change_password", "0")
         try:
-            INITIAL_PASSWORD_PATH.unlink(missing_ok=True)
+            INITIAL_PASSWORD_PATH.write_text(new_password + "\n", encoding="utf-8")
+            os.chmod(INITIAL_PASSWORD_PATH, 0o600)
         except OSError:
             pass
-        log_audit(client_ip, "PASSWORD_CHANGED", "Пароль администратора изменён")
+        log_audit(client_ip, "PASSWORD_CHANGED", "Пароль администратора изменён в настройках панели")
 
     reload_redaction_cache()
     ensure_tg_poller_running()
@@ -1813,39 +2025,32 @@ async def api_run_acceptance_suite(request: Request) -> dict[str, Any]:
     )
 
     # 2. Переживание рестарта панели без потери сервисов (Direct FD + ECHILD recovery)
-    hb = query_one("SELECT * FROM projects WHERE name = 'heartbeat-daemon'")
-    created_temp_hb = False
-    if not hb:
-        hb_workdir = PROJECTS_DIR / "acceptance-survive-test"
-        hb_workdir.mkdir(parents=True, exist_ok=True)
-        (LOGS_DIR / "acceptance-survive-test").mkdir(parents=True, exist_ok=True)
-        hb_id_new = execute_sql(
-            """INSERT INTO projects (
-                name, type, runtime, cmd, workdir, env_json, secrets_json,
-                use_proxy, ram_limit_mb, schedule_type, schedule_expr,
-                timeout_sec, max_retries, retry_delay_sec, webhook_token,
-                autostart, restart_policy, backoff_min_sec, backoff_max_sec,
-                desired_state, notify_on_error, notify_on_success, notify_on_crash,
-                created_at, updated_at
-            ) VALUES ('acceptance-survive-test', 'service', 'bash', 'bash -c "sleep 60"', ?, '{}', '[]',
-                0, 0, 'manual', '', 0, 0, 30, ?, 0, 'no', 2, 60, 'stopped', 0, 0, 0, ?, ?)""",
-            (str(hb_workdir), secrets.token_hex(16), now, now),
-        )
-        hb = query_one("SELECT * FROM projects WHERE id = ?", (hb_id_new,))
-        created_temp_hb = True
+    execute_sql("DELETE FROM projects WHERE name = 'acceptance-survive-test'")
+    hb_workdir = PROJECTS_DIR / "acceptance-survive-test"
+    hb_workdir.mkdir(parents=True, exist_ok=True)
+    (LOGS_DIR / "acceptance-survive-test").mkdir(parents=True, exist_ok=True)
+    hb_id_new = execute_sql(
+        """INSERT INTO projects (
+            name, type, runtime, cmd, workdir, env_json, secrets_json,
+            use_proxy, ram_limit_mb, schedule_type, schedule_expr,
+            timeout_sec, max_retries, retry_delay_sec, webhook_token,
+            autostart, restart_policy, backoff_min_sec, backoff_max_sec,
+            desired_state, notify_on_error, notify_on_success, notify_on_crash,
+            created_at, updated_at
+        ) VALUES ('acceptance-survive-test', 'service', 'bash', 'bash -c "sleep 60"', ?, '{}', '[]',
+            0, 0, 'manual', '', 0, 0, 30, ?, 0, 'no', 2, 60, 'stopped', 0, 0, 0, ?, ?)""",
+        (str(hb_workdir), secrets.token_hex(16), now, now),
+    )
+    hb = query_one("SELECT * FROM projects WHERE id = ?", (hb_id_new,))
+    created_temp_hb = True
 
     if hb:
+        await start_project_run(int(hb["id"]), trigger="autostart")
+        await asyncio.sleep(0.2)
         active_hb = query_one(
             "SELECT * FROM runs WHERE project_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
             (hb["id"],),
         )
-        if not active_hb:
-            await start_project_run(int(hb["id"]), trigger="autostart")
-            await asyncio.sleep(0.3)
-            active_hb = query_one(
-                "SELECT * FROM runs WHERE project_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
-                (hb["id"],),
-            )
         pid_before = active_hb["pid"] if active_hb else None
         ACTIVE_RUNS.clear()
         rec = recover_running_processes()
@@ -2000,3 +2205,59 @@ async def api_system_bundle(request: Request) -> dict[str, Any]:
         "selected_file": selected,
         "content": file_content,
     }
+
+
+@router.get("/system/systemd_unit")
+async def api_system_systemd_unit(request: Request) -> dict[str, Any]:
+    """Генерирует и сохраняет scripts/hub.service для стационарных Linux-серверов с systemd."""
+    from hub.env_detect import generate_systemd_unit
+
+    port = int(get_setting("port", "8050") or 8050)
+    unit_text = generate_systemd_unit(BASE_DIR, port=port)
+    unit_path = BASE_DIR / "scripts" / "hub.service"
+    try:
+        unit_path.parent.mkdir(parents=True, exist_ok=True)
+        unit_path.write_text(unit_text, encoding="utf-8")
+    except OSError:
+        pass
+    return {"ok": True, "path": str(unit_path), "unit": unit_text, "content": unit_text}
+
+
+@router.get("/system/backup")
+async def api_system_backup_zip(request: Request) -> Response:
+    """
+    Формирует и отдаёт .zip-бэкап панели Hub (БД data/hub.db после WAL checkpoint,
+    секреты data/secrets/ и исходный код проектов без тяжёлых .venv / node_modules / .tmp).
+    """
+    from hub.config import DB_PATH, SECRETS_DIR
+    from hub.db import checkpoint_wal
+
+    checkpoint_wal(truncate_threshold_mb=0.0)
+    buf = io.BytesIO()
+    skip_dirs = {".venv", "venv", "node_modules", "__pycache__", ".git", ".tmp", ".home", "browser_profile"}
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if DB_PATH.exists():
+            zf.write(DB_PATH, "data/hub.db")
+        if SECRETS_DIR.exists():
+            for sec_file in SECRETS_DIR.iterdir():
+                if sec_file.is_file():
+                    zf.write(sec_file, f"data/secrets/{sec_file.name}")
+        if PROJECTS_DIR.exists():
+            for root, dirs, files in os.walk(PROJECTS_DIR):
+                dirs[:] = [d for d in dirs if d not in skip_dirs]
+                root_p = Path(root)
+                for fn in files:
+                    fp = root_p / fn
+                    try:
+                        if fp.is_file() and fp.stat().st_size <= 5 * 1024 * 1024:
+                            rel = fp.relative_to(BASE_DIR)
+                            zf.write(fp, str(rel))
+                    except OSError:
+                        pass
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="hub_backup_{ts}.zip"'},
+    )

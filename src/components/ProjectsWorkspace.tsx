@@ -116,10 +116,13 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   const [cfgGroupTag, setCfgGroupTag] = useState<string>('Мои проекты');
   const [cfgCustomProxy, setCfgCustomProxy] = useState<string>('');
   const [cfgCmd, setCfgCmd] = useState<string>('');
-  const [cfgType, setCfgType] = useState<'job' | 'service'>('service');
+  const [cfgType, setCfgType] = useState<'job' | 'service' | 'web'>('service');
   const [cfgRuntime, setCfgRuntime] = useState<'python' | 'node' | 'bash' | 'custom'>('python');
   const [cfgUseProxy, setCfgUseProxy] = useState<boolean>(false);
   const [cfgRamLimit, setCfgRamLimit] = useState<number>(0);
+  const [cfgPort, setCfgPort] = useState<number>(0);
+  const [cfgHealthcheckUrl, setCfgHealthcheckUrl] = useState<string>('');
+  const [cfgHealthcheckInterval, setCfgHealthcheckInterval] = useState<number>(30);
   const [cfgScheduleType, setCfgScheduleType] = useState<'manual' | 'cron' | 'interval'>('manual');
   const [cfgScheduleExpr, setCfgScheduleExpr] = useState<string>('');
   const [cfgTimeoutSec, setCfgTimeoutSec] = useState<number>(0);
@@ -136,6 +139,14 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   const [cfgError, setCfgError] = useState<string>('');
   const [cfgSaved, setCfgSaved] = useState<boolean>(false);
   const [copiedWebhook, setCopiedWebhook] = useState<boolean>(false);
+
+  // Нижняя выдвижная консоль (VS Code / Dockge стиль): Логи + hub.state KV + Shell
+  const [bottomConsoleTab, setBottomConsoleTab] = useState<'logs' | 'kv' | 'shell'>('logs');
+  const [consoleExpanded, setConsoleExpanded] = useState<boolean>(false);
+  const [logSearch, setLogSearch] = useState<string>('');
+  const [kvItems, setKvItems] = useState<Array<{ key: string; value: any; updated_at: number }>>([]);
+  const [newKvKey, setNewKvKey] = useState<string>('');
+  const [newKvValue, setNewKvValue] = useState<string>('');
 
   // Визуальный конструктор расписания (для простых настроек)
   const [schedBuilderMode, setSchedBuilderMode] = useState<'manual' | 'minutes' | 'hours' | 'daily' | 'custom'>('minutes');
@@ -176,12 +187,55 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     setSubTab(initialSubTab);
   }, [initialSubTab]);
 
+  const loadProjectKv = async (projId: number) => {
+    try {
+      const res = await apiFetch(`/api/projects/${projId}/kv`);
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          setKvItems(data);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleSaveKvItem = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeProj || !newKvKey.trim()) return;
+    let parsedVal: any = newKvValue;
+    try {
+      parsedVal = JSON.parse(newKvValue);
+    } catch {
+      parsedVal = newKvValue;
+    }
+    const res = await apiFetch(`/api/projects/${activeProj.id}/kv/${encodeURIComponent(newKvKey.trim())}`, {
+      method: 'PUT',
+      body: JSON.stringify({ value: parsedVal }),
+    });
+    if (res.ok) {
+      setNewKvKey('');
+      setNewKvValue('');
+      await loadProjectKv(activeProj.id);
+    }
+  };
+
+  const handleDeleteKvItem = async (key: string) => {
+    if (!activeProj) return;
+    await apiFetch(`/api/projects/${activeProj.id}/kv/${encodeURIComponent(key)}`, {
+      method: 'DELETE',
+    });
+    await loadProjectKv(activeProj.id);
+  };
+
   const loadFilesAndRuns = async (proj: ProjectItem) => {
     try {
       const [filesRes, runsRes] = await Promise.all([
         apiFetch(`/api/projects/${proj.id}/files`),
         apiFetch(`/api/projects/${proj.id}/runs`),
       ]);
+      await loadProjectKv(proj.id);
       if (filesRes.ok) {
         const fData = await filesRes.json();
         const tree: FileTreeNode[] = fData.tree || [];
@@ -216,6 +270,9 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     setCfgRuntime(proj.runtime);
     setCfgUseProxy(proj.use_proxy === 1);
     setCfgRamLimit(proj.ram_limit_mb);
+    setCfgPort(proj.port || 0);
+    setCfgHealthcheckUrl(proj.healthcheck_url || '');
+    setCfgHealthcheckInterval(proj.healthcheck_interval_sec || 30);
     setCfgScheduleType(proj.schedule_type);
     setCfgScheduleExpr(proj.schedule_expr);
     setCfgTimeoutSec(proj.timeout_sec);
@@ -772,6 +829,9 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
         cmd: cfgCmd,
         use_proxy: cfgUseProxy ? 1 : 0,
         ram_limit_mb: cfgRamLimit,
+        port: cfgPort,
+        healthcheck_url: cfgHealthcheckUrl.trim(),
+        healthcheck_interval_sec: cfgHealthcheckInterval,
         schedule_type: cfgScheduleType,
         schedule_expr: cfgScheduleExpr,
         timeout_sec: cfgTimeoutSec,
@@ -2291,83 +2351,282 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                 />
               </div>
             </div>
+            {/* Параметры Web / API ($PORT и Healthcheck) */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 p-4 bg-[#0b0f17] border border-cyan-500/30 rounded-xl">
+              <div>
+                <label className="block text-xs text-cyan-200 mb-1">Архитектурный тип</label>
+                <select
+                  value={cfgType}
+                  onChange={(e) => setCfgType(e.target.value as any)}
+                  className="w-full bg-[#111622] border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white"
+                >
+                  <option value="service">service (24/7 демон / бот)</option>
+                  <option value="web">web (HTTP/API бэкенд с $PORT)</option>
+                  <option value="job">job (периодическая задача / Cron)</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs text-cyan-200 mb-1">Порт ($PORT, 0 = не задан)</label>
+                <input
+                  type="number"
+                  min={0}
+                  max={65535}
+                  value={cfgPort}
+                  onChange={(e) => setCfgPort(Number(e.target.value))}
+                  className="w-full bg-[#111622] border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-cyan-200 mb-1">Healthcheck URL (HTTP 200..399 / tcp://)</label>
+                <input
+                  type="text"
+                  value={cfgHealthcheckUrl}
+                  onChange={(e) => setCfgHealthcheckUrl(e.target.value)}
+                  placeholder="http://127.0.0.1:18080/health"
+                  className="w-full bg-[#111622] border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                />
+              </div>
+            </div>
           </form>
         )}
 
-        {/* НИЖНЯЯ КОНСОЛЬ ЖИВЫХ ЛОГОВ ПРОЕКТА + ИНТЕРАКТИВНЫЙ ВВОД STDIN */}
+        {/* НИЖНЯЯ ВЫДВИЖНАЯ КОНСОЛЬ В СТИЛЕ VS CODE / DOCKGE: ЛОГИ + STDIN + ХРАНИЛИЩЕ HUB.STATE + SHELL */}
         <section
           aria-label="Консоль живых логов"
-          className="bg-[#1e293b] border border-slate-800 rounded-xl overflow-hidden"
+          className="bg-[#111622] border border-slate-800 rounded-xl overflow-hidden"
         >
-          <div className="px-4 py-2.5 bg-slate-900/80 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2 text-xs">
-              <Terminal className="w-4 h-4 text-emerald-400" />
-              <span className="font-semibold text-white">Живой журнал вывода (Лог запуска и интерактивный stdin)</span>
-              {isStreaming && (
-                <span className="font-mono text-emerald-400">· LIVE STREAM (обновление каждые 300мс)</span>
-              )}
+          <div className="px-4 py-2 bg-[#0b0f17] border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setBottomConsoleTab('logs')}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                  bottomConsoleTab === 'logs'
+                    ? 'bg-slate-800 text-white'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Terminal className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Живой лог и stdin</span>
+                {isStreaming && <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setBottomConsoleTab('kv');
+                  if (activeProj) loadProjectKv(activeProj.id);
+                }}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                  bottomConsoleTab === 'kv'
+                    ? 'bg-slate-800 text-indigo-300'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <HardDrive className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Хранилище hub.state ({kvItems.length})</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setBottomConsoleTab('shell')}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                  bottomConsoleTab === 'shell'
+                    ? 'bg-slate-800 text-amber-300'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Package className="w-3.5 h-3.5 text-amber-400" />
+                <span>Быстрый Shell (.venv / uv)</span>
+              </button>
             </div>
 
             <div className="flex items-center gap-2">
-              <label htmlFor="run-history-select" className="text-xs text-slate-400">
-                История запусков:
-              </label>
-              <select
-                id="run-history-select"
-                value={selectedRunId || ''}
-                onChange={(e) => setSelectedRunId(Number(e.target.value))}
-                className="bg-[#0f172a] border border-slate-700 rounded px-2.5 py-1 text-xs font-mono text-slate-200"
+              {bottomConsoleTab === 'logs' && (
+                <>
+                  <input
+                    type="text"
+                    value={logSearch}
+                    onChange={(e) => setLogSearch(e.target.value)}
+                    placeholder="Поиск в логе..."
+                    className="bg-[#111622] border border-slate-700 rounded px-2.5 py-1 text-xs font-mono text-white w-36 focus:outline-none focus:border-indigo-500"
+                  />
+                  <select
+                    id="run-history-select"
+                    value={selectedRunId || ''}
+                    onChange={(e) => setSelectedRunId(Number(e.target.value))}
+                    className="bg-[#111622] border border-slate-700 rounded px-2.5 py-1 text-xs font-mono text-slate-200"
+                  >
+                    {runs.length === 0 && <option value="">Нет запусков</option>}
+                    {runs.map((r) => (
+                      <option key={r.id} value={r.id}>
+                        Run #{r.id} · {r.status} · PID {r.pid || '—'} ({r.trigger})
+                      </option>
+                    ))}
+                  </select>
+                </>
+              )}
+
+              <button
+                type="button"
+                onClick={() => setConsoleExpanded(!consoleExpanded)}
+                className="px-2 py-1 text-[11px] font-mono text-slate-300 hover:text-white bg-slate-800 rounded cursor-pointer"
               >
-                {runs.length === 0 && <option value="">Нет запусков</option>}
-                {runs.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    Запуск #{r.id} · {r.status} · PID {r.pid || '—'} ({r.trigger})
-                  </option>
-                ))}
-              </select>
+                {consoleExpanded ? 'Свернуть (224px)' : 'Развернуть (420px)'}
+              </button>
 
               <button
                 type="button"
                 onClick={() => activeProj && loadFilesAndRuns(activeProj)}
                 className="p-1.5 text-slate-400 hover:text-white bg-slate-800 rounded cursor-pointer"
-                title="Обновить список запусков"
+                title="Обновить консоль"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
               </button>
             </div>
           </div>
 
-          <pre
-            ref={logContainerRef}
-            data-testid="live-log-console"
-            className="p-4 bg-[#070b14] text-slate-200 font-mono text-xs leading-relaxed h-56 overflow-y-auto whitespace-pre-wrap"
-          >
-            {logText || '// Лог пуст'}
-          </pre>
-
-          {/* Строка отправки интерактивного ввода (stdin) в запущенный процесс */}
-          {selectedRunId && (
-            <form
-              onSubmit={handleSendStdin}
-              className="px-3 py-2 bg-[#0b1120] border-t border-slate-800 flex items-center gap-2"
-            >
-              <span className="text-xs font-mono text-indigo-400 shrink-0">stdin &gt;</span>
-              <input
-                type="text"
-                value={stdinText}
-                onChange={(e) => setStdinText(e.target.value)}
-                placeholder="Если программа в консоли ждёт ответ (номер телефона, y/n, токен) — введите здесь и нажмите Enter..."
-                className="flex-1 bg-transparent text-xs font-mono text-white focus:outline-none"
-              />
-              <button
-                type="submit"
-                disabled={stdinSending || !stdinText.trim()}
-                className="px-3 py-1 text-xs font-medium bg-indigo-600/80 hover:bg-indigo-500 disabled:opacity-40 text-white rounded inline-flex items-center gap-1 cursor-pointer shrink-0"
+          {bottomConsoleTab === 'logs' && (
+            <>
+              <pre
+                ref={logContainerRef}
+                data-testid="live-log-console"
+                className={`p-4 bg-[#070b14] text-slate-200 font-mono text-xs leading-relaxed overflow-y-auto whitespace-pre-wrap ${
+                  consoleExpanded ? 'h-[420px]' : 'h-56'
+                }`}
               >
-                <CornerDownLeft className="w-3 h-3" />
-                Отправить в консоль
-              </button>
-            </form>
+                {(logSearch.trim()
+                  ? (logText || '')
+                      .split('\n')
+                      .filter((line) => line.toLowerCase().includes(logSearch.toLowerCase()))
+                      .join('\n')
+                  : logText) || '// Лог пуст'}
+              </pre>
+
+              {selectedRunId && (
+                <form
+                  onSubmit={handleSendStdin}
+                  className="px-3 py-2 bg-[#0b1120] border-t border-slate-800 flex items-center gap-2"
+                >
+                  <span className="text-xs font-mono text-indigo-400 shrink-0">stdin (FIFO) &gt;</span>
+                  <input
+                    type="text"
+                    value={stdinText}
+                    onChange={(e) => setStdinText(e.target.value)}
+                    placeholder="Введите строку для передачи в блокирующий sys.stdin.readline() / input() дочернего процесса..."
+                    className="flex-1 bg-transparent text-xs font-mono text-white focus:outline-none"
+                  />
+                  <button
+                    type="submit"
+                    disabled={stdinSending || !stdinText.trim()}
+                    className="px-3 py-1 text-xs font-medium bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded inline-flex items-center gap-1 cursor-pointer shrink-0"
+                  >
+                    <CornerDownLeft className="w-3 h-3" />
+                    Отправить в stdin
+                  </button>
+                </form>
+              )}
+            </>
+          )}
+
+          {bottomConsoleTab === 'kv' && (
+            <div className="p-4 bg-[#070b14] space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-slate-400">
+                <span>
+                  Постоянное состояние скрипта в SQLite (<code className="font-mono text-indigo-300">hub.state.get/set/delete</code>)
+                </span>
+                <form onSubmit={handleSaveKvItem} className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    placeholder="Ключ (напр. last_id)"
+                    value={newKvKey}
+                    onChange={(e) => setNewKvKey(e.target.value)}
+                    className="bg-[#111622] border border-slate-700 rounded px-2.5 py-1 text-xs font-mono text-white w-36"
+                  />
+                  <input
+                    type="text"
+                    placeholder='Значение JSON/строка (напр. 105 или {"ok":true})'
+                    value={newKvValue}
+                    onChange={(e) => setNewKvValue(e.target.value)}
+                    className="bg-[#111622] border border-slate-700 rounded px-2.5 py-1 text-xs font-mono text-white w-56"
+                  />
+                  <button
+                    type="submit"
+                    className="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-semibold cursor-pointer"
+                  >
+                    Сохранить ключ
+                  </button>
+                </form>
+              </div>
+
+              {kvItems.length === 0 ? (
+                <div className="py-6 text-center text-xs text-slate-400 font-mono">
+                  В хранилище hub.state этого проекта пока нет ключей. Вызовите hub.state.set("cursor", 1) в коде или добавьте ключ выше.
+                </div>
+              ) : (
+                <div className="overflow-x-auto max-h-56 overflow-y-auto border border-slate-800 rounded-lg">
+                  <table className="w-full text-left border-collapse text-xs font-mono">
+                    <thead>
+                      <tr className="border-b border-slate-800 bg-[#111622] text-slate-400">
+                        <th className="py-2 px-3">Ключ (key)</th>
+                        <th className="py-2 px-3">Значение (JSON)</th>
+                        <th className="py-2 px-3">Обновлено</th>
+                        <th className="py-2 px-3 text-right">Действие</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/70">
+                      {kvItems.map((item) => (
+                        <tr key={item.key} className="hover:bg-slate-900/60">
+                          <td className="py-2 px-3 text-indigo-300 font-semibold">{item.key}</td>
+                          <td className="py-2 px-3 text-slate-200">{JSON.stringify(item.value)}</td>
+                          <td className="py-2 px-3 text-slate-400 tabular-nums">
+                            {new Date(item.updated_at * 1000).toLocaleTimeString('ru-RU')}
+                          </td>
+                          <td className="py-2 px-3 text-right">
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteKvItem(item.key)}
+                              className="text-rose-400 hover:underline cursor-pointer"
+                            >
+                              Удалить
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
+          {bottomConsoleTab === 'shell' && (
+            <div className="p-4 bg-[#070b14] space-y-3">
+              <form onSubmit={handleRunCliCommand} className="flex items-center gap-2">
+                <span className="text-xs font-mono text-emerald-400 shrink-0">
+                  {activeProj.name}/.venv $
+                </span>
+                <input
+                  type="text"
+                  value={cliCommandInput}
+                  onChange={(e) => setCliCommandInput(e.target.value)}
+                  placeholder="Введите команду (напр. pip install -r requirements.txt, git status, ls -la)..."
+                  className="flex-1 bg-[#111622] border border-slate-700 rounded px-3 py-1.5 text-xs font-mono text-white"
+                />
+                <button
+                  type="submit"
+                  disabled={cliRunning}
+                  className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs font-semibold cursor-pointer"
+                >
+                  {cliRunning ? 'Выполнение...' : 'Выполнить'}
+                </button>
+              </form>
+              {cliMsg && (
+                <div className="text-xs font-mono text-slate-300 bg-[#111622] p-2.5 rounded border border-slate-800">
+                  {cliMsg.text}
+                </div>
+              )}
+            </div>
           )}
         </section>
       </div>

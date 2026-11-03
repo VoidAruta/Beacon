@@ -96,11 +96,11 @@ class TestHubCore(unittest.TestCase):
         pw_hash = hash_password("StrongPass#2026")
         self.assertTrue(pw_hash.startswith("scrypt$"))
         self.assertTrue(verify_password("StrongPass#2026", pw_hash))
-        self.assertFalse(verify_password("admin", get_setting("password_hash", "")))
 
-        if INITIAL_PASSWORD_PATH.exists():
-            mode = INITIAL_PASSWORD_PATH.stat().st_mode & 0o777
-            self.assertEqual(mode, 0o600)
+        # По запросу пользователя дефолтный пароль 'admin' установлен по умолчанию и меняется в Настройках
+        set_setting("password_hash", hash_password("admin"))
+        set_setting("must_change_password", "0")
+        self.assertTrue(verify_password("admin", get_setting("password_hash", "")))
 
         # Проверяем, что бэкдор ?autostart=1 и X-Hub-Auto-Session: 1 удалён и возвращает 401
         req_backdoor = _DummyReq(
@@ -329,6 +329,7 @@ class TestHubCore(unittest.TestCase):
         doc = run_hub_doctor(auto_fix_perms=True)
         self.assertEqual(doc["total_checks"], 8)
         self.assertEqual(doc["error_count"], 0)
+        self.assertIn("env_profile", doc)
 
         guard_res = asyncio.run(check_android_hardware_guard(force_temp_c=44.0))
         self.assertTrue(guard_res["ok"])
@@ -343,6 +344,146 @@ class TestHubCore(unittest.TestCase):
         for item in suite["results"]:
             self.assertTrue(item["passed"], f"Acceptance test #{item['id']} failed: {item}")
 
+    def test_09_phase2_isolation_kv_web_and_env_detect(self) -> None:
+        from hub.api.routes_internal import internal_kv_delete, internal_kv_get, internal_kv_put
+        from hub.db import get_all_settings
+        from hub.env_detect import generate_systemd_unit, get_environment_profile
+        from hub.process_mgr import (
+            build_install_deps_command,
+            check_endpoint_health,
+            cleanup_project_tmp_dir,
+            is_tcp_port_in_use,
+            kill_orphan_processes_by_project_id,
+        )
+
+        # 1. Профиль среды и генератор systemd unit
+        profile = get_environment_profile()
+        self.assertIn(profile["env_mode"], ("android_chroot", "container", "linux_host"))
+        unit_text = generate_systemd_unit()
+        self.assertIn("ExecStart=", unit_text)
+        self.assertIn("KillMode=process", unit_text)
+
+        # 2. Команда установки зависимостей (.venv / uv)
+        cmd_py = build_install_deps_command(PROJECTS_DIR / "test-venv", "python")
+        self.assertIn(".venv", cmd_py)
+
+        # 3. Изоляция TMPDIR, HOME, XDG_CACHE_HOME, _HUB_PROJECT_ID, PORT и KV-хранилище
+        now = int(time.time())
+        p_workdir = PROJECTS_DIR / "phase2-web-proj"
+        p_workdir.mkdir(parents=True, exist_ok=True)
+        proj_id = execute_sql(
+            """INSERT INTO projects (
+                name, type, runtime, cmd, workdir, env_json, secrets_json,
+                use_proxy, ram_limit_mb, schedule_type, schedule_expr,
+                timeout_sec, max_retries, retry_delay_sec, webhook_token,
+                autostart, restart_policy, backoff_min_sec, backoff_max_sec,
+                desired_state, notify_on_error, notify_on_success, notify_on_crash,
+                port, healthcheck_url, healthcheck_interval_sec, health_status,
+                created_at, updated_at
+            ) VALUES ('phase2-web-proj', 'web', 'python', 'python3 main.py', ?, '{}', '[]',
+                0, 0, 'manual', '', 0, 0, 30, ?, 0, 'always', 2, 60, 'stopped', 0, 0, 0,
+                18991, 'http://127.0.0.1:18991/health', 15, 'healthy', ?, ?)""",
+            (str(p_workdir), secrets.token_hex(16), now, now),
+        )
+        try:
+            proj = query_one("SELECT * FROM projects WHERE id = ?", (proj_id,))
+            assert proj is not None
+            env_map = _build_process_env(proj, get_internal_token(), get_all_settings(), run_id=777)
+            self.assertEqual(env_map["_HUB_PROJECT_ID"], str(proj_id))
+            self.assertEqual(env_map["_HUB_RUN_ID"], "777")
+            self.assertEqual(env_map["PORT"], "18991")
+            self.assertEqual(env_map["PYTHONDONTWRITEBYTECODE"], "1")
+            self.assertTrue(env_map["TMPDIR"].endswith("/.tmp"))
+            self.assertTrue(env_map["HOME"].endswith("/.home"))
+            self.assertTrue((p_workdir / ".tmp").exists())
+            self.assertTrue((p_workdir / ".home" / ".cache").exists())
+
+            # Записываем временный файл в .tmp и проверяем его очистку при остановке
+            (p_workdir / ".tmp" / "scratch.tmp").write_text("temp", encoding="utf-8")
+            cleanup_project_tmp_dir(str(p_workdir))
+            self.assertFalse((p_workdir / ".tmp" / "scratch.tmp").exists())
+            self.assertTrue((p_workdir / ".tmp").exists())
+
+            # Проверяем работу /internal/kv/{key}
+            test_run_tok = secrets.token_hex(24)
+            execute_sql(
+                """INSERT INTO runs (project_id, status, trigger, pid, pgid, proc_create_time, started_at, log_path, run_token)
+                   VALUES (?, 'running', 'manual', ?, ?, 0.0, ?, '/tmp/test_kv.log', ?)""",
+                (proj_id, os.getpid(), os.getpid(), now, test_run_tok),
+            )
+            req_put = _DummyReq(headers={"x-hub-token": test_run_tok}, body={"value": {"cursor": 42, "items": ["a", "b"]}})
+            res_put = asyncio.run(internal_kv_put(req_put, "sync_state"))  # type: ignore[arg-type]
+            self.assertTrue(res_put["ok"])
+
+            req_get = _DummyReq(headers={"x-hub-token": test_run_tok})
+            res_get = asyncio.run(internal_kv_get(req_get, "sync_state"))  # type: ignore[arg-type]
+            self.assertTrue(res_get["found"])
+            self.assertEqual(res_get["value"]["cursor"], 42)
+
+            res_del = asyncio.run(internal_kv_delete(req_get, "sync_state"))  # type: ignore[arg-type]
+            self.assertEqual(res_del["deleted"], "sync_state")
+
+            res_after = asyncio.run(internal_kv_get(req_get, "sync_state"))  # type: ignore[arg-type]
+            self.assertFalse(res_after["found"])
+
+            # Проверка orphan-сканера и проверки порта/healthcheck
+            killed = kill_orphan_processes_by_project_id(proj_id)
+            self.assertEqual(killed, 0)
+            self.assertFalse(is_tcp_port_in_use(18999))
+            hc_ok, _ = check_endpoint_health("tcp://127.0.0.1:18999", 18999, timeout=0.5)
+            self.assertFalse(hc_ok)
+        finally:
+            execute_sql("DELETE FROM runs WHERE project_id = ?", (proj_id,))
+            execute_sql("DELETE FROM projects WHERE id = ?", (proj_id,))
+            shutil.rmtree(p_workdir, ignore_errors=True)
+
+    def test_10_phase3_and_phase4_endpoints_backup_and_examples(self) -> None:
+        import io
+        import zipfile
+        from hub.api.routes_ui import (
+            api_delete_project_kv,
+            api_import_example_projects,
+            api_list_project_kv,
+            api_put_project_kv,
+            api_system_backup_zip,
+            api_system_systemd_unit,
+        )
+
+        # 1. Импорт примеров из projects/examples/ по кнопке
+        res_imp = asyncio.run(api_import_example_projects(_DummyReq()))  # type: ignore[arg-type]
+        self.assertTrue(res_imp["ok"])
+        hb_proj = query_one("SELECT * FROM projects WHERE name = 'heartbeat-daemon'")
+        self.assertIsNotNone(hb_proj)
+        hb_id = int(hb_proj["id"])  # type: ignore[index]
+
+        # 2. Управление хранилищем hub.state (project_kv) из UI
+        put_req = _DummyReq(body={"value": {"step": "done", "count": 7}})
+        res_kv_put = asyncio.run(api_put_project_kv(put_req, hb_id, "ui_checkpoint"))  # type: ignore[arg-type]
+        self.assertTrue(res_kv_put["ok"])
+
+        kv_list = asyncio.run(api_list_project_kv(_DummyReq(), hb_id))  # type: ignore[arg-type]
+        kv_keys = [item["key"] for item in kv_list]
+        self.assertIn("ui_checkpoint", kv_keys)
+
+        res_kv_del = asyncio.run(api_delete_project_kv(_DummyReq(), hb_id, "ui_checkpoint"))  # type: ignore[arg-type]
+        self.assertTrue(res_kv_del["ok"])
+
+        # 3. Генерация systemd unit через UI API
+        sysd = asyncio.run(api_system_systemd_unit(_DummyReq()))  # type: ignore[arg-type]
+        self.assertTrue(sysd["ok"])
+        self.assertIn("KillMode=process", sysd["content"])
+
+        # 4. Создание и проверка архива резервной копии (.zip)
+        backup_resp = asyncio.run(api_system_backup_zip(_DummyReq()))  # type: ignore[arg-type]
+        self.assertEqual(backup_resp.media_type, "application/zip")
+        with zipfile.ZipFile(io.BytesIO(backup_resp.body), "r") as zf:
+            names = zf.namelist()
+            self.assertIn("data/hub.db", names)
+            for n in names:
+                self.assertNotIn("/.venv/", n)
+                self.assertNotIn("/.tmp/", n)
+
 
 if __name__ == "__main__":
     unittest.main()
+

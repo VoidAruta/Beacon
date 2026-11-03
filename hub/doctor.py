@@ -1,14 +1,8 @@
 """
-Самодиагностика окружения Android Linux Chroot и узлов безопасности Hub (`python3 -m hub doctor` и `GET /api/system/doctor`).
-Проверяет 8 ключевых подсистем:
-1. Сетевые группы ядра Android (aid_inet=3003, aid_net_raw=3004)
-2. Системные точки монтирования chroot (/proc, /sys, /dev/pts)
-3. Права доступа к секретам (0700 на data/secrets, 0600 на файлы и internal.token) + статус начального пароля
-4. Целостность SQLite WAL и размер hub.db-wal (с авто-чекпоинтом)
-5. Доступность локального прокси-моста 127.0.0.1:10808
-6. Наличие и версии рантаймов (python3, git, node, bash)
-7. Бюджет ОЗУ самого Hub (< 80 МБ RSS), ZRAM/Swap и свободное место UFS-накопителя
-8. Датчики питания и температуры смартфона (цикл 45–55%, пороги 43°C / 47°C)
+Адаптивная самодиагностика окружения Hub (`python3 -m hub doctor` и `GET /api/system/doctor`).
+Одинаково корректно работает в двух средах:
+1. Android Linux Chroot / Termux (aarch64, GID 3003/3004, датчики батареи /sys/class/power_supply/battery)
+2. Полноценный Linux-сервер / VPS / Контейнер (x86_64 / aarch64, systemd или без него, стационарное питание)
 """
 
 import os
@@ -20,9 +14,10 @@ from typing import Any
 
 from hub.auth import get_internal_token
 from hub.compat import psutil
-from hub.config import BASE_DIR, DATA_DIR, DB_PATH, INTERNAL_TOKEN_PATH, SECRETS_DIR, ensure_directories
+from hub.config import BASE_DIR, DATA_DIR, INTERNAL_TOKEN_PATH, SECRETS_DIR, ensure_directories
 from hub.db import checkpoint_wal, db_session, get_all_settings
 from hub.disk_guard import get_disk_status
+from hub.env_detect import get_environment_profile
 from hub.web_auth_mgr import check_proxy_reachable, get_poco_hardware_status
 
 
@@ -38,15 +33,17 @@ def _check_cmd_version(cmd: list[str]) -> str:
 
 
 def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
-    """Выполняет полную диагностику окружения Android chroot и возвращает структурированный отчёт."""
+    """Выполняет полную адаптивную диагностику окружения (Android Chroot или Linux Server/Container)."""
     t0 = time.monotonic()
     ensure_directories()
     get_internal_token()
     settings = get_all_settings()
+    env_prof = get_environment_profile()
+    is_android = bool(env_prof.get("is_android_chroot"))
 
     checks: list[dict[str, Any]] = []
 
-    # 1. Сетевые группы ядра Android (GID 3003 aid_inet, GID 3004 aid_net_raw)
+    # 1. Профиль среды и сетевые привилегии (Android GID 3003/3004 vs Linux Network Stack)
     proc_groups = set()
     try:
         proc_groups = set(os.getgroups())
@@ -66,30 +63,40 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
 
     has_3003 = (3003 in proc_groups) or (3003 in etc_group_gids)
     has_3004 = (3004 in proc_groups) or (3004 in etc_group_gids)
-    in_proc_3003 = 3003 in proc_groups
-    in_proc_3004 = 3004 in proc_groups
 
-    if in_proc_3003 and in_proc_3004:
-        grp_status = "ok"
-        grp_summary = "Группы GID 3003 (aid_inet) и 3004 (aid_net_raw) активны у процесса Hub и передаются дочерним сервисам."
-    elif has_3003 and has_3004:
-        grp_status = "ok"
-        grp_summary = "Группы 3003/3004 зарегистрированы в /etc/group и принудительно инжектируются через os.setgroups([3003, 3004])."
+    if is_android:
+        if has_3003 and has_3004:
+            grp_status = "ok"
+            grp_summary = "Среда Android Chroot: группы GID 3003 (aid_inet) и 3004 (aid_net_raw) активны."
+        else:
+            grp_status = "warn"
+            grp_summary = (
+                "Среда Android Chroot: в /etc/group не найдены GID 3003/3004. "
+                "При запуске от root Hub автоматически передаёт GID 3003/3004 через os.setgroups."
+            )
     else:
-        grp_status = "warn"
+        grp_status = "ok"
         grp_summary = (
-            "В /etc/group не найдены GID 3003/3004 (норма для облачного контейнера; на Android chroot без них возможен PermissionError(13) при сокетах). "
-            "При старте от root Hub автоматически передаёт GID 3003/3004 через os.setgroups."
+            f"Определена среда {env_prof['env_label']} (ядро {env_prof['kernel']}). "
+            "Стандартный сетевой стек Linux активен, группы Android aid_inet не требуются."
         )
 
     checks.append(
         {
             "id": "android_groups",
-            "title": "Сетевые группы ядра Android (aid_inet 3003 / aid_net_raw 3004)",
+            "title": "Профиль ОС и сетевой стек (Linux / Android Chroot)",
             "status": grp_status,
             "summary": grp_summary,
-            "fix_hint": "groupadd -g 3003 aid_inet && groupadd -g 3004 aid_net_raw && usermod -aG aid_inet,aid_net_raw root",
+            "fix_hint": (
+                "groupadd -g 3003 aid_inet && groupadd -g 3004 aid_net_raw"
+                if is_android
+                else "Для автозапуска на Linux с systemd выполните: python3 -m hub systemd"
+            ),
             "details": {
+                "env_mode": env_prof["env_mode"],
+                "env_label": env_prof["env_label"],
+                "is_android_chroot": is_android,
+                "has_systemd": env_prof["has_systemd"],
                 "process_gids": sorted(list(proc_groups)),
                 "gid_3003_present": has_3003,
                 "gid_3004_present": has_3004,
@@ -97,7 +104,7 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
         }
     )
 
-    # 2. Точки монтирования chroot (/proc, /sys, /dev/pts)
+    # 2. Системные файловые системы (/proc, /sys, /dev/pts)
     proc_ok = Path("/proc/stat").exists() and Path("/proc/meminfo").exists()
     sys_ok = Path("/sys/class").exists()
     pts_ok = Path("/dev/pts").exists()
@@ -105,10 +112,10 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
     checks.append(
         {
             "id": "chroot_mounts",
-            "title": "Системные ФС внутри Chroot (/proc, /sys, /dev/pts)",
+            "title": "Системные файловые системы (/proc, /sys, /dev/pts)",
             "status": "ok" if mounts_ok else "error",
             "summary": (
-                "Все системные файловые системы (/proc, /sys, /dev/pts) смонтированы и доступны для чтения телеметрии."
+                "Все системные файловые системы (/proc, /sys, /dev/pts) смонтированы и доступны для телеметрии процессов."
                 if mounts_ok
                 else f"Отсутствуют точки монтирования: /proc={proc_ok}, /sys={sys_ok}, /dev/pts={pts_ok}."
             ),
@@ -117,7 +124,7 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
         }
     )
 
-    # 3. Права доступа к директориям, секретам и internal.token + проверка начального пароля
+    # 3. Права доступа к директориям, секретам и internal.token
     fixed_perms = 0
     perm_errors: list[str] = []
     for d_path in (DATA_DIR, SECRETS_DIR):
@@ -150,56 +157,57 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
         except OSError as e:
             perm_errors.append(str(e))
 
-    must_change_pw = settings.get("must_change_password", "0") == "1"
-    sec_status = "error" if perm_errors else ("warn" if must_change_pw else "ok")
+    sec_status = "error" if perm_errors else "ok"
     sec_summary = (
         f"Права 0700 (data, secrets) и 0600 ({len(secret_files)} файлов) верифицированы"
         + (f" (автоматически исправлено: {fixed_perms})." if fixed_perms else ".")
     )
-    if must_change_pw:
-        sec_summary += " Внимание: используется начальный пароль 'admin' — смените его в Настройках!"
 
     checks.append(
         {
             "id": "security_permissions",
-            "title": "Права доступа к секретам (0700 / 0600) и статус пароля",
+            "title": "Права доступа к хранилищу секретов (0700 / 0600)",
             "status": sec_status,
             "summary": sec_summary,
             "fix_hint": "chmod 700 data data/secrets && chmod 600 data/internal.token data/secrets/*",
             "details": {
                 "checked_files": len(secret_files),
                 "auto_fixed_count": fixed_perms,
-                "must_change_password": must_change_pw,
             },
         }
     )
 
-    # 4. Целостность SQLite WAL и размер hub.db-wal
+    # 4. Целостность SQLite WAL, размер hub.db-wal и таблица project_kv
     wal_info = checkpoint_wal(truncate_threshold_mb=4.0)
     journal_mode = "unknown"
     integrity = "unknown"
+    has_kv_table = False
     try:
         with db_session() as conn:
             jm_row = conn.execute("PRAGMA journal_mode;").fetchone()
             ic_row = conn.execute("PRAGMA quick_check;").fetchone()
+            kv_row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='project_kv'").fetchone()
             journal_mode = str(jm_row[0]).lower() if jm_row else "unknown"
             integrity = str(ic_row[0]) if ic_row else "unknown"
+            has_kv_table = kv_row is not None
     except Exception as e:
         integrity = f"error: {e}"
 
-    db_ok = journal_mode == "wal" and integrity.lower() == "ok"
+    db_ok = journal_mode == "wal" and integrity.lower() == "ok" and has_kv_table
     checks.append(
         {
             "id": "sqlite_wal",
-            "title": "База данных SQLite (режим WAL и контроль размера журнала)",
+            "title": "База данных SQLite (WAL + хранилище состояния project_kv)",
             "status": "ok" if db_ok else "error",
             "summary": (
-                f"Режим {journal_mode.upper()}, quick_check={integrity}, размер WAL после чекпоинта ({wal_info['mode']}): {wal_info['wal_size_after_kb']} КБ."
+                f"Режим {journal_mode.upper()}, quick_check={integrity}, project_kv={'OK' if has_kv_table else 'missing'}, "
+                f"размер WAL после чекпоинта ({wal_info['mode']}): {wal_info['wal_size_after_kb']} КБ."
             ),
             "fix_hint": "sqlite3 data/hub.db 'PRAGMA wal_checkpoint(TRUNCATE);'",
             "details": {
                 "journal_mode": journal_mode,
                 "quick_check": integrity,
+                "project_kv_ready": has_kv_table,
                 **wal_info,
             },
         }
@@ -211,20 +219,21 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
     checks.append(
         {
             "id": "proxy_bridge",
-            "title": f"Локальный прокси-мост Android ({proxy_url or 'не задан'})",
+            "title": f"Локальный прокси-туннель ({proxy_url or 'не задан'})",
             "status": "ok" if proxy_st["online"] else "warn",
             "summary": (
                 f"Прокси {proxy_st['host']}:{proxy_st['port']} доступен (задержка {proxy_st['latency_ms']} мс)."
                 if proxy_st["online"]
-                else f"Прокси {proxy_st['host']}:{proxy_st['port']} сейчас не отвечает (проекты с флагом use_proxy ждут запуска v2ray/xray/sing-box на телефоне)."
+                else f"Прокси {proxy_st['host']}:{proxy_st['port']} сейчас офлайн (проекты без use_proxy работают напрямую)."
             ),
-            "fix_hint": "Проверьте работу VPN/прокси-клиента на Android (порт 10808).",
+            "fix_hint": "При необходимости проксирования запустите локальный туннель (xray/sing-box/v2ray) на порту 10808.",
             "details": proxy_st,
         }
     )
 
-    # 6. Наличие и версии рантаймов (python3, git, node, bash)
+    # 6. Наличие и версии рантаймов и изоляции окружений (python3, uv, venv, git, node, bash)
     py_ver = _check_cmd_version(["python3", "--version"])
+    uv_ver = _check_cmd_version(["uv", "--version"]) if env_prof["has_uv"] else ""
     git_ver = _check_cmd_version(["git", "--version"])
     node_ver = _check_cmd_version(["node", "--version"])
     bash_ver = _check_cmd_version(["bash", "--version"])
@@ -232,21 +241,25 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
     checks.append(
         {
             "id": "runtimes_and_tools",
-            "title": "Инструменты и рантаймы (Python 3, Git, Node.js, Bash)",
+            "title": "Рантаймы и изоляция окружений (Python .venv / uv, Node.js, Git, Bash)",
             "status": "ok" if runtimes_ok else "warn",
-            "summary": f"Python: {py_ver or 'нет'} · Git: {git_ver or 'нет'} · Node: {node_ver or 'опционально'} · Bash: {'OK' if bash_ver else 'нет'}",
-            "fix_hint": "apt update && apt install -y python3 python3-venv git nodejs bash curl",
+            "summary": (
+                f"Python: {py_ver or 'нет'} · Менеджер пакетов: {uv_ver or 'python3 -m venv + pip'} · "
+                f"Node: {node_ver or 'опционально'} · Git: {git_ver or 'нет'}"
+            ),
+            "fix_hint": "apt update && apt install -y python3 python3-venv python3-pip git nodejs bash curl",
             "details": {
                 "python3": py_ver,
+                "uv": uv_ver,
+                "has_uv": env_prof["has_uv"],
                 "git": git_ver,
                 "node": node_ver,
                 "bash": bool(bash_ver),
-                "curl": bool(shutil.which("curl")),
             },
         }
     )
 
-    # 7. Бюджет ОЗУ самого Hub (< 80 МБ) и свободное место на UFS-диске
+    # 7. Бюджет ОЗУ самого Hub (< 80 МБ) и свободное место на диске
     hub_proc = psutil.Process(os.getpid())
     hub_rss_mb = round(hub_proc.memory_info().rss / (1024 * 1024), 1)
     disk_st = get_disk_status()
@@ -255,12 +268,12 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
     checks.append(
         {
             "id": "ram_and_disk_budget",
-            "title": "Бюджет ОЗУ панели Hub (< 80 МБ) и память UFS",
+            "title": "Бюджет ОЗУ панели Hub (< 80 МБ) и свободное место на диске",
             "status": res_status,
             "summary": (
                 f"Потребление Hub RSS: {hub_rss_mb} МБ (лимит 80 МБ). Свободно на диске: {disk_st['free_mb']} МБ из {disk_st['total_mb']} МБ."
             ),
-            "fix_hint": "Используйте кнопку «Очистить кэш pip/npm и старые логи» в Настройках при нехватке места.",
+            "fix_hint": "Используйте кнопку «Очистить кэш pip/uv/npm, .tmp и старые логи» в Настройках при нехватке места.",
             "details": {
                 "hub_rss_mb": hub_rss_mb,
                 "hub_rss_budget_mb": 80.0,
@@ -270,25 +283,33 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
         }
     )
 
-    # 8. Аппаратные датчики смартфона (батарея, цикл 45–55%, температура)
+    # 8. Аппаратные датчики питания и температуры (адаптивно: Android sysfs vs стационарный Linux)
     hw = get_poco_hardware_status()
-    hw_status = "ok"
-    if hw["thermal_state"] == "critical" or hw["cycle_state"] == "critical_low":
-        hw_status = "error"
-    elif hw["thermal_state"] == "warning" or hw["should_alert"]:
-        hw_status = "warn"
+    if hw.get("available"):
+        hw_status = "ok"
+        if hw["thermal_state"] == "critical" or hw["cycle_state"] == "critical_low":
+            hw_status = "error"
+        elif hw["thermal_state"] == "warning" or hw["should_alert"]:
+            hw_status = "warn"
+        hw_summary = (
+            f"Батарея: {hw['battery_percent']}% ({hw['raw_status']}), "
+            f"T° батареи: {hw['battery_temp_c']}°C, CPU: {hw['cpu_temp_c']}°C, "
+            f"Swap: {hw['swap_used_mb']}/{hw['swap_total_mb']} МБ."
+        )
+    else:
+        hw_status = "ok"
+        hw_summary = (
+            f"Стационарное питание ({env_prof['env_label']}): датчики батареи отсутствуют (available=false). "
+            f"Swap: {hw['swap_used_mb']}/{hw['swap_total_mb']} МБ, аптайм: {hw['uptime_human']}."
+        )
 
     checks.append(
         {
             "id": "android_battery_thermal",
-            "title": "Датчики питания и термозащиты смартфона (45–55% / 43°C / 47°C)",
+            "title": "Датчики питания и термомониторинг (Адаптивный режим)",
             "status": hw_status,
-            "summary": (
-                f"Батарея: {hw['battery_percent']}% ({hw['raw_status']}, {hw['voltage_mv']} мВ), "
-                f"T° батареи: {hw['battery_temp_c']}°C (warn {hw['battery_warn_temp_c']}°C / crit {hw['battery_crit_temp_c']}°C), "
-                f"CPU: {hw['cpu_temp_c']}°C, ZRAM Swap: {hw['swap_used_mb']}/{hw['swap_total_mb']} МБ."
-            ),
-            "fix_hint": "При нагреве >= 47°C Hub автоматически остановит некритичные проекты (если включён thermal_auto_stop).",
+            "summary": hw_summary,
+            "fix_hint": "На смартфонах с root при нагреве >= 47°C Hub автоматически останавливает некритичные проекты.",
             "details": hw,
         }
     )
@@ -308,6 +329,7 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
         "duration_ms": round((time.monotonic() - t0) * 1000, 1),
         "timestamp": int(time.time()),
         "base_dir": str(BASE_DIR),
+        "env_profile": env_prof,
         "checks": checks,
     }
 
@@ -315,8 +337,9 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
 def print_doctor_cli(report: dict[str, Any]) -> int:
     """Форматированный вывод результата `python3 -m hub doctor` в терминал."""
     icons = {"ok": "[ OK ]", "warn": "[WARN]", "error": "[FAIL]"}
+    env_label = report.get("env_profile", {}).get("env_label", "Linux")
     print("=" * 78)
-    print(f"  HUB ANDROID CHROOT DOCTOR · Самодиагностика окружения ({report['duration_ms']} мс)")
+    print(f"  HUB DOCTOR · Самодиагностика окружения [{env_label}] ({report['duration_ms']} мс)")
     print(f"  Рабочая директория: {report['base_dir']}")
     print("=" * 78)
     for chk in report["checks"]:

@@ -8,13 +8,17 @@ import {
   CheckCircle2,
   ShieldAlert,
   FolderCode,
+  MessageSquareWarning,
+  Send,
 } from 'lucide-react';
-import { ProjectItem, SecretItem } from '../types/hub';
+import { PendingAsk, ProjectItem, SecretItem } from '../types/hub';
 import { formatBytes, validateCookieEditorJson } from '../utils/hubLogic';
 
 interface SecretsViewProps {
   secrets: SecretItem[];
   projects: ProjectItem[];
+  pendingAsks?: PendingAsk[];
+  onAnswerAsk?: (askId: string, answer: string) => Promise<void>;
   onSaveSecret: (name: string, type: 'text' | 'file' | 'cookie_json', value: string, targetProjectId?: number) => Promise<void>;
   onImportCookieJson: (name: string, rawJson: string, targetProjectId?: number) => Promise<void>;
   onExpireCookie: (name: string) => Promise<void>;
@@ -39,6 +43,8 @@ const DEFAULT_COOKIE_SAMPLE = JSON.stringify(
 export const SecretsView: React.FC<SecretsViewProps> = ({
   secrets,
   projects,
+  pendingAsks = [],
+  onAnswerAsk,
   onSaveSecret,
   onImportCookieJson,
   onExpireCookie,
@@ -49,6 +55,7 @@ export const SecretsView: React.FC<SecretsViewProps> = ({
   const [targetSecProjId, setTargetSecProjId] = useState<string>('global');
   const [value, setValue] = useState('');
   const [formMsg, setFormMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [askAnswers, setAskAnswers] = useState<Record<string, string>>({});
 
   const [cookieTargetProjId, setCookieTargetProjId] = useState<string>(
     projects[0] ? String(projects[0].id) : 'global'
@@ -120,8 +127,77 @@ export const SecretsView: React.FC<SecretsViewProps> = ({
 
   return (
     <div className="space-y-6">
+      {/* Центр событий и интерактивных запросов hub.ask() */}
+      <section className="bg-[#111622] border border-slate-800 rounded-xl p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-800">
+          <div className="flex items-center gap-2">
+            <MessageSquareWarning className="w-4 h-4 text-amber-400" />
+            <div>
+              <h2 className="text-sm font-bold text-white">
+                Центр событий и интерактивных запросов (<code className="font-mono text-amber-300">hub.ask()</code> / <code className="font-mono text-indigo-300">cookies_expired</code>)
+              </h2>
+              <p className="text-[11px] text-slate-400">
+                Активные запросы на ввод одноразового кода (2FA / SMS / капча) от запущенных процессов
+              </p>
+            </div>
+          </div>
+          <span className="text-xs font-mono text-slate-400 tabular-nums">
+            Ожидают ответа: {pendingAsks.length} · Протухших куки: {secrets.filter((s) => s.is_expired === 1).length}
+          </span>
+        </div>
+
+        {pendingAsks.length > 0 ? (
+          <div className="mt-3 space-y-2.5">
+            {pendingAsks.map((ask) => (
+              <div
+                key={ask.id}
+                className="p-3 bg-amber-950/30 border border-amber-500/40 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+              >
+                <div className="text-xs">
+                  <div className="font-semibold text-amber-200">
+                    Проект <span className="font-mono text-white">{ask.project_name}</span> ожидает ввод (Run #{ask.run_id}):
+                  </div>
+                  <div className="text-slate-200 mt-0.5 font-mono">{ask.prompt}</div>
+                </div>
+                {onAnswerAsk && (
+                  <form
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      const val = (askAnswers[ask.id] || '').trim();
+                      if (!val) return;
+                      await onAnswerAsk(ask.id, val);
+                      setAskAnswers((prev) => ({ ...prev, [ask.id]: '' }));
+                    }}
+                    className="flex items-center gap-2 shrink-0"
+                  >
+                    <input
+                      type="text"
+                      value={askAnswers[ask.id] || ''}
+                      onChange={(e) => setAskAnswers((prev) => ({ ...prev, [ask.id]: e.target.value }))}
+                      placeholder="Введите код / ответ..."
+                      className="bg-[#0b0f17] border border-amber-500/40 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                    />
+                    <button
+                      type="submit"
+                      className="px-3 py-1.5 text-xs font-semibold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg inline-flex items-center gap-1 cursor-pointer"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                      Отправить
+                    </button>
+                  </form>
+                )}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="mt-3 text-xs text-slate-400 flex items-center justify-between">
+            <span>Нет зависших на вводе процессов (WAITING_INPUT = 0). Все боты и парсеры работают штатно.</span>
+          </div>
+        )}
+      </section>
+
       {/* Поясняющая плашка: Индивидуальные куки скриптов vs Общие секреты */}
-      <div className="bg-[#1e293b] border border-slate-800 rounded-xl p-4 grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+      <div className="bg-[#111622] border border-slate-800 rounded-xl p-4 grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
         <div className="flex items-start gap-2.5">
           <Cookie className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
           <div>
