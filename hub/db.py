@@ -11,7 +11,16 @@ import time
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 
-from hub.config import DB_PATH, DEFAULT_SETTINGS, LOGS_DIR, PROJECTS_DIR, SECRETS_DIR, ensure_directories
+from hub.config import (
+    DB_PATH,
+    DEFAULT_SETTINGS,
+    EXAMPLES_DIR,
+    INITIAL_PASSWORD_PATH,
+    LOGS_DIR,
+    PROJECTS_DIR,
+    SECRETS_DIR,
+    ensure_directories,
+)
 
 DDL_SCRIPT = """
 PRAGMA journal_mode = WAL;
@@ -112,10 +121,16 @@ CREATE TABLE IF NOT EXISTS audit_log (
     action TEXT NOT NULL,
     details TEXT NOT NULL
 );
+
+-- 7. Отозванные сессии (серверная инвалидация при logout)
+CREATE TABLE IF NOT EXISTS revoked_sessions (
+    sid TEXT PRIMARY KEY,
+    exp INTEGER NOT NULL
+);
 """
 
 
-def _default_scrypt_hash(password: str = "admin") -> str:
+def _scrypt_hash(password: str) -> str:
     salt = secrets.token_bytes(16)
     derived = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=16384, r=8, p=1)
     return f"scrypt${salt.hex()}${derived.hex()}"
@@ -195,320 +210,129 @@ def log_audit(ip: str, action: str, details: str) -> None:
     )
 
 
-def _ensure_secret_row_and_file(
-    conn: sqlite3.Connection,
-    name: str,
-    sec_type: str,
-    default_content: str,
-    now: int,
-) -> None:
-    file_path = SECRETS_DIR / name
-    if not file_path.exists():
-        file_path.write_text(default_content, encoding="utf-8")
+def _is_default_admin_hash(stored_hash: str) -> bool:
+    if not stored_hash or not stored_hash.startswith("scrypt$"):
+        return False
+    try:
+        parts = stored_hash.split("$")
+        if len(parts) != 3:
+            return False
+        salt = bytes.fromhex(parts[1])
+        expected = bytes.fromhex(parts[2])
+        derived = hashlib.scrypt(b"admin", salt=salt, n=16384, r=8, p=1)
+        return derived == expected
+    except Exception:
+        return False
+
+
+def _get_or_create_initial_password() -> tuple[str, bool]:
+    """
+    Возвращает (initial_password, newly_generated).
+    Если файл data/initial_password уже существует и содержит непустой пароль (не 'admin'),
+    переиспользует его; иначе генерирует криптостойкий пароль, сохраняет с chmod 0600 и возвращает.
+    """
+    ensure_directories()
+    if INITIAL_PASSWORD_PATH.exists():
         try:
-            os.chmod(file_path, 0o600)
+            existing = INITIAL_PASSWORD_PATH.read_text(encoding="utf-8").strip()
+            if len(existing) >= 8 and existing.lower() != "admin":
+                os.chmod(INITIAL_PASSWORD_PATH, 0o600)
+                return existing, False
         except OSError:
             pass
-    row = conn.execute("SELECT name FROM secrets WHERE name = ?", (name,)).fetchone()
-    if not row:
-        conn.execute(
-            "INSERT INTO secrets (name, type, file_path, is_expired, expired_note, updated_at) VALUES (?, ?, ?, 0, '', ?)",
-            (name, sec_type, str(file_path), now),
-        )
 
-
-def _seed_initial_data(conn: sqlite3.Connection) -> None:
-    """Создаёт стартовые секреты, индивидуальные куки проектов и 5 тестовых проектов."""
-    now = int(time.time())
-
-    sample_cookies_json = json.dumps(
-        [
-            {
-                "domain": ".example.com",
-                "name": "session_id",
-                "value": "hub_cookie_session_98f12a",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True,
-            },
-            {
-                "domain": ".example.com",
-                "name": "csrf_token",
-                "value": "tk_882190_valid",
-                "path": "/",
-                "httpOnly": False,
-                "secure": True,
-            },
-        ],
-        indent=2,
-        ensure_ascii=False,
-    )
-
-    # 1. Стартовые секреты и индивидуальные куки для тестовых проектов (0600 в /opt/hub/data/secrets/)
-    _ensure_secret_row_and_file(conn, "my_cookies", "cookie_json", sample_cookies_json, now)
-    _ensure_secret_row_and_file(conn, "sms-auth-bot_cookies", "cookie_json", sample_cookies_json, now)
-    _ensure_secret_row_and_file(conn, "cookie-checker-job_cookies", "cookie_json", sample_cookies_json, now)
-    _ensure_secret_row_and_file(conn, "api_token", "text", "sk_live_hub_secret_994812", now)
-
-    recreated_any = False
-
-    # Проект 1: Постоянная программа / Фоновый демон (Service)
-    p1_dir = PROJECTS_DIR / "heartbeat-daemon"
-    p1_dir.mkdir(parents=True, exist_ok=True)
-    (LOGS_DIR / "heartbeat-daemon").mkdir(parents=True, exist_ok=True)
-    if not (p1_dir / "main.py").exists():
-        recreated_any = True
-        (p1_dir / "main.py").write_text(
-            """import os
-import time
-import hub
-
-print(f"[heartbeat-daemon] Постоянная программа запущена. PID={os.getpid()}, PGID={os.getpgid(0)}", flush=True)
-tick = 0
-while True:
-    tick += 1
-    print(f"[heartbeat] tick={tick} timestamp={time.time():.2f} status=nominal", flush=True)
-    time.sleep(1.5)
-""",
-            encoding="utf-8",
-        )
-    if not (p1_dir / "requirements.txt").exists():
-        (p1_dir / "requirements.txt").write_text("# Зависимости проекта heartbeat-daemon\n", encoding="utf-8")
-
-    p1_env = json.dumps(
-        {
-            "PROJECT_DESCRIPTION": "Постоянная программа 24/7 (Service): работает непрерывно в фоне, автоматически перезапускается при сбое и выживает при перезапуске самой панели Hub.",
-            "IS_TEST_PROJECT": "1",
-            "WORKER_ENV": "chroot-arm64",
-        },
-        ensure_ascii=False,
-    )
-    if not conn.execute("SELECT id FROM projects WHERE name = 'heartbeat-daemon'").fetchone():
-        conn.execute(
-            """INSERT INTO projects (
-                name, type, runtime, cmd, workdir, env_json, secrets_json,
-                use_proxy, ram_limit_mb, schedule_type, schedule_expr,
-                timeout_sec, max_retries, retry_delay_sec, webhook_token,
-                autostart, restart_policy, backoff_min_sec, backoff_max_sec,
-                desired_state, notify_on_error, notify_on_success, notify_on_crash,
-                created_at, updated_at
-            ) VALUES (?, 'service', 'python', 'python3 main.py', ?, ?, '["api_token"]',
-                0, 128, 'manual', '', 0, 0, 30, ?, 1, 'always', 2, 60, 'running', 1, 0, 1, ?, ?)""",
-            ("heartbeat-daemon", str(p1_dir), p1_env, secrets.token_hex(16), now, now),
-        )
-    else:
-        conn.execute(
-            "UPDATE projects SET env_json = ? WHERE name = 'heartbeat-daemon' AND (env_json = '{}' OR env_json NOT LIKE '%PROJECT_DESCRIPTION%')",
-            (p1_env,),
-        )
-
-    # Проект 2: Тест интерактивного запроса СМС / 2FA через hub.ask() + индивидуальные куки
-    p2_dir = PROJECTS_DIR / "sms-auth-bot"
-    p2_dir.mkdir(parents=True, exist_ok=True)
-    (LOGS_DIR / "sms-auth-bot").mkdir(parents=True, exist_ok=True)
-    if not (p2_dir / "main.py").exists():
-        recreated_any = True
-        (p2_dir / "main.py").write_text(
-            """import time
-import hub
-
-print("[sms-auth-bot] Чтение индивидуальных куки этого скрипта ('sms-auth-bot_cookies')...", flush=True)
-cookies = hub.secret("sms-auth-bot_cookies")
-print(f"[sms-auth-bot] Получено куки ({type(cookies).__name__}): {len(cookies)} шт.", flush=True)
-
-token = hub.secret("api_token")
-print(f"[sms-auth-bot] Проверка маскировки секрета в логе: {token}", flush=True)
-
-print("[sms-auth-bot] Запрашиваем интерактивный код подтверждения через hub.ask()...", flush=True)
-code = hub.ask("Код из СМС?", timeout=300)
-print(f"[sms-auth-bot] УСПЕХ! Получен код подтверждения: {code}", flush=True)
-hub.notify(f"Авторизация sms-auth-bot завершена с кодом {code}", level="info")
-""",
-            encoding="utf-8",
-        )
-    if not (p2_dir / "requirements.txt").exists():
-        (p2_dir / "requirements.txt").write_text("# Зависимости sms-auth-bot\n", encoding="utf-8")
-
-    p2_env = json.dumps(
-        {
-            "PROJECT_DESCRIPTION": "Тестовый скрипт с индивидуальными куки и интерактивным вводом (Job): запрашивает у вас СМС-код через жёлтый баннер вверху экрана (hub.ask).",
-            "IS_TEST_PROJECT": "1",
-        },
-        ensure_ascii=False,
-    )
-    if not conn.execute("SELECT id FROM projects WHERE name = 'sms-auth-bot'").fetchone():
-        conn.execute(
-            """INSERT INTO projects (
-                name, type, runtime, cmd, workdir, env_json, secrets_json,
-                use_proxy, ram_limit_mb, schedule_type, schedule_expr,
-                timeout_sec, max_retries, retry_delay_sec, webhook_token,
-                autostart, restart_policy, backoff_min_sec, backoff_max_sec,
-                desired_state, notify_on_error, notify_on_success, notify_on_crash,
-                created_at, updated_at
-            ) VALUES (?, 'job', 'python', 'python3 main.py', ?, ?, '["sms-auth-bot_cookies","my_cookies","api_token"]',
-                1, 128, 'manual', '', 300, 1, 15, ?, 0, 'no', 2, 60, 'stopped', 1, 1, 1, ?, ?)""",
-            ("sms-auth-bot", str(p2_dir), p2_env, secrets.token_hex(16), now, now),
-        )
-    else:
-        conn.execute(
-            "UPDATE projects SET env_json = ?, secrets_json = ? WHERE name = 'sms-auth-bot'",
-            (p2_env, '["sms-auth-bot_cookies","my_cookies","api_token"]'),
-        )
-
-    # Проект 3: Периодический Bash-скрипт резервного копирования по расписанию
-    p3_dir = PROJECTS_DIR / "backup-sync-job"
-    p3_dir.mkdir(parents=True, exist_ok=True)
-    (LOGS_DIR / "backup-sync-job").mkdir(parents=True, exist_ok=True)
-    if not (p3_dir / "main.sh").exists():
-        recreated_any = True
-        (p3_dir / "main.sh").write_text(
-            """#!/usr/bin/env bash
-set -e
-echo "[backup-sync-job] Старт проверки архивов по расписанию (PID=$$)..."
-sleep 1
-echo "[backup-sync-job] Проверка контрольных сумм завершена успешно."
-""",
-            encoding="utf-8",
-        )
-
-    p3_env = json.dumps(
-        {
-            "PROJECT_DESCRIPTION": "Скрипт по расписанию (Job): запускается автоматически каждые 15 минут (*/15 * * * *), проверяет файлы и завершает работу.",
-            "IS_TEST_PROJECT": "1",
-            "BACKUP_MODE": "incremental",
-        },
-        ensure_ascii=False,
-    )
-    if not conn.execute("SELECT id FROM projects WHERE name = 'backup-sync-job'").fetchone():
-        conn.execute(
-            """INSERT INTO projects (
-                name, type, runtime, cmd, workdir, env_json, secrets_json,
-                use_proxy, ram_limit_mb, schedule_type, schedule_expr,
-                timeout_sec, max_retries, retry_delay_sec, webhook_token,
-                autostart, restart_policy, backoff_min_sec, backoff_max_sec,
-                desired_state, notify_on_error, notify_on_success, notify_on_crash,
-                created_at, updated_at
-            ) VALUES (?, 'job', 'bash', 'bash main.sh', ?, ?, '[]',
-                0, 64, 'cron', '*/15 * * * *', 60, 2, 30, ?, 0, 'no', 2, 60, 'stopped', 1, 0, 1, ?, ?)""",
-            ("backup-sync-job", str(p3_dir), p3_env, secrets.token_hex(16), now, now),
-        )
-    else:
-        conn.execute(
-            "UPDATE projects SET env_json = ? WHERE name = 'backup-sync-job'",
-            (p3_env,),
-        )
-
-    # Проект 4: Тест индивидуальных куки и сигнала протухания сессии (cookie-checker-job)
-    p4_dir = PROJECTS_DIR / "cookie-checker-job"
-    p4_dir.mkdir(parents=True, exist_ok=True)
-    (LOGS_DIR / "cookie-checker-job").mkdir(parents=True, exist_ok=True)
-    if not (p4_dir / "main.py").exists():
-        recreated_any = True
-        (p4_dir / "main.py").write_text(
-            """import time
-import hub
-
-SECRET_NAME = "cookie-checker-job_cookies"
-print(f"[cookie-checker-job] Проверка индивидуальных куки '{SECRET_NAME}'...", flush=True)
-cookies = hub.secret(SECRET_NAME)
-print(f"[cookie-checker-job] Прочитано {len(cookies)} куки для домена {cookies[0].get('domain') if cookies else '?'}.", flush=True)
-time.sleep(0.5)
-print("[cookie-checker-job] Имитация ответа 401 Unauthorized от сайта -> вызываем hub.cookies_expired()!", flush=True)
-hub.cookies_expired(SECRET_NAME, note="Сайт вернул 401: обновите куки для cookie-checker-job")
-print("[cookie-checker-job] Сигнал протухания куки отправлен в панель и Telegram.", flush=True)
-""",
-            encoding="utf-8",
-        )
-    if not (p4_dir / "requirements.txt").exists():
-        (p4_dir / "requirements.txt").write_text("# Зависимости cookie-checker-job\n", encoding="utf-8")
-
-    p4_env = json.dumps(
-        {
-            "PROJECT_DESCRIPTION": "Тест индивидуальных куки скрипта (Job): проверяет куки 'cookie-checker-job_cookies' каждые 30 минут и при устаревании зажигает красный баннер замены куки.",
-            "IS_TEST_PROJECT": "1",
-        },
-        ensure_ascii=False,
-    )
-    if not conn.execute("SELECT id FROM projects WHERE name = 'cookie-checker-job'").fetchone():
-        conn.execute(
-            """INSERT INTO projects (
-                name, type, runtime, cmd, workdir, env_json, secrets_json,
-                use_proxy, ram_limit_mb, schedule_type, schedule_expr,
-                timeout_sec, max_retries, retry_delay_sec, webhook_token,
-                autostart, restart_policy, backoff_min_sec, backoff_max_sec,
-                desired_state, notify_on_error, notify_on_success, notify_on_crash,
-                created_at, updated_at
-            ) VALUES (?, 'job', 'python', 'python3 main.py', ?, ?, '["cookie-checker-job_cookies"]',
-                1, 128, 'interval', '1800', 120, 0, 30, ?, 0, 'no', 2, 60, 'stopped', 1, 0, 1, ?, ?)""",
-            ("cookie-checker-job", str(p4_dir), p4_env, secrets.token_hex(16), now, now),
-        )
-
-    # Проект 5: Тест проекта со своими собственными данными Telegram (tg-user-notifier)
-    p5_dir = PROJECTS_DIR / "tg-user-notifier"
-    p5_dir.mkdir(parents=True, exist_ok=True)
-    (LOGS_DIR / "tg-user-notifier").mkdir(parents=True, exist_ok=True)
-    if not (p5_dir / "bot.py").exists():
-        recreated_any = True
-        (p5_dir / "bot.py").write_text(
-            """import os
-import time
-import hub
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
-TG_API_ID = os.environ.get("TG_API_ID", "")
-PROXY = os.environ.get("HTTP_PROXY", "прямое подключение")
-
-print(f"[tg-user-notifier] Запуск собственного Telegram-бота проекта через прокси: {PROXY}", flush=True)
-print(f"[tg-user-notifier] Индивидуальный BOT_TOKEN проекта: {BOT_TOKEN[:10]}... | TG_CHAT_ID={TG_CHAT_ID} | API_ID={TG_API_ID}", flush=True)
-time.sleep(1.0)
-print("[tg-user-notifier] Проверка конфигурации Telegram проекта завершена успешно.", flush=True)
-""",
-            encoding="utf-8",
-        )
-    if not (p5_dir / "requirements.txt").exists():
-        (p5_dir / "requirements.txt").write_text("httpx>=0.27.2\n", encoding="utf-8")
-
-    p5_env = json.dumps(
-        {
-            "PROJECT_DESCRIPTION": "Тест индивидуального Telegram-бота проекта: использует собственные BOT_TOKEN, TG_CHAT_ID и TG_API_ID, заданные внутри этого проекта (отдельно от системного бота панели).",
-            "IS_TEST_PROJECT": "1",
-            "BOT_TOKEN": "7100223344:AAH_demo_project_bot_token",
-            "TG_CHAT_ID": "192837465",
-            "TG_API_ID": "2040",
-            "TG_API_HASH": "b18441a1ff607e10a989891a5462e627",
-        },
-        ensure_ascii=False,
-    )
-    if not conn.execute("SELECT id FROM projects WHERE name = 'tg-user-notifier'").fetchone():
-        conn.execute(
-            """INSERT INTO projects (
-                name, type, runtime, cmd, workdir, env_json, secrets_json,
-                use_proxy, ram_limit_mb, schedule_type, schedule_expr,
-                timeout_sec, max_retries, retry_delay_sec, webhook_token,
-                autostart, restart_policy, backoff_min_sec, backoff_max_sec,
-                desired_state, notify_on_error, notify_on_success, notify_on_crash,
-                created_at, updated_at
-            ) VALUES (?, 'job', 'python', 'python3 bot.py', ?, ?, '[]',
-                1, 128, 'manual', '', 60, 0, 30, ?, 0, 'no', 2, 60, 'stopped', 1, 1, 1, ?, ?)""",
-            ("tg-user-notifier", str(p5_dir), p5_env, secrets.token_hex(16), now, now),
-        )
-
-    if recreated_any:
-        conn.execute("DELETE FROM runs WHERE error_summary LIKE '%No such file or directory%'")
+    generated = secrets.token_urlsafe(12)
+    try:
+        INITIAL_PASSWORD_PATH.write_text(generated + "\n", encoding="utf-8")
+        os.chmod(INITIAL_PASSWORD_PATH, 0o600)
+    except OSError:
+        pass
+    return generated, True
 
 
 def init_db() -> None:
-    """Инициализирует таблицы SQLite в режиме WAL и заполняет настройки по умолчанию."""
+    """
+    Инициализирует таблицы SQLite в режиме WAL и настройки по умолчанию.
+    При первом старте (если не задан HUB_ADMIN_PASSWORD) генерирует случайный пароль,
+    сохраняет его в data/initial_password (0600), выводит один раз в консоль и требует смену при первом входе.
+    Демо-проекты в рабочую БД автоматически НЕ засеваются (они лежат в projects/examples/).
+    """
     ensure_directories()
+    EXAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+    custom_init_pw = (os.environ.get("HUB_ADMIN_PASSWORD") or os.environ.get("HUB_INIT_PASSWORD") or "").strip()
+
     with db_session() as conn:
         conn.executescript(DDL_SCRIPT)
+
         for key, default_val in DEFAULT_SETTINGS.items():
             row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
             if row is None:
-                val = default_val
-                if key == "password_hash" and not val:
-                    admin_pw = os.environ.get("HUB_ADMIN_PASSWORD", "admin")
-                    val = _default_scrypt_hash(admin_pw)
-                conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, val))
-        _seed_initial_data(conn)
+                conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, default_val))
+
+        pw_row = conn.execute("SELECT value FROM settings WHERE key = 'password_hash'").fetchone()
+        curr_hash = str(pw_row["value"]).strip() if pw_row else ""
+
+        # Если пароль ещё не задан или остался небезопасный дефолт 'admin' из прошлых версий —
+        # устанавливаем пароль из HUB_ADMIN_PASSWORD либо генерируем случайный в data/initial_password (0600)
+        if not curr_hash or _is_default_admin_hash(curr_hash):
+            if custom_init_pw and custom_init_pw.lower() != "admin":
+                new_hash = _scrypt_hash(custom_init_pw)
+                conn.execute(
+                    "INSERT INTO settings (key, value) VALUES ('password_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (new_hash,),
+                )
+                conn.execute(
+                    "INSERT INTO settings (key, value) VALUES ('must_change_password', '0') ON CONFLICT(key) DO UPDATE SET value = '0'"
+                )
+                if INITIAL_PASSWORD_PATH.exists():
+                    try:
+                        INITIAL_PASSWORD_PATH.unlink()
+                    except OSError:
+                        pass
+            else:
+                init_pw, is_new = _get_or_create_initial_password()
+                new_hash = _scrypt_hash(init_pw)
+                conn.execute(
+                    "INSERT INTO settings (key, value) VALUES ('password_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (new_hash,),
+                )
+                conn.execute(
+                    "INSERT INTO settings (key, value) VALUES ('must_change_password', '1') ON CONFLICT(key) DO UPDATE SET value = '1'"
+                )
+                if is_new:
+                    print(
+                        f"\n[Hub Security] Сгенерирован начальный пароль администратора: {init_pw}\n"
+                        f"[Hub Security] Пароль сохранён в {INITIAL_PASSWORD_PATH} (права 0600). Смените его при первом входе!\n",
+                        flush=True,
+                    )
+
+
+def checkpoint_wal(truncate_threshold_mb: float = 4.0) -> dict[str, Any]:
+    """
+    Контролирует размер файла data/hub.db-wal и выполняет PRAGMA wal_checkpoint(TRUNCATE)
+    при превышении порога (по умолчанию 4 МБ), чтобы постоянный 2-секундный опрос UI
+    не мешал авто-чекпоинту SQLite и не раздувал UFS-память смартфона.
+    """
+    wal_path = DB_PATH.with_name(f"{DB_PATH.name}-wal")
+    size_before = wal_path.stat().st_size if wal_path.exists() else 0
+    mode = "TRUNCATE" if size_before >= int(truncate_threshold_mb * 1024 * 1024) else "PASSIVE"
+    busy = 0
+    log_frames = 0
+    checkpointed_frames = 0
+    try:
+        with db_session() as conn:
+            row = conn.execute(f"PRAGMA wal_checkpoint({mode});").fetchone()
+            if row:
+                busy, log_frames, checkpointed_frames = int(row[0]), int(row[1]), int(row[2])
+    except Exception:
+        pass
+    size_after = wal_path.stat().st_size if wal_path.exists() else 0
+    return {
+        "mode": mode,
+        "wal_size_before_kb": round(size_before / 1024.0, 1),
+        "wal_size_after_kb": round(size_after / 1024.0, 1),
+        "busy": busy,
+        "log_frames": log_frames,
+        "checkpointed_frames": checkpointed_frames,
+    }
+

@@ -1,14 +1,12 @@
 """
-Модуль аппаратного мониторинга Poco X3 NFC (Root, цикл заряда 45%–55%),
-проверки доступности прокси 127.0.0.1:10808 и интерактивной авторизации прямо на сайте
-(On-Demand Web Auth для прохождения Антибота / Капчи / входа с сохранением cookies.json + storage_state.json).
+Модуль аппаратного мониторинга датчиков питания и температуры (/sys/class/power_supply/battery),
+проверки доступности прокси и проверки HTTP-сессий / куки.
+Не содержит фейковых генераторов SVG или симуляции зарядки при отсутствии sysfs-датчиков.
 """
 
-import base64
-import html
 import json
 import os
-import signal
+import platform
 import socket
 import time
 from pathlib import Path
@@ -16,12 +14,19 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 
 from hub.compat import httpx
-from hub.db import execute_sql, get_all_settings, query_one
+from hub.db import execute_sql, get_all_settings, log_audit, query_all, query_one
+from hub.notifier import send_notification
 from hub.secrets_mgr import import_cookie_editor_json
 
-# Активные интерактивные сессии входа на сайт (по project_id)
-# В простое браузер НЕ держится в памяти (0 МБ ОЗУ) — поднимается только на время входа!
+# Активные сессии проверки HTTP-ответа и заголовков Set-Cookie (по project_id)
 ACTIVE_WEB_AUTH_SESSIONS: dict[int, dict[str, Any]] = {}
+
+# Кулдауны уведомлений аппаратной защиты (чтобы не спамить в Telegram)
+_LAST_HW_ALERT_TS: dict[str, float] = {
+    "thermal_warn": 0.0,
+    "thermal_crit": 0.0,
+    "battery_low": 0.0,
+}
 
 
 def check_proxy_reachable(proxy_url: str, timeout: float = 0.4) -> dict[str, Any]:
@@ -53,61 +58,81 @@ def check_proxy_reachable(proxy_url: str, timeout: float = 0.4) -> dict[str, Any
         }
 
 
-def get_poco_hardware_status() -> dict[str, Any]:
-    """
-    Читает датчики смартфона Xiaomi Poco X3 NFC (surya, Snapdragon 732G, Root) из /sys/class/...
-    Учитывает работу Root-контроллера удержания заряда в коридоре 45% — 55%:
-    - Зарядка до 55% -> отключение подачи тока -> плавный спуск до 45% -> включение зарядки.
-    - Плавный разряд внутри коридора 43%..58% считается НОРМОЙ (cycle_ok), без ложных тревог!
-    - Тревога срабатывает только при падении заряда ниже 40% или перегреве (> 42°C батарея / > 55°C CPU).
-    """
-    settings = get_all_settings()
-    min_target = int(settings.get("battery_limit_min", "45") or 45)
-    max_target = int(settings.get("battery_limit_max", "55") or 55)
-    alert_below = int(settings.get("battery_alert_below", "40") or 40)
+def _read_zram_and_uptime() -> dict[str, Any]:
+    """Читает реальную статистику ZRAM/Swap из /proc/meminfo и аптайм ядра из /proc/uptime."""
+    swap_total_kb = 0
+    swap_free_kb = 0
+    try:
+        meminfo = Path("/proc/meminfo")
+        if meminfo.exists():
+            for line in meminfo.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.startswith("SwapTotal:"):
+                    swap_total_kb = int(line.split()[1])
+                elif line.startswith("SwapFree:"):
+                    swap_free_kb = int(line.split()[1])
+    except Exception:
+        pass
+    swap_total_mb = round(swap_total_kb / 1024.0, 1)
+    swap_used_mb = round(max(0, swap_total_kb - swap_free_kb) / 1024.0, 1)
+    swap_percent = round((swap_used_mb / swap_total_mb) * 100.0, 1) if swap_total_mb > 0 else 0.0
 
-    bat_cap_path = Path("/sys/class/power_supply/battery/capacity")
-    bat_status_path = Path("/sys/class/power_supply/battery/status")
-    bat_temp_path = Path("/sys/class/power_supply/battery/temp")
-    usb_online_path = Path("/sys/class/power_supply/usb/online")
-    ac_online_path = Path("/sys/class/power_supply/ac/online")
+    uptime_sec = 0
+    try:
+        up_file = Path("/proc/uptime")
+        if up_file.exists():
+            uptime_sec = int(float(up_file.read_text().split()[0]))
+    except Exception:
+        pass
+    days = uptime_sec // 86400
+    hours = (uptime_sec % 86400) // 3600
+    mins = (uptime_sec % 3600) // 60
+    uptime_human = f"{days}д {hours}ч {mins}м" if days > 0 else f"{hours}ч {mins}м"
 
-    is_real_sysfs = bat_cap_path.exists()
-    if is_real_sysfs:
-        try:
-            percent = int(bat_cap_path.read_text().strip())
-        except Exception:
-            percent = 50
-        try:
-            raw_status = bat_status_path.read_text().strip()
-        except Exception:
-            raw_status = "Discharging"
-        try:
-            bat_temp_c = round(int(bat_temp_path.read_text().strip()) / 10.0, 1)
-        except Exception:
-            bat_temp_c = 32.5
-        try:
-            plugged = (
-                (usb_online_path.exists() and usb_online_path.read_text().strip() == "1")
-                or (ac_online_path.exists() and ac_online_path.read_text().strip() == "1")
-                or raw_status in ("Charging", "Full", "Not charging")
-            )
-        except Exception:
-            plugged = True
-    else:
-        # Плавная детерминированная симуляция цикла 45%..55% для превью вне телефона
-        cycle_pos = int(time.time() // 30) % 20  # 0..19
-        if cycle_pos < 10:
-            percent = 45 + cycle_pos  # 45% -> 54% (Charging)
-            raw_status = "Charging"
-        else:
-            percent = 55 - (cycle_pos - 10)  # 55% -> 46% (Discharging до 45%)
-            raw_status = "Discharging"
-        bat_temp_c = 33.4
-        plugged = True
+    return {
+        "swap_total_mb": swap_total_mb,
+        "swap_used_mb": swap_used_mb,
+        "swap_percent": swap_percent,
+        "uptime_sec": uptime_sec,
+        "uptime_human": uptime_human,
+    }
 
-    # Чтение температуры CPU из /sys/class/thermal/
-    cpu_temp_c = 38.2
+
+def _detect_device_model() -> str:
+    """Определяет реальную модель устройства из sysfs или /system/build.prop, иначе возвращает N/A."""
+    dt_model = Path("/sys/firmware/devicetree/base/model")
+    if dt_model.exists():
+        try:
+            raw = dt_model.read_bytes().replace(b"\x00", b"").decode("utf-8", errors="ignore").strip()
+            if raw:
+                return raw
+        except Exception:
+            pass
+
+    build_prop = Path("/system/build.prop")
+    if build_prop.exists():
+        try:
+            for line in build_prop.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.startswith("ro.product.model="):
+                    val = line.split("=", 1)[1].strip()
+                    if val:
+                        return val
+        except Exception:
+            pass
+
+    dmi_model = Path("/sys/devices/virtual/dmi/id/product_name")
+    if dmi_model.exists():
+        try:
+            raw = dmi_model.read_text(encoding="utf-8", errors="ignore").strip()
+            if raw:
+                return raw
+        except Exception:
+            pass
+
+    return "N/A"
+
+
+def _read_cpu_temp_c() -> Optional[float]:
+    """Читает реальную температуру CPU из /sys/class/thermal/thermal_zone*, иначе возвращает None."""
     try:
         thermal_base = Path("/sys/class/thermal")
         if thermal_base.exists():
@@ -117,118 +142,290 @@ def get_poco_hardware_status() -> dict[str, Any]:
                 if t_file.exists():
                     val = int(t_file.read_text().strip())
                     c_val = val / 1000.0 if val > 1000 else float(val)
-                    if 20.0 <= c_val <= 95.0:
+                    if 15.0 <= c_val <= 115.0:
                         temps.append(c_val)
             if temps:
-                cpu_temp_c = round(max(temps), 1)
+                return round(max(temps), 1)
     except Exception:
         pass
+    return None
 
-    if percent < 20:
+
+def get_poco_hardware_status() -> dict[str, Any]:
+    """
+    Читает реальные датчики питания из /sys/class/power_supply/battery/*.
+    Если датчиков батареи в системе нет — возвращает available: False и значения N/A / None
+    (без фейковой симуляции зарядки и без хардкода модели).
+    """
+    settings = get_all_settings()
+    min_target = int(settings.get("battery_limit_min", "45") or 45)
+    max_target = int(settings.get("battery_limit_max", "55") or 55)
+    alert_below = int(settings.get("battery_alert_below", "40") or 40)
+    warn_temp_c = float(settings.get("battery_warn_temp_c", "43") or 43.0)
+    crit_temp_c = float(settings.get("battery_crit_temp_c", "47") or 47.0)
+    low_pct = int(settings.get("battery_low_pct", "20") or 20)
+    thermal_auto_stop = str(settings.get("thermal_auto_stop", "1")) == "1"
+
+    bat_cap_path = Path("/sys/class/power_supply/battery/capacity")
+    bat_status_path = Path("/sys/class/power_supply/battery/status")
+    bat_temp_path = Path("/sys/class/power_supply/battery/temp")
+    bat_volt_path = Path("/sys/class/power_supply/battery/voltage_now")
+    bat_curr_path = Path("/sys/class/power_supply/battery/current_now")
+    bat_health_path = Path("/sys/class/power_supply/battery/health")
+    usb_online_path = Path("/sys/class/power_supply/usb/online")
+    ac_online_path = Path("/sys/class/power_supply/ac/online")
+
+    is_real_sysfs = bat_cap_path.exists()
+    sys_extra = _read_zram_and_uptime()
+    cpu_temp_c = _read_cpu_temp_c()
+    device_model = _detect_device_model()
+
+    if not is_real_sysfs:
+        return {
+            "available": False,
+            "is_real_sysfs": False,
+            "device_model": device_model,
+            "battery_percent": None,
+            "raw_status": "N/A",
+            "power_plugged": False,
+            "voltage_mv": None,
+            "current_ma": None,
+            "battery_health": "N/A",
+            "min_target_pct": min_target,
+            "max_target_pct": max_target,
+            "alert_below_pct": alert_below,
+            "battery_low_pct": low_pct,
+            "cycle_state": "unavailable",
+            "cycle_label": "N/A (датчики батареи отсутствуют)",
+            "should_alert": False,
+            "battery_temp_c": None,
+            "cpu_temp_c": cpu_temp_c,
+            "battery_warn_temp_c": warn_temp_c,
+            "battery_crit_temp_c": crit_temp_c,
+            "thermal_auto_stop": thermal_auto_stop,
+            "thermal_state": "unavailable",
+            "thermal_warning": False,
+            **sys_extra,
+        }
+
+    percent: Optional[int] = None
+    raw_status = "N/A"
+    bat_temp_c: Optional[float] = None
+    voltage_mv: Optional[int] = None
+    current_ma: Optional[int] = None
+    battery_health = "N/A"
+    plugged = False
+
+    try:
+        percent = int(bat_cap_path.read_text().strip())
+    except Exception:
+        percent = None
+    try:
+        if bat_status_path.exists():
+            raw_status = bat_status_path.read_text().strip()
+    except Exception:
+        pass
+    try:
+        if bat_temp_path.exists():
+            bat_temp_c = round(int(bat_temp_path.read_text().strip()) / 10.0, 1)
+    except Exception:
+        pass
+    try:
+        if bat_volt_path.exists():
+            v_raw = int(bat_volt_path.read_text().strip())
+            voltage_mv = v_raw // 1000 if v_raw > 10000 else v_raw
+    except Exception:
+        pass
+    try:
+        if bat_curr_path.exists():
+            c_raw = int(bat_curr_path.read_text().strip())
+            current_ma = c_raw // 1000 if abs(c_raw) > 10000 else c_raw
+    except Exception:
+        pass
+    try:
+        if bat_health_path.exists():
+            battery_health = bat_health_path.read_text().strip()
+    except Exception:
+        pass
+    try:
+        plugged = (
+            (usb_online_path.exists() and usb_online_path.read_text().strip() == "1")
+            or (ac_online_path.exists() and ac_online_path.read_text().strip() == "1")
+            or raw_status in ("Charging", "Full", "Not charging")
+        )
+    except Exception:
+        plugged = False
+
+    if percent is None:
+        cycle_state = "unavailable"
+        cycle_label = "N/A"
+        should_alert = False
+    elif percent <= low_pct:
         cycle_state = "critical_low"
-        cycle_label = f"Критический разряд {percent}% (< 20%) — сбой питания!"
+        cycle_label = f"Критический разряд {percent}% (<= {low_pct}%)"
         should_alert = True
     elif percent < alert_below:
         cycle_state = "power_loss"
-        cycle_label = f"Тревога: заряд {percent}% упал ниже {alert_below}% (проверьте зарядку / Root-контроллер)"
+        cycle_label = f"Тревога: заряд {percent}% ниже порога {alert_below}%"
         should_alert = True
     elif raw_status == "Charging":
         cycle_state = "charging_to_target"
-        cycle_label = f"Зарядка до {max_target}% (сейчас {percent}%, Root-цикл {min_target}–{max_target}%)"
+        cycle_label = f"Зарядка ({percent}%, коридор {min_target}–{max_target}%)"
         should_alert = False
     else:
         cycle_state = "cycle_ok"
-        cycle_label = f"Удержание {min_target}–{max_target}% в норме ({percent}%, плавный спуск до {min_target}%)"
+        cycle_label = f"Удержание {min_target}–{max_target}% ({percent}%)"
         should_alert = False
 
-    thermal_warn = bat_temp_c >= 42.0 or cpu_temp_c >= 55.0
+    if bat_temp_c is not None and bat_temp_c >= crit_temp_c:
+        thermal_state = "critical"
+    elif (bat_temp_c is not None and bat_temp_c >= warn_temp_c) or (cpu_temp_c is not None and cpu_temp_c >= 65.0):
+        thermal_state = "warning"
+    else:
+        thermal_state = "ok"
 
     return {
-        "device_model": "Xiaomi Poco X3 NFC (surya · Root)",
+        "available": True,
+        "is_real_sysfs": True,
+        "device_model": device_model,
         "battery_percent": percent,
         "raw_status": raw_status,
         "power_plugged": plugged,
+        "voltage_mv": voltage_mv,
+        "current_ma": current_ma,
+        "battery_health": battery_health,
         "min_target_pct": min_target,
         "max_target_pct": max_target,
         "alert_below_pct": alert_below,
+        "battery_low_pct": low_pct,
         "cycle_state": cycle_state,
         "cycle_label": cycle_label,
         "should_alert": should_alert,
         "battery_temp_c": bat_temp_c,
         "cpu_temp_c": cpu_temp_c,
-        "thermal_warning": thermal_warn,
-        "is_real_sysfs": is_real_sysfs,
+        "battery_warn_temp_c": warn_temp_c,
+        "battery_crit_temp_c": crit_temp_c,
+        "thermal_auto_stop": thermal_auto_stop,
+        "thermal_state": thermal_state,
+        "thermal_warning": thermal_state in ("warning", "critical"),
+        **sys_extra,
     }
 
 
-def _render_svg_preview(session: dict[str, Any]) -> str:
-    """Генерирует наглядный интерактивный снимок экрана браузерной сессии (SVG Data URI)."""
-    url = html.escape(session.get("current_url", "https://example.com"))
-    title = html.escape(session.get("page_title", "Страница входа"))
-    status_code = session.get("http_status", 200)
-    proxy_label = html.escape(session.get("proxy_used") or "Прямое соединение")
-    antibot_passed = session.get("antibot_passed", True)
-    logged_in = session.get("logged_in", False)
-    login_val = html.escape(session.get("form_login", ""))
-    masked_pw = "•" * len(session.get("form_password", "")) if session.get("form_password") else ""
-    twofa_val = html.escape(session.get("form_2fa", ""))
-    cookies_count = len(session.get("cookies", []))
-    local_storage_count = len(session.get("local_storage", {}))
-    last_action = html.escape(session.get("last_action", "Сессия открыта через прокси сервера"))
+async def check_android_hardware_guard(
+    force_temp_c: Optional[float] = None,
+    force_percent: Optional[int] = None,
+) -> dict[str, Any]:
+    """
+    Периодический сторож батареи и температуры:
+    - Если датчики батареи отсутствуют (available=False) и не переданы force_temp_c/force_percent, ничего не делает.
+    - При температуре батареи >= battery_warn_temp_c (43°C) — предупреждение.
+    - При температуре батареи >= battery_crit_temp_c (47°C) — остановка некритичных задач.
+    """
+    from hub.process_mgr import stop_run
 
-    badge_color = "#10b981" if logged_in else ("#6366f1" if antibot_passed else "#f59e0b")
-    badge_text = (
-        "АВТОРИЗОВАН · СЕССИЯ ГОТОВА К СОХРАНЕНИЮ"
-        if logged_in
-        else ("АНТИБОТ ПРОЙДЕН · ОЖИДАНИЕ ВХОДА" if antibot_passed else "ПРОВЕРКА CLOUDFLARE / CAPTCHA")
+    hw = get_poco_hardware_status()
+    is_manual_test = force_temp_c is not None or force_percent is not None
+
+    if not hw.get("available") and not is_manual_test:
+        return {
+            "ok": True,
+            "available": False,
+            "battery_temp_c": None,
+            "battery_percent": None,
+            "warn_temp_c": hw["battery_warn_temp_c"],
+            "crit_temp_c": hw["battery_crit_temp_c"],
+            "stopped_projects": [],
+            "actions_taken": [],
+        }
+
+    bat_temp = float(force_temp_c) if force_temp_c is not None else (
+        float(hw["battery_temp_c"]) if hw.get("battery_temp_c") is not None else 0.0
     )
+    bat_pct = int(force_percent) if force_percent is not None else (
+        int(hw["battery_percent"]) if hw.get("battery_percent") is not None else 100
+    )
+    warn_temp = float(hw["battery_warn_temp_c"])
+    crit_temp = float(hw["battery_crit_temp_c"])
+    low_pct = int(hw["battery_low_pct"])
+    auto_stop = bool(hw["thermal_auto_stop"])
 
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="800" height="440" viewBox="0 0 800 440">
-      <rect width="800" height="440" rx="12" fill="#0b1120" stroke="#334155" stroke-width="2"/>
-      <!-- Шапка браузера -->
-      <rect x="2" y="2" width="796" height="44" rx="10" fill="#1e293b"/>
-      <circle cx="22" cy="24" r="6" fill="#ef4444"/>
-      <circle cx="40" cy="24" r="6" fill="#f59e0b"/>
-      <circle cx="58" cy="24" r="6" fill="#10b981"/>
-      <rect x="82" y="10" width="510" height="28" rx="6" fill="#0f172a" stroke="#334155"/>
-      <text x="94" y="28" fill="#e2e8f0" font-family="monospace" font-size="12">🔒 {url[:62]}</text>
-      <rect x="604" y="10" width="182" height="28" rx="6" fill="#1e1b4b" stroke="#4f46e5"/>
-      <text x="614" y="28" fill="#a5b4fc" font-family="monospace" font-size="11">Прокси: {proxy_label[:18]}</text>
+    now = time.time()
+    stopped_projects: list[str] = []
+    actions_taken: list[str] = []
 
-      <!-- Статус-бар Антибота и HTTP -->
-      <rect x="20" y="60" width="760" height="36" rx="8" fill="#111827" stroke="{badge_color}" stroke-width="1.5"/>
-      <text x="34" y="83" fill="{badge_color}" font-family="sans-serif" font-weight="bold" font-size="12">● {badge_text}</text>
-      <text x="540" y="83" fill="#94a3b8" font-family="monospace" font-size="11">HTTP {status_code} · Куки: {cookies_count} · Storage: {local_storage_count}</text>
+    if bat_temp >= crit_temp:
+        if auto_stop:
+            active_runs = query_all(
+                """SELECT r.id AS run_id, r.project_id, p.name, p.type, p.env_json
+                   FROM runs r
+                   JOIN projects p ON p.id = r.project_id
+                   WHERE r.status IN ('running', 'waiting_input')"""
+            )
+            for r in active_runs:
+                try:
+                    env_dict = json.loads(r.get("env_json") or "{}")
+                except Exception:
+                    env_dict = {}
+                if str(env_dict.get("CRITICAL_SERVICE", "0")) == "1":
+                    continue
+                if r["type"] == "service":
+                    execute_sql(
+                        "UPDATE projects SET desired_state = 'stopped', updated_at = ? WHERE id = ?",
+                        (int(now), r["project_id"]),
+                    )
+                await stop_run(int(r["run_id"]), final_status="stopped", reason_note=f"Остановлено термозащитой ({bat_temp}°C)")
+                stopped_projects.append(str(r["name"]))
 
-      <!-- Основная карточка страницы сайта -->
-      <rect x="160" y="112" width="480" height="268" rx="12" fill="#1e293b" stroke="#334155"/>
-      <text x="190" y="146" fill="#f8fafc" font-family="sans-serif" font-weight="bold" font-size="16">{title[:42]}</text>
-      <text x="190" y="168" fill="#94a3b8" font-family="sans-serif" font-size="12">Интерактивный браузер внутри Ubuntu chroot (aarch64)</text>
+        if stopped_projects:
+            log_audit(
+                "127.0.0.1",
+                "THERMAL_THROTTLE_STOP",
+                f"Батарея {bat_temp}°C >= {crit_temp}°C. Остановлены проекты: {', '.join(stopped_projects)}",
+            )
+            actions_taken.append(f"stopped:{','.join(stopped_projects)}")
 
-      <!-- Поле Логин / Email / Телефон -->
-      <text x="190" y="198" fill="#cbd5e1" font-family="sans-serif" font-size="11">Логин / Email / Телефон на сайте:</text>
-      <rect x="190" y="205" width="420" height="32" rx="6" fill="#0f172a" stroke="#475569"/>
-      <text x="202" y="226" fill="#38bdf8" font-family="monospace" font-size="13">{login_val or "нажмите «Заполнить и войти» справа..."}</text>
+        if is_manual_test or (now - _LAST_HW_ALERT_TS["thermal_crit"] > 900):
+            _LAST_HW_ALERT_TS["thermal_crit"] = now
+            stopped_note = (
+                f" Автоматически остановлены проекты: {', '.join(stopped_projects)}."
+                if stopped_projects
+                else " Активных некритичных задач для остановки не было."
+            )
+            await send_notification(
+                f"КРИТИЧЕСКИЙ ПЕРЕГРЕВ: батарея {bat_temp}°C (порог {crit_temp}°C)!{stopped_note}",
+                level="error",
+            )
+            actions_taken.append("notified_thermal_crit")
 
-      <!-- Поле Пароль / Код 2FA -->
-      <text x="190" y="256" fill="#cbd5e1" font-family="sans-serif" font-size="11">Пароль и 2FA / Капча:</text>
-      <rect x="190" y="263" width="265" height="32" rx="6" fill="#0f172a" stroke="#475569"/>
-      <text x="202" y="284" fill="#f8fafc" font-family="monospace" font-size="14">{masked_pw or "••••••••"}</text>
-      <rect x="465" y="263" width="145" height="32" rx="6" fill="#0f172a" stroke="#475569"/>
-      <text x="477" y="284" fill="#fbbf24" font-family="monospace" font-size="12">2FA: {twofa_val or "—"}</text>
+    elif bat_temp >= warn_temp:
+        if is_manual_test or (now - _LAST_HW_ALERT_TS["thermal_warn"] > 900):
+            _LAST_HW_ALERT_TS["thermal_warn"] = now
+            await send_notification(
+                f"Нагрев батареи: {bat_temp}°C (порог предупреждения {warn_temp}°C, критический {crit_temp}°C).",
+                level="warn",
+            )
+            actions_taken.append("notified_thermal_warn")
 
-      <!-- Кнопка входа и чекбокс Cloudflare -->
-      <rect x="190" y="312" width="235" height="44" rx="8" fill="#0f172a" stroke="#10b981"/>
-      <text x="206" y="339" fill="#34d399" font-family="sans-serif" font-weight="bold" font-size="12">✓ Cloudflare Turnstile OK</text>
+    if bat_pct <= low_pct and (is_manual_test or hw.get("raw_status") != "Charging"):
+        if is_manual_test or (now - _LAST_HW_ALERT_TS["battery_low"] > 900):
+            _LAST_HW_ALERT_TS["battery_low"] = now
+            await send_notification(
+                f"КРИТИЧЕСКИЙ РАЗРЯД БАТАРЕИ: {bat_pct}% (<= {low_pct}%).",
+                level="error",
+            )
+            actions_taken.append("notified_battery_low")
 
-      <rect x="438" y="312" width="172" height="44" rx="8" fill="{'#059669' if logged_in else '#4f46e5'}"/>
-      <text x="462" y="339" fill="#ffffff" font-family="sans-serif" font-weight="bold" font-size="13">{'Сессия активна ✓' if logged_in else 'Войти в аккаунт'}</text>
-
-      <!-- Нижняя строка лога действия -->
-      <text x="24" y="416" fill="#94a3b8" font-family="monospace" font-size="11">Последнее действие: {last_action[:82]}</text>
-    </svg>"""
-    b64 = base64.b64encode(svg.encode("utf-8")).decode("ascii")
-    return f"data:image/svg+xml;base64,{b64}"
+    return {
+        "ok": True,
+        "available": bool(hw.get("available") or is_manual_test),
+        "battery_temp_c": bat_temp,
+        "battery_percent": bat_pct,
+        "warn_temp_c": warn_temp,
+        "crit_temp_c": crit_temp,
+        "stopped_projects": stopped_projects,
+        "actions_taken": actions_taken,
+    }
 
 
 async def start_web_auth_session(
@@ -238,9 +435,8 @@ async def start_web_auth_session(
     custom_proxy: str = "",
 ) -> dict[str, Any]:
     """
-    Запускает интерактивную сессию авторизации на целевом сайте для проекта.
-    Реально обращается к URL через выбранный прокси (собирая первичные Set-Cookie и заголовки)
-    и инициализирует профиль projects/<name>/browser_profile/.
+    Выполняет реальный HTTP-запрос к целевому URL (с учётом прокси) и собирает настоящие Set-Cookie,
+    возвращённые сервером. Никакие фейковые куки или SVG-картинки не генерируются.
     """
     proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     if not proj:
@@ -248,12 +444,12 @@ async def start_web_auth_session(
 
     clean_url = (target_url or "").strip()
     if not clean_url:
-        clean_url = "https://example.com/login"
+        raise ValueError("Укажите целевой URL")
     if not clean_url.startswith(("http://", "https://")):
         clean_url = f"https://{clean_url}"
 
     parsed_url = urlparse(clean_url)
-    domain = parsed_url.hostname or "example.com"
+    domain = parsed_url.hostname or "localhost"
 
     settings = get_all_settings()
     sys_proxy = settings.get("proxy_url", "http://127.0.0.1:10808").strip()
@@ -263,24 +459,19 @@ async def start_web_auth_session(
     elif proxy_mode == "none":
         active_proxy = None
     else:
-        # Системный прокси 127.0.0.1:10808 (если он сейчас поднят, иначе прямое с пометкой)
         reach = check_proxy_reachable(sys_proxy)
         active_proxy = sys_proxy if reach["online"] else None
 
-    workdir = Path(proj["workdir"])
-    profile_dir = workdir / "browser_profile"
-    profile_dir.mkdir(parents=True, exist_ok=True)
-
-    # Пробуем выполнить реальный HTTP-запрос к странице входа для получения настоящих Set-Cookie сайта
     fetched_cookies: list[dict[str, Any]] = []
-    page_title = f"Вход на {domain}"
-    http_status = 200
-    ua = "Mozilla/5.0 (Linux; Android 14; Poco X3 NFC; aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+    page_title = domain
+    http_status = 0
+    error_note = ""
+    ua = f"HubHTTPProbe/1.0 ({platform.system()}; {platform.machine()})"
 
     try:
         async with httpx.AsyncClient(
             proxy=active_proxy,
-            timeout=6.0,
+            timeout=8.0,
             follow_redirects=True,
             headers={"User-Agent": ua},
         ) as client:
@@ -303,22 +494,9 @@ async def start_web_auth_session(
                 s_idx = low.find("<title>") + 7
                 e_idx = low.find("</title>", s_idx)
                 if e_idx > s_idx:
-                    page_title = text_sample[s_idx:e_idx].strip()[:60] or page_title
-    except Exception:
-        # Даже если сайт закрыт фаерволом или оффлайн, создаём стартовую сессию для домена
-        pass
-
-    if not fetched_cookies:
-        fetched_cookies.append(
-            {
-                "domain": f".{domain}",
-                "name": "cf_clearance",
-                "value": f"poco_arm64_{int(time.time())}",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True,
-            }
-        )
+                    page_title = text_sample[s_idx:e_idx].strip()[:80] or page_title
+    except Exception as e:
+        error_note = str(e)
 
     session_data: dict[str, Any] = {
         "project_id": project_id,
@@ -328,150 +506,68 @@ async def start_web_auth_session(
         "page_title": page_title,
         "http_status": http_status,
         "proxy_mode": proxy_mode,
-        "proxy_used": active_proxy or (f"{sys_proxy} (ожидание туннеля)" if proxy_mode == "system" else "Без прокси"),
+        "proxy_used": active_proxy or "Без прокси",
         "user_agent": ua,
-        "antibot_passed": True,
-        "logged_in": False,
-        "form_login": "",
-        "form_password": "",
-        "form_2fa": "",
         "cookies": fetched_cookies,
-        "local_storage": {
-            "device_fingerprint": "poco-x3-nfc-surya-arm64",
-            "antibot_verified_at": str(int(time.time())),
-        },
-        "profile_dir": str(profile_dir),
+        "local_storage": {},
         "started_at": int(time.time()),
-        "last_action": f"Открыт сайт {domain} (профиль browser_profile готов)",
+        "error": error_note,
+        "last_action": (
+            f"HTTP {http_status}: получено {len(fetched_cookies)} Set-Cookie с {domain}"
+            if http_status
+            else f"Ошибка подключения к {domain}: {error_note}"
+        ),
     }
-    session_data["preview_data_url"] = _render_svg_preview(session_data)
     ACTIVE_WEB_AUTH_SESSIONS[project_id] = session_data
     return session_data
 
 
 async def perform_web_auth_action(project_id: int, action_payload: dict[str, Any]) -> dict[str, Any]:
     """
-    Выполняет действие в открытой браузерной сессии:
-    - pass_antibot: прохождение Cloudflare / Turnstile / Капчи с выдачей cf_clearance
-    - fill_and_login: ввод логина, пароля и 2FA-кода на сайте с получением авторизованной сессии
-    - navigate: переход на другой внутренний URL сайта
-    - add_cookie: ручное добавление/обновление токена в активную сессию
+    Обновляет активную HTTP-сессию проекта (переход по новому URL или добавление реальных куки).
     """
     session = ACTIVE_WEB_AUTH_SESSIONS.get(project_id)
     if not session:
-        raise ValueError("Интерактивная сессия не запущена. Сначала нажмите «Открыть сайт для входа».")
+        raise ValueError("Сессия не запущена.")
 
     act = str(action_payload.get("action", "")).strip()
-    domain = session["domain"]
-
-    if act == "pass_antibot":
-        session["antibot_passed"] = True
-        # Обновляем или добавляем cf_clearance
-        cookies: list[dict[str, Any]] = session["cookies"]
-        cookies = [c for c in cookies if c.get("name") != "cf_clearance"]
-        cookies.append(
-            {
-                "domain": f".{domain}",
-                "name": "cf_clearance",
-                "value": f"cf_verified_{int(time.time())}_arm64",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True,
-            }
-        )
-        session["cookies"] = cookies
-        session["local_storage"]["cf_turnstile_passed"] = "true"
-        session["last_action"] = "Пройдена проверка Антибот / Cloudflare Turnstile (выдан cf_clearance)"
-
-    elif act == "fill_and_login":
-        login_str = str(action_payload.get("login", "")).strip()
-        password_str = str(action_payload.get("password", "")).strip()
-        twofa_str = str(action_payload.get("twofa", "")).strip()
-
-        session["form_login"] = login_str or "user@example.com"
-        session["form_password"] = password_str or "secret"
-        session["form_2fa"] = twofa_str
-        session["antibot_passed"] = True
-        session["logged_in"] = True
-
-        cookies = [
-            c
-            for c in session["cookies"]
-            if c.get("name") not in ("session_id", "auth_token", "user_logged_in")
-        ]
-        cookies.extend(
-            [
-                {
-                    "domain": f".{domain}",
-                    "name": "session_id",
-                    "value": f"sess_{project_id}_{int(time.time())}",
-                    "path": "/",
-                    "httpOnly": True,
-                    "secure": True,
-                },
-                {
-                    "domain": f".{domain}",
-                    "name": "auth_token",
-                    "value": f"bearer_{project_id}_{ abs(hash(session['form_login'])) % 1000000 }",
-                    "path": "/",
-                    "httpOnly": True,
-                    "secure": True,
-                },
-            ]
-        )
-        session["cookies"] = cookies
-        session["local_storage"]["auth_user"] = session["form_login"]
-        session["local_storage"]["session_active"] = "1"
-        if twofa_str:
-            session["local_storage"]["twofa_verified"] = "true"
-        session["last_action"] = f"Выполнен вход под аккаунтом «{session['form_login']}» (получены куки и LocalStorage)"
-
-    elif act == "navigate":
+    if act == "navigate":
         new_url = str(action_payload.get("url", "")).strip()
-        if new_url:
-            if not new_url.startswith(("http://", "https://")):
-                new_url = f"https://{new_url}"
-            session["current_url"] = new_url
-            parsed = urlparse(new_url)
-            session["domain"] = parsed.hostname or session["domain"]
-            session["page_title"] = f"Страница {session['domain']}"
-            session["last_action"] = f"Переход по адресу {new_url}"
+        if not new_url:
+            raise ValueError("Не указан URL для перехода")
+        return await start_web_auth_session(
+            project_id,
+            new_url,
+            proxy_mode=session.get("proxy_mode", "system"),
+        )
+    elif act == "set_cookies":
+        raw_cookies = action_payload.get("cookies", [])
+        if isinstance(raw_cookies, list):
+            session["cookies"] = raw_cookies
+            session["last_action"] = f"Обновлен список куки ({len(raw_cookies)} шт.)"
+        return session
 
-    session["preview_data_url"] = _render_svg_preview(session)
-    return session
+    raise ValueError(f"Неподдерживаемое действие: {act}. Используйте импорт JSON из Cookie-Editor.")
 
 
 async def save_and_close_web_auth_session(project_id: int) -> dict[str, Any]:
-    """
-    Сохраняет результаты интерактивного входа:
-    1. Записывает индивидуальный секрет <project_name>_cookies (0600) и снимает флаг is_expired.
-    2. Записывает файл cookies.json в папку проекта.
-    3. Записывает файл storage_state.json (Playwright-совместимый формат: cookies + origins localStorage)
-       и метаданные профиля в browser_profile/session_meta.json.
-    4. Полностью закрывает сессию браузера (0 МБ ОЗУ в фоне).
-    """
+    """Сохраняет собранные реальные куки в секрет <project_name>_cookies (0600) и закрывает сессию."""
     proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     if not proj:
         raise ValueError("Проект не найден")
 
     session = ACTIVE_WEB_AUTH_SESSIONS.pop(project_id, None)
     if not session:
-        raise ValueError("Нет активной браузерной сессии для сохранения")
-
-    # Если бы был запущен дочерний PID браузера — гарантированно убиваем группу PGID
-    browser_pgid = session.get("browser_pgid")
-    if browser_pgid:
-        try:
-            os.killpg(int(browser_pgid), signal.SIGTERM)
-        except Exception:
-            pass
+        raise ValueError("Нет активной сессии для сохранения")
 
     cookies_list = session.get("cookies", [])
+    if not cookies_list:
+        raise ValueError("В сессии нет полученных куки для сохранения. Импортируйте JSON из Cookie-Editor.")
+
     cookies_raw = json.dumps(cookies_list, indent=2, ensure_ascii=False)
     secret_name = f"{proj['name']}_cookies"
     saved_secret = import_cookie_editor_json(secret_name, cookies_raw)
 
-    # Привязываем секрет к проекту
     try:
         curr_secrets: list[str] = json.loads(proj.get("secrets_json") or "[]")
     except Exception:
@@ -485,10 +581,6 @@ async def save_and_close_web_auth_session(project_id: int) -> dict[str, Any]:
 
     workdir = Path(proj["workdir"])
     workdir.mkdir(parents=True, exist_ok=True)
-    profile_dir = workdir / "browser_profile"
-    profile_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. Сохраняем cookies.json
     cookies_file = workdir / "cookies.json"
     cookies_file.write_text(cookies_raw, encoding="utf-8")
     try:
@@ -496,59 +588,14 @@ async def save_and_close_web_auth_session(project_id: int) -> dict[str, Any]:
     except OSError:
         pass
 
-    # 2. Сохраняем Playwright-совместимый storage_state.json (включая localStorage и User-Agent!)
-    storage_state = {
-        "cookies": cookies_list,
-        "origins": [
-            {
-                "origin": f"https://{session.get('domain', 'example.com')}",
-                "localStorage": [
-                    {"name": k, "value": str(v)} for k, v in (session.get("local_storage") or {}).items()
-                ],
-            }
-        ],
-        "user_agent": session.get("user_agent", ""),
-        "saved_at": int(time.time()),
-    }
-    storage_file = workdir / "storage_state.json"
-    storage_file.write_text(json.dumps(storage_state, indent=2, ensure_ascii=False), encoding="utf-8")
-    try:
-        os.chmod(storage_file, 0o600)
-    except OSError:
-        pass
-
-    # 3. Сохраняем метаданные в browser_profile/
-    (profile_dir / "session_meta.json").write_text(
-        json.dumps(
-            {
-                "domain": session.get("domain"),
-                "url": session.get("current_url"),
-                "user_agent": session.get("user_agent"),
-                "proxy_used": session.get("proxy_used"),
-                "cookies_count": len(cookies_list),
-                "saved_at": int(time.time()),
-            },
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-
     return {
         "ok": True,
         "secret_name": secret_name,
         "cookies_count": len(cookies_list),
-        "storage_state_path": str(storage_file),
-        "profile_dir": str(profile_dir),
         "secret": saved_secret,
     }
 
 
 def cancel_web_auth_session(project_id: int) -> dict[str, Any]:
-    session = ACTIVE_WEB_AUTH_SESSIONS.pop(project_id, None)
-    if session and session.get("browser_pgid"):
-        try:
-            os.killpg(int(session["browser_pgid"]), signal.SIGTERM)
-        except Exception:
-            pass
+    ACTIVE_WEB_AUTH_SESSIONS.pop(project_id, None)
     return {"ok": True, "closed": True}

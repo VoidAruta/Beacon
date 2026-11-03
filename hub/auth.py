@@ -16,19 +16,78 @@ import time
 import urllib.parse
 from typing import Any, Optional
 
-from hub.db import get_setting, log_audit, set_setting
+from hub.config import INTERNAL_TOKEN_PATH, ensure_directories
+from hub.db import execute_sql, get_setting, log_audit, query_one, set_setting
 
 # Секретный ключ подписи сессий (генерируется или берётся из настроек)
 _SESSION_SECRET: Optional[bytes] = None
+# Внутренний токен авторизации локального шлюза /internal/* (хранится в data/internal.token с правами 0600)
+_INTERNAL_TOKEN: Optional[str] = None
+# Отозванные сессии в памяти: sid -> exp
+_REVOKED_SESSIONS: dict[str, int] = {}
 
-# В памяти: ip -> список таймстампов неудачных попыток
+# В памяти: ip -> список таймстампов неудачных попыток входа
 _FAILED_LOGINS: dict[str, list[float]] = {}
-# В памяти: ip -> время окончания блокировки (unix timestamp)
+# В памяти: ip -> время окончания блокировки входа (unix timestamp)
 _BLOCKED_IPS: dict[str, float] = {}
 
-RATE_LIMIT_WINDOW_SEC = 600   # 10 минут
-RATE_LIMIT_MAX_FAILS = 5      # 5 неудачных попыток
+# В памяти: защита вебхуков от перебора и флуда
+_WEBHOOK_HITS: dict[str, list[float]] = {}
+_WEBHOOK_FAILS: dict[str, list[float]] = {}
+_WEBHOOK_BLOCKED_IPS: dict[str, float] = {}
+
+RATE_LIMIT_WINDOW_SEC = 300   # 5 минут окно наблюдения
+RATE_LIMIT_MAX_FAILS = 5      # 5 неудачных попыток входа
 RATE_LIMIT_BLOCK_SEC = 900    # 15 минут блокировки
+
+WEBHOOK_WINDOW_SEC = 60       # 1 минута окно для частоты запросов вебхука
+WEBHOOK_MAX_HITS = 30         # макс 30 вызовов в минуту с одного IP
+WEBHOOK_MAX_FAILS = 10        # макс 10 ошибок 404 по токену вебхука
+WEBHOOK_BLOCK_SEC = 600       # 10 минут блокировки при брутфорсе вебхуков
+
+
+def get_internal_token() -> str:
+    """
+    Возвращает криптостойкий токен для локального шлюза /internal/*.
+    Хранится в data/internal.token (права 0600), чтобы выжившие дочерние сервисы
+    сохраняли доступ к SDK после перезапуска самого процесса Hub.
+    """
+    global _INTERNAL_TOKEN
+    if _INTERNAL_TOKEN:
+        return _INTERNAL_TOKEN
+
+    ensure_directories()
+    env_tok = os.environ.get("HUB_INTERNAL_TOKEN", "").strip()
+    if env_tok and len(env_tok) >= 16:
+        _INTERNAL_TOKEN = env_tok
+        return _INTERNAL_TOKEN
+
+    if INTERNAL_TOKEN_PATH.exists():
+        try:
+            existing = INTERNAL_TOKEN_PATH.read_text(encoding="utf-8").strip()
+            if len(existing) >= 32:
+                os.chmod(INTERNAL_TOKEN_PATH, 0o600)
+                _INTERNAL_TOKEN = existing
+                return _INTERNAL_TOKEN
+        except OSError:
+            pass
+
+    new_tok = secrets.token_hex(32)
+    try:
+        INTERNAL_TOKEN_PATH.write_text(new_tok, encoding="utf-8")
+        os.chmod(INTERNAL_TOKEN_PATH, 0o600)
+    except OSError:
+        pass
+    _INTERNAL_TOKEN = new_tok
+    return _INTERNAL_TOKEN
+
+
+def verify_internal_token(candidate: str) -> bool:
+    """Проверяет заголовок X-Hub-Internal-Token за константное время."""
+    if not candidate:
+        return False
+    expected = get_internal_token()
+    return hmac.compare_digest(candidate.strip(), expected)
 
 
 def _get_session_secret() -> bytes:
@@ -69,8 +128,10 @@ def verify_password(password: str, stored_hash: str) -> bool:
 def create_session_tokens(ttl_sec: int = 86400 * 7) -> tuple[str, str]:
     """Создаёт подписанный токен сессии (hub_session) и привязанный csrf_token."""
     csrf_token = secrets.token_hex(24)
+    sid = secrets.token_hex(12)
     now = int(time.time())
     payload = {
+        "sid": sid,
         "iat": now,
         "exp": now + ttl_sec,
         "csrf": csrf_token,
@@ -80,8 +141,27 @@ def create_session_tokens(ttl_sec: int = 86400 * 7) -> tuple[str, str]:
     return f"{payload_b64}.{sig}", csrf_token
 
 
+def revoke_session_token(token: str) -> None:
+    """Серверная инвалидация токена сессии при выходе (POST /api/auth/logout)."""
+    if not token or "." not in token:
+        return
+    try:
+        payload_b64, _ = token.rsplit(".", 1)
+        payload = json.loads(urllib.parse.unquote(payload_b64))
+        sid = str(payload.get("sid") or token)
+        exp = int(payload.get("exp") or (int(time.time()) + 86400 * 7))
+        _REVOKED_SESSIONS[sid] = exp
+        execute_sql(
+            "INSERT INTO revoked_sessions (sid, exp) VALUES (?, ?) ON CONFLICT(sid) DO UPDATE SET exp = excluded.exp",
+            (sid, exp),
+        )
+        execute_sql("DELETE FROM revoked_sessions WHERE exp < ?", (int(time.time()),))
+    except Exception:
+        pass
+
+
 def verify_session_token(token: str) -> Optional[dict[str, Any]]:
-    """Проверяет подпись и срок действия токена сессии."""
+    """Проверяет подпись, срок действия и отсутствие в списке отозванных сессий."""
     if not token or "." not in token:
         return None
     try:
@@ -92,8 +172,19 @@ def verify_session_token(token: str) -> Optional[dict[str, Any]]:
         if not hmac.compare_digest(sig, expected_sig):
             return None
         payload = json.loads(urllib.parse.unquote(payload_b64))
-        if int(payload.get("exp", 0)) < int(time.time()):
+        now = int(time.time())
+        if int(payload.get("exp", 0)) < now:
             return None
+        sid = str(payload.get("sid") or token)
+        if sid in _REVOKED_SESSIONS:
+            return None
+        try:
+            row = query_one("SELECT sid FROM revoked_sessions WHERE sid = ? AND exp >= ?", (sid, now))
+            if row:
+                _REVOKED_SESSIONS[sid] = int(payload.get("exp", now + 3600))
+                return None
+        except Exception:
+            pass
         return payload
     except Exception:
         return None
@@ -114,7 +205,7 @@ def is_ip_allowed(client_ip: str) -> bool:
 
     subnets_str = get_setting(
         "allowed_subnets",
-        "127.0.0.0/8,192.168.100.0/24,192.168.1.0/24,10.0.0.0/8,172.16.0.0/12",
+        "127.0.0.0/8,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,100.64.0.0/10",
     )
     if "*" in subnets_str or "0.0.0.0/0" in subnets_str:
         return True
@@ -140,12 +231,12 @@ def is_ip_allowed(client_ip: str) -> bool:
 def check_rate_limit(client_ip: str) -> tuple[bool, int]:
     """
     Возвращает (allowed, retry_after_sec).
-    Если IP заблокирован после >5 неудачных попыток за 10 минут — возвращает (False, remaining_sec).
+    Если IP заблокирован после 5 неудачных попыток за 5 минут — возвращает (False, remaining_sec).
     """
     now = time.time()
     unblock_at = _BLOCKED_IPS.get(client_ip, 0.0)
     if unblock_at > now:
-        return False, int(unblock_at - now)
+        return False, max(1, int(unblock_at - now))
     elif client_ip in _BLOCKED_IPS:
         del _BLOCKED_IPS[client_ip]
     return True, 0
@@ -154,7 +245,7 @@ def check_rate_limit(client_ip: str) -> tuple[bool, int]:
 def record_login_failure(client_ip: str) -> tuple[bool, int]:
     """
     Регистрирует неудачную попытку входа.
-    При превышении 5 попыток за 10 минут блокирует IP на 15 минут, пишет в audit_log.
+    При достижении 5 попыток за 5 минут блокирует IP на 15 минут, пишет в audit_log.
     Возвращает (is_now_blocked, block_seconds).
     """
     now = time.time()
@@ -162,7 +253,7 @@ def record_login_failure(client_ip: str) -> tuple[bool, int]:
     attempts.append(now)
     _FAILED_LOGINS[client_ip] = attempts
 
-    if len(attempts) > RATE_LIMIT_MAX_FAILS:
+    if len(attempts) >= RATE_LIMIT_MAX_FAILS:
         _BLOCKED_IPS[client_ip] = now + RATE_LIMIT_BLOCK_SEC
         _FAILED_LOGINS[client_ip] = []
         log_audit(
@@ -179,3 +270,35 @@ def record_login_failure(client_ip: str) -> tuple[bool, int]:
 def clear_login_failures(client_ip: str) -> None:
     _FAILED_LOGINS.pop(client_ip, None)
     _BLOCKED_IPS.pop(client_ip, None)
+
+
+def check_webhook_rate_limit(client_ip: str) -> tuple[bool, int]:
+    """Проверяет лимит частоты вызовов /api/webhook/{token} с одного IP."""
+    now = time.time()
+    unblock_at = _WEBHOOK_BLOCKED_IPS.get(client_ip, 0.0)
+    if unblock_at > now:
+        return False, max(1, int(unblock_at - now))
+    elif client_ip in _WEBHOOK_BLOCKED_IPS:
+        del _WEBHOOK_BLOCKED_IPS[client_ip]
+
+    hits = [t for t in _WEBHOOK_HITS.get(client_ip, []) if now - t <= WEBHOOK_WINDOW_SEC]
+    if len(hits) >= WEBHOOK_MAX_HITS:
+        return False, WEBHOOK_WINDOW_SEC
+    hits.append(now)
+    _WEBHOOK_HITS[client_ip] = hits
+    return True, 0
+
+
+def record_webhook_failure(client_ip: str) -> tuple[bool, int]:
+    """Регистрирует ошибку неверного webhook_token и блокирует IP при переборе."""
+    now = time.time()
+    fails = [t for t in _WEBHOOK_FAILS.get(client_ip, []) if now - t <= RATE_LIMIT_WINDOW_SEC]
+    fails.append(now)
+    _WEBHOOK_FAILS[client_ip] = fails
+    if len(fails) >= WEBHOOK_MAX_FAILS:
+        _WEBHOOK_BLOCKED_IPS[client_ip] = now + WEBHOOK_BLOCK_SEC
+        _WEBHOOK_FAILS[client_ip] = []
+        log_audit(client_ip, "WEBHOOK_BRUTEFORCE_BLOCK", f"IP заблокирован на 10 минут после {len(fails)} ошибок вебхука")
+        return True, WEBHOOK_BLOCK_SEC
+    return False, 0
+

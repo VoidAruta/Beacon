@@ -20,10 +20,11 @@ from typing import Any, Optional
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def _get_api_config() -> tuple[str, str]:
+def _get_api_config() -> tuple[str, str, str]:
     api_url = os.environ.get("HUB_API_URL", "http://127.0.0.1:8050/internal").rstrip("/")
     run_token = os.environ.get("HUB_RUN_TOKEN", "")
-    return api_url, run_token
+    internal_token = os.environ.get("HUB_INTERNAL_TOKEN", "")
+    return api_url, run_token, internal_token
 
 
 def _request_json(
@@ -32,12 +33,14 @@ def _request_json(
     payload: Optional[dict[str, Any]] = None,
     timeout: float = 15.0,
 ) -> dict[str, Any]:
-    api_url, run_token = _get_api_config()
+    api_url, run_token, internal_token = _get_api_config()
     url = f"{api_url}/{path.lstrip('/')}"
     headers = {
         "X-Hub-Token": run_token,
         "Accept": "application/json",
     }
+    if internal_token:
+        headers["X-Hub-Internal-Token"] = internal_token
     data_bytes = None
     if payload is not None:
         data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")

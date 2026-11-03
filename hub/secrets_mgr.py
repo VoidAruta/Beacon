@@ -10,10 +10,21 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from hub.auth import get_internal_token
 from hub.config import SECRETS_DIR, ensure_directories
-from hub.db import db_session, execute_sql, query_all, query_one
+from hub.db import db_session, execute_sql, get_setting, query_all, query_one
 
-_SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+_SECRET_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+# Регулярные выражения для автоматического маскирования типичных токенов в логах (даже если они не внесены в таблицу secrets)
+_REGEX_REDACTORS: list[tuple[re.Pattern[str], str]] = [
+    # Telegram Bot API токен (например, 1234567890:AAH_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx)
+    (re.compile(r"\b\d{8,11}:[A-Za-z0-9_-]{24,45}\b"), "***REDACTED_TG_TOKEN***"),
+    # GitHub Personal Access Token (ghp_..., github_pat_...)
+    (re.compile(r"\b(?:ghp_[A-Za-z0-9]{30,45}|github_pat_[A-Za-z0-9_]{60,95})\b"), "***REDACTED_GH_TOKEN***"),
+    # Authorization: Bearer <token>
+    (re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9_\-\.~+/]{16,}=*"), r"\1***REDACTED_BEARER***"),
+]
 
 # Кэш текстовых секретов длиной >= 4 символов для фильтрации логов: list[(secret_name, secret_value)]
 _REDACTION_CACHE: list[tuple[str, str]] = []
@@ -21,10 +32,25 @@ _CACHE_LOADED = False
 
 
 def validate_secret_name(name: str) -> str:
+    """
+    Строгая валидация имени секрета / профиля куки против Path Traversal:
+    разрешены только латинские буквы, цифры, '_' и '-' (1–64 символа).
+    """
     clean = (name or "").strip()
-    if not _SECRET_NAME_RE.match(clean):
-        raise ValueError("Имя секрета должно содержать только латинские буквы, цифры и '_' (1–64 символа).")
+    if not clean or clean in (".", "..") or not _SECRET_NAME_RE.match(clean):
+        raise ValueError(
+            "Недопустимое имя секрета или профиля куки: разрешены только латинские буквы (a-z, A-Z), цифры (0-9), '_' и '-' (1–64 символа)."
+        )
+    base_dir = SECRETS_DIR.resolve()
+    target = (base_dir / clean).resolve()
+    if os.path.commonpath([str(base_dir), str(target)]) != str(base_dir):
+        raise ValueError("Обнаружена попытка выхода за пределы каталога секретов (Path Traversal).")
     return clean
+
+
+def validate_cookie_name(name: str) -> str:
+    """Алиас валидации имени профиля куки."""
+    return validate_secret_name(name)
 
 
 def reload_redaction_cache() -> None:
@@ -33,6 +59,23 @@ def reload_redaction_cache() -> None:
     ensure_directories()
     rows = query_all("SELECT name, type, file_path FROM secrets")
     items: list[tuple[str, str]] = []
+
+    # 1. Внутренний токен шлюза /internal/* и системный Telegram-токен панели
+    try:
+        int_tok = get_internal_token()
+        if len(int_tok) >= 8:
+            items.append(("HUB_INTERNAL_TOKEN", int_tok))
+    except Exception:
+        pass
+
+    try:
+        sys_tg = get_setting("tg_bot_token", "").strip()
+        if len(sys_tg) >= 4:
+            items.append(("tg_bot_token", sys_tg))
+    except Exception:
+        pass
+
+    # 2. Пользовательские секреты и значения куки
     for row in rows:
         name = row["name"]
         sec_type = row["type"]
@@ -64,7 +107,10 @@ def reload_redaction_cache() -> None:
 
 
 def redact_log_text(text: str) -> str:
-    """Заменяет вхождения значений секретов длиной >= 4 символов на ***SECRET:<name>***."""
+    """
+    Заменяет вхождения значений секретов длиной >= 4 символов на ***SECRET:<name>***
+    и дополнительно маскирует токены по регулярным выражениям.
+    """
     if not text:
         return text
     if not _CACHE_LOADED:
@@ -73,6 +119,8 @@ def redact_log_text(text: str) -> str:
     for name, secret_val in _REDACTION_CACHE:
         if secret_val and secret_val in result:
             result = result.replace(secret_val, f"***SECRET:{name}***")
+    for pattern, replacement in _REGEX_REDACTORS:
+        result = pattern.sub(replacement, result)
     return result
 
 
@@ -100,13 +148,17 @@ def list_secrets() -> list[dict[str, Any]]:
 
 def get_secret_raw(name: str) -> Optional[dict[str, Any]]:
     """Возвращает метаданные и расшифрованное содержимое секрета для внутреннего SDK."""
+    clean_name = validate_secret_name(name)
     row = query_one(
         "SELECT name, type, file_path, is_expired, expired_note, updated_at FROM secrets WHERE name = ?",
-        (name,),
+        (clean_name,),
     )
     if not row:
         return None
-    fpath = Path(row["file_path"])
+    fpath = Path(row["file_path"]).resolve()
+    base_dir = SECRETS_DIR.resolve()
+    if os.path.commonpath([str(base_dir), str(fpath)]) != str(base_dir):
+        raise ValueError("Недопустимый путь файла секрета")
     raw_val: Any = ""
     if fpath.exists():
         content = fpath.read_text(encoding="utf-8", errors="replace")
@@ -120,7 +172,7 @@ def get_secret_raw(name: str) -> Optional[dict[str, Any]]:
     return {
         "name": row["name"],
         "type": row["type"],
-        "file_path": row["file_path"],
+        "file_path": str(fpath),
         "value": raw_val,
         "is_expired": int(row["is_expired"]),
         "expired_note": row["expired_note"] or "",
@@ -199,12 +251,12 @@ def import_cookie_editor_json(name: str, raw_json: Any) -> dict[str, Any]:
 
 def mark_cookies_expired(name: str, note: str = "Куки устарели, требуется обновление") -> bool:
     """Помечает секрет is_expired = 1."""
-    row = query_one("SELECT name FROM secrets WHERE name = ?", (name,))
+    clean_name = validate_secret_name(name)
+    row = query_one("SELECT name FROM secrets WHERE name = ?", (clean_name,))
     now = int(time.time())
     if not row:
         # Если секрет ещё не существовал, создаём пустой слот cookie_json со статусом is_expired=1
         ensure_directories()
-        clean_name = validate_secret_name(name)
         fpath = SECRETS_DIR / clean_name
         if not fpath.exists():
             fpath.write_text("[]", encoding="utf-8")
@@ -220,21 +272,23 @@ def mark_cookies_expired(name: str, note: str = "Куки устарели, тр
 
     execute_sql(
         "UPDATE secrets SET is_expired = 1, expired_note = ?, updated_at = ? WHERE name = ?",
-        (note, now, name),
+        (note, now, clean_name),
     )
     return True
 
 
 def delete_secret(name: str) -> bool:
-    row = query_one("SELECT file_path FROM secrets WHERE name = ?", (name,))
+    clean_name = validate_secret_name(name)
+    row = query_one("SELECT file_path FROM secrets WHERE name = ?", (clean_name,))
     if not row:
         return False
-    fpath = Path(row["file_path"])
-    if fpath.exists():
+    fpath = Path(row["file_path"]).resolve()
+    base_dir = SECRETS_DIR.resolve()
+    if os.path.commonpath([str(base_dir), str(fpath)]) == str(base_dir) and fpath.exists():
         try:
             fpath.unlink()
         except OSError:
             pass
-    execute_sql("DELETE FROM secrets WHERE name = ?", (name,))
+    execute_sql("DELETE FROM secrets WHERE name = ?", (clean_name,))
     reload_redaction_cache()
     return True

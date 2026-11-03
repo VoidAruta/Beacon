@@ -43,13 +43,67 @@ const TAB_META: Record<NavTab, { title: string; subtitle: string }> = {
   },
 };
 
+async function safeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const res = await fetch(input, init);
+  const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.pathname : input.url;
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+
+  // Если прокси-сервер во время перезапуска контейнера вернул HTML-заглушку вместо JSON для /api/*
+  if (urlStr.startsWith('/api/') && contentType.includes('text/html')) {
+    try {
+      Object.defineProperty(res, 'ok', { value: false, configurable: true });
+    } catch {
+      // ignore if read-only
+    }
+  }
+
+  const origText = res.text.bind(res);
+  let cachedTextPromise: Promise<string> | null = null;
+  const getSafeText = () => {
+    if (!cachedTextPromise) {
+      cachedTextPromise = origText().catch(() => '');
+    }
+    return cachedTextPromise;
+  };
+
+  res.text = getSafeText;
+  res.json = async () => {
+    const raw = await getSafeText();
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.startsWith('<')) {
+      try {
+        Object.defineProperty(res, 'ok', { value: false, configurable: true });
+      } catch {
+        // ignore
+      }
+      return {
+        __html_fallback: true,
+        detail: 'Сервер инициализируется, повторите попытку через секунду',
+      };
+    }
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return {
+        __invalid_json: true,
+        detail: 'Некорректный JSON-ответ от сервера',
+      };
+    }
+  };
+
+  return res;
+}
+
 export function App() {
   const [authenticated, setAuthenticated] = useState<boolean>(false);
   const [authChecking, setAuthChecking] = useState<boolean>(true);
   const [csrfToken, setCsrfToken] = useState<string>('');
   const [sessionToken, setSessionToken] = useState<string>('');
+  const [mustChangePassword, setMustChangePassword] = useState<boolean>(false);
+  const [initPwInput, setInitPwInput] = useState<string>('');
+  const [initPwStatus, setInitPwStatus] = useState<string>('');
 
-  const [loginPassword, setLoginPassword] = useState<string>('admin');
+  const [loginPassword, setLoginPassword] = useState<string>('');
   const [loginError, setLoginError] = useState<string>('');
 
   const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
@@ -64,12 +118,15 @@ export function App() {
   const apiFetch = useCallback(
     async (path: string, options: RequestInit = {}) => {
       const headers = new Headers(options.headers || {});
+      if (!headers.has('Accept')) {
+        headers.set('Accept', 'application/json');
+      }
       if (!headers.has('Content-Type') && options.body && typeof options.body === 'string') {
         headers.set('Content-Type', 'application/json; charset=utf-8');
       }
       if (csrfToken) headers.set('X-CSRF-Token', csrfToken);
       if (sessionToken) headers.set('X-Hub-Session', sessionToken);
-      return fetch(path, {
+      return safeFetch(path, {
         ...options,
         headers,
         credentials: 'same-origin',
@@ -80,30 +137,41 @@ export function App() {
 
   const loadAllData = useCallback(
     async (overrideCsrf?: string, overrideSession?: string) => {
-      const hdrs: Record<string, string> = {};
-      if (overrideCsrf || csrfToken) hdrs['X-CSRF-Token'] = overrideCsrf || csrfToken;
-      if (overrideSession || sessionToken) hdrs['X-Hub-Session'] = overrideSession || sessionToken;
+      try {
+        const hdrs: Record<string, string> = { Accept: 'application/json' };
+        if (overrideCsrf || csrfToken) hdrs['X-CSRF-Token'] = overrideCsrf || csrfToken;
+        if (overrideSession || sessionToken) hdrs['X-Hub-Session'] = overrideSession || sessionToken;
 
-      const [dRes, pRes, sRes] = await Promise.all([
-        fetch('/api/dashboard', { headers: hdrs }),
-        fetch('/api/projects', { headers: hdrs }),
-        fetch('/api/secrets', { headers: hdrs }),
-      ]);
+        const [dRes, pRes, sRes] = await Promise.all([
+          safeFetch('/api/dashboard', { headers: hdrs }),
+          safeFetch('/api/projects', { headers: hdrs }),
+          safeFetch('/api/secrets', { headers: hdrs }),
+        ]);
 
-      if (dRes.ok) {
-        const dData: DashboardData = await dRes.json();
-        setDashboard(dData);
-      }
-      if (pRes.ok) {
-        const pData: ProjectItem[] = await pRes.json();
-        setProjects(pData);
-        setSelectedProject((prev) => {
-          if (!prev) return pData[0] || null;
-          return pData.find((x) => x.id === prev.id) || pData[0] || null;
-        });
-      }
-      if (sRes.ok) {
-        setSecrets(await sRes.json());
+        if (dRes.ok) {
+          const dData = await dRes.json();
+          if (dData && typeof dData === 'object' && 'system' in dData) {
+            setDashboard(dData as DashboardData);
+          }
+        }
+        if (pRes.ok) {
+          const pData = await pRes.json();
+          if (Array.isArray(pData)) {
+            setProjects(pData as ProjectItem[]);
+            setSelectedProject((prev) => {
+              if (!prev) return pData[0] || null;
+              return pData.find((x: ProjectItem) => x.id === prev.id) || pData[0] || null;
+            });
+          }
+        }
+        if (sRes.ok) {
+          const sData = await sRes.json();
+          if (Array.isArray(sData)) {
+            setSecrets(sData as SecretItem[]);
+          }
+        }
+      } catch {
+        // Игнорируем кратковременные обрывы сети во время перезапуска демона
       }
     },
     [csrfToken, sessionToken]
@@ -112,17 +180,23 @@ export function App() {
   useEffect(() => {
     const initAuth = async () => {
       try {
-        const res = await fetch('/api/auth/me?autostart=1', {
-          headers: { 'X-Hub-Auto-Session': '1' },
-        });
-        if (res.ok) {
+        for (let attempt = 0; attempt < 6; attempt++) {
+          const res = await safeFetch('/api/auth/me', {
+            headers: { Accept: 'application/json' },
+            credentials: 'same-origin',
+          });
           const data = await res.json();
-          if (data.authenticated) {
-            setAuthenticated(true);
-            setCsrfToken(data.csrf_token || '');
-            setSessionToken(data.session_token || '');
-            await loadAllData(data.csrf_token, data.session_token);
+          if (data && !data.__html_fallback) {
+            if (res.ok && data.authenticated) {
+              setAuthenticated(true);
+              setCsrfToken(data.csrf_token || '');
+              setSessionToken(data.session_token || '');
+              setMustChangePassword(Boolean(data.must_change_password));
+              await loadAllData(data.csrf_token, data.session_token);
+            }
+            break;
           }
+          await new Promise((r) => setTimeout(r, 600));
         }
       } catch (e) {
         console.error(e);
@@ -144,20 +218,42 @@ export function App() {
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoginError('');
-    const res = await fetch('/api/auth/login', {
+    const res = await safeFetch('/api/auth/login', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ password: loginPassword }),
     });
     if (res.ok) {
       const data = await res.json();
-      setAuthenticated(true);
-      setCsrfToken(data.csrf_token || '');
-      setSessionToken(data.session_token || '');
-      await loadAllData(data.csrf_token, data.session_token);
+      if (data && data.authenticated) {
+        setAuthenticated(true);
+        setCsrfToken(data.csrf_token || '');
+        setSessionToken(data.session_token || '');
+        setMustChangePassword(Boolean(data.must_change_password));
+        await loadAllData(data.csrf_token, data.session_token);
+      } else {
+        setLoginError(data?.detail || 'Ошибка авторизации');
+      }
     } else {
       const err = await res.json().catch(() => ({}));
-      setLoginError(err.detail || 'Ошибка авторизации');
+      setLoginError(err?.detail || 'Ошибка авторизации');
+    }
+  };
+
+  const handleChangeInitialPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setInitPwStatus('');
+    const res = await apiFetch('/api/auth/change_initial_password', {
+      method: 'POST',
+      body: JSON.stringify({ new_password: initPwInput }),
+    });
+    if (res.ok) {
+      setMustChangePassword(false);
+      setInitPwInput('');
+      setInitPwStatus('');
+    } else {
+      const err = await res.json().catch(() => ({}));
+      setInitPwStatus(err.detail || 'Не удалось сменить пароль');
     }
   };
 
@@ -410,11 +506,12 @@ export function App() {
           <form onSubmit={handleLogin} className="mt-5 space-y-4">
             <div>
               <label htmlFor="hub-login-password" className="block text-xs text-slate-300 mb-1">
-                Пароль администратора (по умолчанию <code className="font-mono text-indigo-300">admin</code>)
+                Пароль администратора (при первом старте сохранён в <code className="font-mono text-indigo-300">data/initial_password</code>)
               </label>
               <input
                 id="hub-login-password"
                 type="password"
+                placeholder="Введите пароль администратора..."
                 value={loginPassword}
                 onChange={(e) => setLoginPassword(e.target.value)}
                 className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3.5 py-2 text-sm text-white focus:outline-none focus:border-indigo-500"
@@ -443,6 +540,48 @@ export function App() {
 
   return (
     <div className="min-h-screen bg-[#0f172a] text-slate-100 flex flex-col pb-16 lg:pb-0">
+      {/* Баннер смены начального пароля при первом входе */}
+      {mustChangePassword && (
+        <div className="bg-amber-950/90 border-b border-amber-500/40 px-4 py-2.5">
+          <form
+            onSubmit={handleChangeInitialPassword}
+            className="max-w-[1440px] mx-auto flex flex-wrap items-center justify-between gap-3"
+          >
+            <div className="flex items-center gap-2 text-xs text-amber-200">
+              <Lock className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>
+                <strong>Безопасность (первый вход):</strong> вы вошли по одноразовому начальному паролю из{' '}
+                <code className="font-mono bg-amber-900/60 px-1.5 py-0.5 rounded">data/initial_password</code>. Задайте постоянный пароль
+                (от 6 символов):
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="password"
+                value={initPwInput}
+                onChange={(e) => setInitPwInput(e.target.value)}
+                placeholder="Новый пароль (мин. 6 симв.)"
+                className="bg-slate-900/90 border border-amber-500/40 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-400 focus:outline-none focus:border-amber-400"
+              />
+              <button
+                type="submit"
+                className="px-3 py-1.5 text-xs font-semibold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg transition-colors cursor-pointer"
+              >
+                Сохранить пароль
+              </button>
+              <button
+                type="button"
+                onClick={() => setMustChangePassword(false)}
+                className="px-2 py-1.5 text-xs text-amber-300/80 hover:text-white cursor-pointer"
+              >
+                Позже
+              </button>
+            </div>
+            {initPwStatus && <div className="w-full text-xs text-rose-300 font-medium">{initPwStatus}</div>}
+          </form>
+        </div>
+      )}
+
       {/* Глобальные тревожные баннеры (WAITING_INPUT и COOKIES_EXPIRED) */}
       <GlobalAlertBanners
         pendingAsks={dashboard?.pending_asks || []}

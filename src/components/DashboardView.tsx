@@ -170,7 +170,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             />
           </div>
           <p className="mt-2 text-[11px] text-slate-400">
-            Лёгкий сервер <code className="font-mono text-slate-300">PID {system.hub_pid}</code> · База SQLite WAL
+            Лёгкий сервер <code className="font-mono text-slate-300">PID {system.hub_pid}</code> · WAL:{' '}
+            <code className="font-mono text-slate-300">{system.disk.wal_size_kb ?? 0} КБ</code>
           </p>
         </div>
 
@@ -194,7 +195,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             />
           </div>
           <p className="mt-2 text-[11px] text-slate-400 font-mono tabular-nums">
-            Занято ОЗУ: {Math.round(system.ram_used_mb)} из {Math.round(system.ram_total_mb)} МБ ({system.ram_percent}%)
+            ОЗУ: {Math.round(system.ram_used_mb)}/{Math.round(system.ram_total_mb)} МБ · ZRAM:{' '}
+            {system.hardware?.swap_used_mb ?? 0}/{system.hardware?.swap_total_mb ?? 0} МБ
           </p>
         </div>
 
@@ -228,23 +230,39 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
         <div className="bg-[#1e293b] border border-slate-800 rounded-xl p-4">
           <div className="flex items-center justify-between text-xs text-slate-400">
-            <span>Poco X3 NFC (Root 45–55%) и Прокси</span>
+            <span>
+              {system.hardware?.available
+                ? `${system.hardware.device_model || 'Android'} и Прокси`
+                : 'Питание и Прокси'}
+            </span>
             <BatteryCharging className="w-4 h-4 text-emerald-400" />
           </div>
           <div className="mt-2 flex items-baseline gap-2">
             <span className="text-2xl font-bold text-white font-mono tabular-nums">
-              {system.hardware ? `${system.hardware.battery_percent}%` : `${runningCount}/${projects.length}`}
+              {system.hardware?.available && system.hardware.battery_percent !== null
+                ? `${system.hardware.battery_percent}%`
+                : 'N/A'}
             </span>
-            <span className="text-xs text-emerald-300 font-mono truncate">
-              {system.hardware ? `· ${system.hardware.battery_temp_c}°C (CPU ${system.hardware.cpu_temp_c}°C)` : 'сейчас в работе'}
+            <span
+              className={`text-xs font-mono truncate ${
+                system.hardware?.thermal_state === 'critical'
+                  ? 'text-red-400 font-bold'
+                  : system.hardware?.thermal_state === 'warning'
+                  ? 'text-amber-300'
+                  : 'text-slate-400'
+              }`}
+            >
+              {system.hardware?.available && system.hardware.battery_temp_c !== null
+                ? `· ${system.hardware.battery_temp_c}°C${system.hardware.voltage_mv ? ` · ${system.hardware.voltage_mv} мВ` : ''}`
+                : '· датчики АКБ: N/A'}
             </span>
           </div>
           <p className="mt-1.5 text-[11px] text-slate-200 truncate" title={system.hardware?.cycle_label}>
-            {system.hardware?.cycle_label || 'Контроллер заряда 45%–55% активен'}
+            {system.hardware?.cycle_label || 'Стационарное питание (N/A)'}
           </p>
           <p className="mt-1 text-[11px] text-slate-400 font-mono flex items-center justify-between">
             <span>Прокси 10808: {system.proxy_status?.online ? 'Онлайн' : 'Ожидание туннеля'}</span>
-            <span>Рабочих: {runningCount}/{projects.length}</span>
+            <span>Аптайм: {system.hardware?.uptime_human || `${runningCount}/${projects.length}`}</span>
           </p>
         </div>
       </section>

@@ -6,6 +6,7 @@ process_mgr и scheduler.
 """
 
 import asyncio
+import hmac
 import os
 import sys
 from pathlib import Path
@@ -22,7 +23,8 @@ from hub.api import (
 )
 from hub.api.routes_internal import router as internal_router
 from hub.api.routes_ui import router as ui_router
-from hub.auth import is_ip_allowed, verify_session_token
+from hub.ask_broker import ensure_tg_poller_running
+from hub.auth import get_internal_token, is_ip_allowed, verify_session_token
 from hub.config import FORBIDDEN_PORTS, STATIC_DIR, ensure_directories
 from hub.db import get_setting, init_db
 from hub.process_mgr import recover_running_processes, watch_processes_loop
@@ -69,7 +71,8 @@ async def security_and_auth_middleware(request: Request, call_next: Callable[[Re
 
         if request.method in ("POST", "PUT", "DELETE"):
             csrf_header = request.headers.get("x-csrf-token", "")
-            if not csrf_header or csrf_header != session.get("csrf"):
+            expected_csrf = str(session.get("csrf") or "")
+            if not csrf_header or not expected_csrf or not hmac.compare_digest(csrf_header, expected_csrf):
                 return JSONResponse({"detail": "Недействительный или отсутствующий X-CSRF-Token"}, status_code=403)
 
     return await call_next(request)
@@ -117,6 +120,7 @@ async def serve_static_vendor(request: Request, subpath: str) -> Any:
 async def on_startup() -> None:
     ensure_directories()
     init_db()
+    get_internal_token()
     reload_redaction_cache()
     rec = recover_running_processes()
     print(
@@ -124,6 +128,7 @@ async def on_startup() -> None:
         flush=True,
     )
     await autostart_services_on_boot()
+    ensure_tg_poller_running()
     loop = asyncio.get_running_loop()
     _BG_TASKS.append(loop.create_task(watch_processes_loop()))
     _BG_TASKS.append(loop.create_task(scheduler_loop()))
@@ -132,6 +137,14 @@ async def on_startup() -> None:
 def main() -> None:
     ensure_directories()
     init_db()
+    get_internal_token()
+
+    if len(sys.argv) > 1 and sys.argv[1] in ("doctor", "--doctor", "check"):
+        from hub.doctor import print_doctor_cli, run_hub_doctor
+
+        report = run_hub_doctor(auto_fix_perms=True)
+        sys.exit(print_doctor_cli(report))
+
     port_str = os.environ.get("HUB_PORT") or get_setting("port", "8050")
     port = int(port_str)
     if port in FORBIDDEN_PORTS:
@@ -151,3 +164,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

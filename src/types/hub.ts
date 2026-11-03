@@ -1,18 +1,32 @@
 export interface PocoHardwareStatus {
+  available?: boolean;
   device_model: string;
-  battery_percent: number;
+  battery_percent: number | null;
   raw_status: string;
-  power_plugged: boolean;
+  power_plugged: boolean | null;
+  voltage_mv?: number | null;
+  current_ma?: number | null;
+  battery_health?: string;
   min_target_pct: number;
   max_target_pct: number;
   alert_below_pct: number;
-  cycle_state: 'cycle_ok' | 'charging_to_target' | 'power_loss' | 'critical_low';
+  battery_low_pct?: number;
+  cycle_state: 'cycle_ok' | 'charging_to_target' | 'power_loss' | 'critical_low' | 'unavailable';
   cycle_label: string;
   should_alert: boolean;
-  battery_temp_c: number;
-  cpu_temp_c: number;
+  battery_temp_c: number | null;
+  cpu_temp_c: number | null;
+  battery_warn_temp_c?: number;
+  battery_crit_temp_c?: number;
+  thermal_auto_stop?: boolean;
+  thermal_state?: 'ok' | 'warning' | 'critical';
   thermal_warning: boolean;
   is_real_sysfs: boolean;
+  swap_total_mb?: number;
+  swap_used_mb?: number;
+  swap_percent?: number;
+  uptime_sec?: number;
+  uptime_human?: string;
 }
 
 export interface ProxyReachabilityStatus {
@@ -42,6 +56,7 @@ export interface SystemStatus {
     crit_mb: number;
     state: 'ok' | 'warning' | 'critical';
     can_start_runs: boolean;
+    wal_size_kb?: number;
   };
   proxy_url: string;
   proxy_status?: ProxyReachabilityStatus;

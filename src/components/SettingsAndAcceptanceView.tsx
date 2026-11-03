@@ -45,8 +45,13 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
   const [saveMsg, setSaveMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [notifyMsg, setNotifyMsg] = useState<string>('');
   const [cleanupMsg, setCleanupMsg] = useState<string>('');
+  const [tgCmdPreview, setTgCmdPreview] = useState<string>('');
   const [auditLogs, setAuditLogs] = useState<AuditEntry[]>([]);
   const [showAdvancedSystem, setShowAdvancedSystem] = useState<boolean>(false);
+
+  // Самодиагностика Android Chroot (hub doctor)
+  const [doctorReport, setDoctorReport] = useState<any | null>(null);
+  const [runningDoctor, setRunningDoctor] = useState(false);
 
   // Тестовый полигон и 6 пунктов приёмки
   const [runningSuite, setRunningSuite] = useState(false);
@@ -57,12 +62,38 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
   const [busyTestProjId, setBusyTestProjId] = useState<number | null>(null);
 
   const loadSettingsAndAudit = async () => {
-    const [sRes, aRes] = await Promise.all([
-      apiFetch('/api/settings'),
-      apiFetch('/api/system/audit'),
-    ]);
-    if (sRes.ok) setSettings(await sRes.json());
-    if (aRes.ok) setAuditLogs(await aRes.json());
+    try {
+      const [sRes, aRes] = await Promise.all([
+        apiFetch('/api/settings'),
+        apiFetch('/api/system/audit'),
+      ]);
+      if (sRes.ok) {
+        const sData = await sRes.json();
+        if (sData && typeof sData === 'object' && !sData.__html_fallback) {
+          setSettings(sData);
+        }
+      }
+      if (aRes.ok) {
+        const aData = await aRes.json();
+        if (Array.isArray(aData)) {
+          setAuditLogs(aData);
+        }
+      }
+    } catch {
+      // ignore transient errors
+    }
+  };
+
+  const handleRunDoctor = async () => {
+    setRunningDoctor(true);
+    try {
+      const res = await apiFetch('/api/system/doctor');
+      if (res.ok) {
+        setDoctorReport(await res.json());
+      }
+    } finally {
+      setRunningDoctor(false);
+    }
   };
 
   const loadBundleFile = async (filePath: string) => {
@@ -80,6 +111,7 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
       loadSettingsAndAudit();
     } else {
       loadBundleFile(selectedBundleFile);
+      handleRunDoctor();
     }
   }, [mode]);
 
@@ -126,16 +158,33 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
     }
   };
 
+  const handleTestTgCommand = async (command: string) => {
+    setTgCmdPreview(`Выполнение команды ${command}...`);
+    const res = await apiFetch('/api/settings/test_tg_command', {
+      method: 'POST',
+      body: JSON.stringify({ command }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      setTgCmdPreview(data.reply || '');
+    } else {
+      setTgCmdPreview('Ошибка выполнения команды бота');
+    }
+  };
+
   const handleCleanup = async () => {
-    setCleanupMsg('Выполняется очистка кэша pip/npm и старых логов...');
+    setCleanupMsg('Выполняется очистка кэша pip/npm, старых логов и SQLite WAL...');
     const res = await apiFetch('/api/system/cleanup', {
       method: 'POST',
       body: JSON.stringify({}),
     });
     if (res.ok) {
       const data = await res.json();
+      const walNote = data.wal_checkpoint
+        ? ` WAL: ${data.wal_checkpoint.wal_size_before_kb} -> ${data.wal_checkpoint.wal_size_after_kb} КБ.`
+        : '';
       setCleanupMsg(
-        `Очистка завершена: удалено старых запусков ${data.deleted_runs}, усечено логов ${data.rotated_files}. Свободно на диске: ${data.disk?.free_mb} МБ.`
+        `Очистка завершена: удалено старых запусков ${data.deleted_runs}, усечено логов ${data.rotated_files}.${walNote} Свободно на диске: ${data.disk?.free_mb} МБ.`
       );
       await loadSettingsAndAudit();
       await onRefreshDashboard();
@@ -174,6 +223,91 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
 
     return (
       <div className="space-y-6">
+        {/* 0. Самодиагностика Android Chroot (hub doctor) */}
+        <section className="bg-[#1e293b] border border-slate-800 rounded-xl p-6">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-800">
+            <div>
+              <h2 className="text-base font-bold text-white flex items-center gap-2">
+                <Shield className="w-5 h-5 text-emerald-400" />
+                Самодиагностика Android Chroot (<code className="font-mono text-indigo-300">python3 -m hub doctor</code>)
+              </h2>
+              <p className="text-xs text-slate-400 mt-1">
+                Проверяет 8 узлов Android-сервера: сетевые группы ядра <code className="font-mono">3003/3004</code>, точки монтирования <code className="font-mono">/proc, /sys, /dev/pts</code>, права <code className="font-mono">0700/0600</code> на секреты, чекпоинт SQLite WAL, прокси <code className="font-mono">127.0.0.1:10808</code> и термозащиту батареи.
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={runningDoctor}
+              onClick={handleRunDoctor}
+              className="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg inline-flex items-center gap-2 shrink-0 cursor-pointer"
+            >
+              <RefreshCw className={`w-4 h-4 ${runningDoctor ? 'animate-spin' : ''}`} />
+              {runningDoctor ? 'Проверка chroot...' : 'Запустить hub doctor'}
+            </button>
+          </div>
+
+          {doctorReport ? (
+            <div className="mt-4 space-y-3">
+              <div className="flex flex-wrap items-center gap-3 text-xs font-mono">
+                <span className="px-2.5 py-1 rounded bg-emerald-950/60 border border-emerald-500/40 text-emerald-300">
+                  OK: {doctorReport.ok_count}
+                </span>
+                <span className="px-2.5 py-1 rounded bg-amber-950/60 border border-amber-500/40 text-amber-300">
+                  WARN: {doctorReport.warn_count}
+                </span>
+                <span className="px-2.5 py-1 rounded bg-red-950/60 border border-red-500/40 text-red-300">
+                  ERROR: {doctorReport.error_count}
+                </span>
+                <span className="text-slate-400">
+                  Время проверки: {doctorReport.duration_ms} мс · Директория: {doctorReport.base_dir}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {(doctorReport.checks || []).map((chk: any) => {
+                  const isOk = chk.status === 'ok';
+                  const isWarn = chk.status === 'warn';
+                  return (
+                    <div
+                      key={chk.id}
+                      className={`p-3.5 rounded-lg border text-xs ${
+                        isOk
+                          ? 'bg-emerald-950/20 border-emerald-500/30'
+                          : isWarn
+                          ? 'bg-amber-950/25 border-amber-500/40'
+                          : 'bg-red-950/30 border-red-500/40'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold text-white">{chk.title}</span>
+                        <span
+                          className={`px-2 py-0.5 rounded text-[10px] font-mono uppercase font-bold ${
+                            isOk
+                              ? 'bg-emerald-500/20 text-emerald-300'
+                              : isWarn
+                              ? 'bg-amber-500/20 text-amber-300'
+                              : 'bg-red-500/20 text-red-300'
+                          }`}
+                        >
+                          {chk.status}
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-slate-300 leading-relaxed">{chk.summary}</p>
+                      {!isOk && chk.fix_hint && (
+                        <div className="mt-2 p-2 bg-slate-950/70 rounded font-mono text-[11px] text-amber-200">
+                          Подсказка: {chk.fix_hint}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ) : (
+            <div className="mt-4 text-xs text-slate-400">Загрузка отчёта самодиагностики...</div>
+          )}
+        </section>
+
         {/* 1. Набор готовых тестовых проектов с понятным объяснением, что каждый из них проверяет */}
         <section className="bg-[#1e293b] border border-slate-800 rounded-xl p-6">
           <div className="pb-4 border-b border-slate-800">
@@ -345,7 +479,7 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
           <div>
             <h2 className="text-base font-bold text-white">Настройки панели и Системного Telegram-бота</h2>
             <p className="text-xs text-slate-400">
-              Настройка бота для получения уведомлений от самой панели и управления ею, а также сетевого прокси и очистки диска
+              Настройка бота для получения уведомлений от самой панели и управления ею, а также сетевого прокси, термозащиты смартфона и очистки диска
             </p>
           </div>
 
@@ -435,9 +569,34 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
           </div>
 
           {/* Шпаргалка команд системного бота управления панелью */}
-          <div className="p-3 bg-[#0f172a] border border-slate-800 rounded-lg text-xs text-slate-300">
-            <div className="font-semibold text-white mb-1">
-              Что умеет системный Telegram-бот панели:
+          <div className="p-3 bg-[#0f172a] border border-slate-800 rounded-lg text-xs text-slate-300 space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="font-semibold text-white">
+                Что умеет системный Telegram-бот панели (нажмите для предпросмотра ответа):
+              </div>
+              <div className="flex items-center gap-1.5 font-mono text-[11px]">
+                <button
+                  type="button"
+                  onClick={() => handleTestTgCommand('/status')}
+                  className="px-2 py-0.5 rounded bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/30 cursor-pointer"
+                >
+                  Тест /status
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleTestTgCommand('/projects')}
+                  className="px-2 py-0.5 rounded bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/30 cursor-pointer"
+                >
+                  Тест /projects
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleTestTgCommand('/doctor')}
+                  className="px-2 py-0.5 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 cursor-pointer"
+                >
+                  Тест /doctor
+                </button>
+              </div>
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 text-[11px] font-mono">
               <div>
@@ -453,10 +612,81 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
                 <span className="text-amber-300">Reply (Ответ)</span> — передаёт СМС-код в <code className="font-mono">hub.ask()</code>
               </div>
             </div>
+            {tgCmdPreview && (
+              <pre className="p-2.5 bg-slate-950 border border-slate-800 rounded text-[11px] font-mono text-emerald-200 whitespace-pre-wrap">
+                {tgCmdPreview}
+              </pre>
+            )}
           </div>
         </div>
 
-        {/* БЛОК 2: Стандартные настройки панели (Прокси, Пароль, Очистка диска) */}
+        {/* БЛОК 2: Термозащита и сторож питания смартфона (Android Thermal & Battery Guard) */}
+        <div className="p-5 bg-slate-900/70 border border-emerald-500/30 rounded-xl space-y-4">
+          <div>
+            <h3 className="text-sm font-bold text-white flex items-center gap-2">
+              <Shield className="w-4 h-4 text-emerald-400" />
+              2. Аппаратная термозащита и сторож батареи смартфона (Poco X3 NFC · 24/7)
+            </h3>
+            <p className="text-xs text-slate-300 mt-1">
+              Защищает аккумулятор от вздутия при круглосуточной работе на зарядке: отправляет предупреждение при нагреве выше порога <code className="font-mono text-amber-300">warn</code> и автоматически останавливает некритичные задачи при достижении критической температуры <code className="font-mono text-red-300">crit</code>.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+            <div>
+              <label className="block text-xs text-slate-300 mb-1">
+                Порог предупреждения T° батареи (°C)
+              </label>
+              <input
+                type="number"
+                step="0.5"
+                value={settings.battery_warn_temp_c || '43'}
+                onChange={(e) => setSettings({ ...settings, battery_warn_temp_c: e.target.value })}
+                className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs text-slate-300 mb-1">
+                Критический перегрев T° батареи (°C)
+              </label>
+              <input
+                type="number"
+                step="0.5"
+                value={settings.battery_crit_temp_c || '47'}
+                onChange={(e) => setSettings({ ...settings, battery_crit_temp_c: e.target.value })}
+                className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs text-slate-300 mb-1">
+                Тревога потери питания 220В (&lt;= %)
+              </label>
+              <input
+                type="number"
+                value={settings.battery_low_pct || '20'}
+                onChange={(e) => setSettings({ ...settings, battery_low_pct: e.target.value })}
+                className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
+              />
+            </div>
+
+            <div className="flex flex-col justify-end">
+              <label className="flex items-center gap-2 text-xs text-slate-200 cursor-pointer p-2 bg-[#0f172a] border border-slate-700 rounded-lg">
+                <input
+                  type="checkbox"
+                  checked={settings.thermal_auto_stop !== '0'}
+                  onChange={(e) =>
+                    setSettings({ ...settings, thermal_auto_stop: e.target.checked ? '1' : '0' })
+                  }
+                />
+                Авто-стоп задач при перегреве &gt;= {settings.battery_crit_temp_c || '47'}°C
+              </label>
+            </div>
+          </div>
+        </div>
+
+        {/* БЛОК 3: Стандартные настройки панели (Прокси, Пароль, Очистка диска + SQLite WAL) */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
             <label className="block text-xs font-medium text-slate-200 mb-1">
@@ -490,7 +720,7 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
               className="w-full py-2 px-3 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700 rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
             >
               <Trash2 className="w-3.5 h-3.5" />
-              Очистить кэш pip / npm и старые логи
+              Очистить кэш pip / npm, логи и SQLite WAL
             </button>
           </div>
         </div>
@@ -502,7 +732,7 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
           </div>
         )}
 
-        {/* БЛОК 3: Расширенные технические настройки сервера (Скрыты по умолчанию, чтобы не перегружать интерфейс) */}
+        {/* БЛОК 4: Расширенные технические настройки сервера (Скрыты по умолчанию, чтобы не перегружать интерфейс) */}
         <div className="border border-slate-800 rounded-xl overflow-hidden">
           <button
             type="button"
@@ -687,3 +917,4 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
     </div>
   );
 };
+

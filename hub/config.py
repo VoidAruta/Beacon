@@ -13,7 +13,10 @@ DATA_DIR = BASE_DIR / "data"
 SECRETS_DIR = DATA_DIR / "secrets"
 LOGS_DIR = DATA_DIR / "logs"
 PROJECTS_DIR = BASE_DIR / "projects"
+EXAMPLES_DIR = PROJECTS_DIR / "examples"
 DB_PATH = DATA_DIR / "hub.db"
+INTERNAL_TOKEN_PATH = DATA_DIR / "internal.token"
+INITIAL_PASSWORD_PATH = DATA_DIR / "initial_password"
 
 SDK_PYTHON_DIR = BASE_DIR / "sdk" / "python"
 SDK_NODE_DIR = BASE_DIR / "sdk" / "node"
@@ -29,7 +32,8 @@ if DEFAULT_PORT in FORBIDDEN_PORTS:
 DEFAULT_SETTINGS: dict[str, str] = {
     "port": str(DEFAULT_PORT),
     "password_hash": "",  # Заполняется при инициализации БД scrypt-хешем
-    "allowed_subnets": "127.0.0.0/8,192.168.100.0/24,192.168.1.0/24,10.0.0.0/8,172.16.0.0/12,::1/128",
+    "must_change_password": "1",  # Требует смены начального пароля 'admin' при первом входе
+    "allowed_subnets": "127.0.0.0/8,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,100.64.0.0/10,::1/128",
     "proxy_url": os.environ.get("HUB_PROXY_URL", "http://127.0.0.1:10808"),
     "run_as_user": "root",
     "disk_warn_mb": "500",
@@ -45,6 +49,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ntfy_use_proxy": "0",
     "webhook_url": "",
     "webhook_use_proxy": "0",
+    "battery_warn_temp_c": "43",
+    "battery_crit_temp_c": "47",
+    "battery_low_pct": "20",
+    "thermal_auto_stop": "1",
 }
 
 

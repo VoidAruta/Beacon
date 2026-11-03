@@ -11,6 +11,7 @@ from hub.db import execute_sql, query_all, query_one
 from hub.disk_guard import check_disk_and_maintain
 from hub.notifier import send_notification
 from hub.process_mgr import ACTIVE_RUNS, set_on_finish_callback, start_project_run
+from hub.web_auth_mgr import check_android_hardware_guard
 
 # Состояние сервисов для экспоненциального backoff:
 # project_id -> {"consecutive_failures": int, "next_restart_at": float}
@@ -201,6 +202,7 @@ async def scheduler_loop() -> None:
     """
     set_on_finish_callback(on_run_finished)
     last_disk_check = 0.0
+    last_hw_guard_check = 0.0
 
     while True:
         try:
@@ -269,10 +271,15 @@ async def scheduler_loop() -> None:
                         except Exception:
                             pass
 
-            # 4. Периодический контроль диска и ротация логов
+            # 4. Периодический контроль диска, ротация логов и WAL checkpoint
             if now - last_disk_check >= 60.0:
                 last_disk_check = now
                 await check_disk_and_maintain()
+
+            # 5. Аппаратный сторож батареи и перегрева Android (каждые 30 секунд)
+            if now - last_hw_guard_check >= 30.0:
+                last_hw_guard_check = now
+                await check_android_hardware_guard()
 
         except Exception:
             pass

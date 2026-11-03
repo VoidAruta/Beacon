@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import fcntl
 import json
 import os
 import pwd
@@ -22,6 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Optional
 
+from hub.auth import get_internal_token
 from hub.compat import psutil
 from hub.config import LOGS_DIR, SDK_NODE_DIR, SDK_PYTHON_DIR
 from hub.db import execute_sql, get_all_settings, query_all, query_one
@@ -33,6 +35,7 @@ from hub.secrets_mgr import get_secret_raw, redact_log_text
 # run_id -> {
 #   "run_id": int, "project_id": int, "pid": int, "pgid": int,
 #   "proc_create_time": float, "started_at": int, "log_path": str,
+#   "stdin_fifo": str, "stdin_keepalive_fd": Optional[int],
 #   "popen": Optional[subprocess.Popen], "rss_mb": float, "cpu_percent": float
 # }
 ACTIVE_RUNS: dict[int, dict[str, Any]] = {}
@@ -44,6 +47,17 @@ _ON_FINISH_CALLBACK: Optional[Callable[[dict[str, Any], int, str, str], Coroutin
 def set_on_finish_callback(cb: Callable[[dict[str, Any], int, str, str], Coroutine[Any, Any, None]]) -> None:
     global _ON_FINISH_CALLBACK
     _ON_FINISH_CALLBACK = cb
+
+
+def _reap_zombies() -> None:
+    """Неблокирующий сбор осиротевших дочерних зомби-процессов."""
+    while True:
+        try:
+            wpid, _ = os.waitpid(-1, os.WNOHANG)
+            if wpid <= 0:
+                break
+        except (ChildProcessError, OSError):
+            break
 
 
 def _get_pgid_processes(pgid: int) -> list[Any]:
@@ -60,35 +74,101 @@ def _get_pgid_processes(pgid: int) -> list[Any]:
     return procs
 
 
+def collect_all_pgid_metrics(target_pgids: set[int]) -> dict[int, tuple[float, float, int]]:
+    """
+    Собирает метрики (rss_mb, cpu_percent, proc_count) для всех указанных PGID
+    за ОДИН проход по psutil.process_iter().
+    """
+    valid_pgids = {pg for pg in target_pgids if pg and pg > 1}
+    if not valid_pgids:
+        return {}
+
+    agg_rss: dict[int, int] = {pg: 0 for pg in valid_pgids}
+    agg_cpu: dict[int, float] = {pg: 0.0 for pg in valid_pgids}
+    agg_cnt: dict[int, int] = {pg: 0 for pg in valid_pgids}
+
+    for p in psutil.process_iter():
+        try:
+            pg = os.getpgid(p.pid)
+            if pg not in valid_pgids:
+                continue
+            if not p.is_running() or p.status() == "zombie":
+                continue
+            agg_rss[pg] += p.memory_info().rss
+            agg_cpu[pg] += p.cpu_percent(interval=None)
+            agg_cnt[pg] += 1
+        except (ProcessLookupError, PermissionError, psutil.NoSuchProcess, psutil.AccessDenied, Exception):
+            continue
+
+    result: dict[int, tuple[float, float, int]] = {}
+    for pg in valid_pgids:
+        rss_mb = round(agg_rss[pg] / (1024.0 * 1024.0), 2)
+        result[pg] = (rss_mb, round(agg_cpu[pg], 1), agg_cnt[pg])
+    return result
+
+
 def get_pgid_metrics(pgid: int) -> tuple[float, float, int]:
     """Возвращает (rss_mb, cpu_percent, proc_count) по всем процессам группы PGID."""
-    procs = _get_pgid_processes(pgid)
-    total_rss = 0
-    total_cpu = 0.0
-    for p in procs:
+    if not pgid or pgid <= 1:
+        return 0.0, 0.0, 0
+    return collect_all_pgid_metrics({pgid}).get(pgid, (0.0, 0.0, 0))
+
+
+def _cleanup_run_fifo(
+    run_id: int,
+    mem_info: Optional[dict[str, Any]] = None,
+    project_name: Optional[str] = None,
+) -> None:
+    """Закрывает удерживающий дескриптор записи FIFO и удаляет файл stdin_<run_id>.fifo."""
+    if mem_info:
+        keep_fd = mem_info.pop("stdin_keepalive_fd", None)
+        if isinstance(keep_fd, int):
+            try:
+                os.close(keep_fd)
+            except OSError:
+                pass
+        fifo_str = mem_info.get("stdin_fifo")
+        if fifo_str:
+            try:
+                Path(fifo_str).unlink(missing_ok=True)
+            except OSError:
+                pass
+    if project_name:
+        fifo_p = LOGS_DIR / project_name / f"stdin_{run_id}.fifo"
         try:
-            total_rss += p.memory_info().rss
-            total_cpu += p.cpu_percent(interval=None)
-        except Exception:
-            continue
-    rss_mb = round(total_rss / (1024.0 * 1024.0), 2)
-    return rss_mb, round(total_cpu, 1), len(procs)
+            fifo_p.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
-def _read_log_tail(log_path: str, max_lines: int = 15) -> str:
+def read_log_tail_bytes(log_path: str | Path, max_bytes: int = 131072, max_lines: int = 500) -> str:
+    """
+    Потоковое чтение хвоста лог-файла с конца через f.seek() (без загрузки всего файла в ОЗУ)
+    с автоматической маскировкой секретов (redact_log_text).
+    """
     path = Path(log_path)
     if not path.exists():
         return ""
     try:
         with open(path, "rb") as f:
-            sz = path.stat().st_size
-            f.seek(max(0, sz - 4096))
-            raw = f.read().decode("utf-8", errors="replace")
-        lines = [ln for ln in raw.splitlines() if ln.strip()]
-        tail = "\n".join(lines[-max_lines:])
-        return redact_log_text(tail)
+            sz = os.fstat(f.fileno()).st_size
+            start_pos = max(0, sz - max_bytes)
+            f.seek(start_pos, os.SEEK_SET)
+            raw_bytes = f.read(max_bytes)
+        raw_text = raw_bytes.decode("utf-8", errors="replace")
+        lines = raw_text.splitlines()
+        if start_pos > 0 and len(lines) > 1:
+            # Отбрасываем потенциально обрезанную первую строку при чтении со смещением
+            lines = lines[1:]
+        if max_lines > 0 and len(lines) > max_lines:
+            lines = lines[-max_lines:]
+        return redact_log_text("\n".join(lines))
     except Exception:
         return ""
+
+
+def _read_log_tail(log_path: str, max_lines: int = 15) -> str:
+    return read_log_tail_bytes(log_path, max_bytes=8192, max_lines=max_lines)
 
 
 def _build_command_args(project: dict[str, Any], custom_cmd: Optional[str] = None) -> list[str]:
@@ -141,6 +221,7 @@ def _build_process_env(project: dict[str, Any], run_token: str, settings: dict[s
     port = settings.get("port", "8050")
     env["HUB_API_URL"] = f"http://127.0.0.1:{port}/internal"
     env["HUB_RUN_TOKEN"] = run_token
+    env["HUB_INTERNAL_TOKEN"] = get_internal_token()
     env["PYTHONUNBUFFERED"] = "1"
 
     # Подключение SDK через PYTHONPATH и NODE_PATH
@@ -159,7 +240,8 @@ def _build_process_env(project: dict[str, Any], run_token: str, settings: dict[s
         env["NO_PROXY"] = "127.0.0.1,localhost"
         env["no_proxy"] = "127.0.0.1,localhost"
 
-    # Привязанные секреты проекта
+    # Привязанные секреты проекта: НЕ передаём сырые значения текстовых секретов в /proc/<pid>/environ!
+    # Секреты читаются через SDK (/internal/secret/{name}) или через защищённый файл с правами 0600.
     try:
         sec_names = json.loads(project.get("secrets_json") or "[]")
         if isinstance(sec_names, list):
@@ -167,8 +249,6 @@ def _build_process_env(project: dict[str, Any], run_token: str, settings: dict[s
                 sec = get_secret_raw(str(sec_name))
                 if sec:
                     env[f"HUB_SECRET_FILE_{sec['name']}"] = str(sec["file_path"])
-                    if sec["type"] == "text" and isinstance(sec["value"], str):
-                        env[f"HUB_SECRET_{sec['name']}"] = sec["value"]
     except Exception:
         pass
 
@@ -279,7 +359,8 @@ async def start_project_run(
     # КРИТИЧЕСКОЕ ПРАВИЛО #2:
     # Никаких subprocess.PIPE! Открываем лог-файл с buffering=0, передаём дескриптор дочернему процессу
     # и сразу закрываем дескриптор в родительском процессе Hub.
-    # Для интерактивного ввода в консоль (stdin) используем именованный FIFO-канал с O_RDWR (безопасно при рестарте Hub).
+    # Для интерактивного ввода в консоль (stdin) открываем читающий конец FIFO в блокирующем режиме
+    # и удерживаем пишущий конец открытым в родителе до завершения процесса (без BlockingIOError и без EOF).
     log_fd = open(log_path, "ab", buffering=0)
     header_line = (
         f"=== [Hub Run #{run_id}] Started at {time.strftime('%Y-%m-%d %H:%M:%S')} | "
@@ -288,21 +369,37 @@ async def start_project_run(
     log_fd.write(header_line)
 
     stdin_fifo_path = proj_log_dir / f"stdin_{run_id}.fifo"
-    stdin_fd: Optional[int] = None
+    stdin_r_fd: Optional[int] = None
+    stdin_w_fd: Optional[int] = None
     try:
         if stdin_fifo_path.exists():
             stdin_fifo_path.unlink()
         os.mkfifo(stdin_fifo_path, 0o600)
-        stdin_fd = os.open(str(stdin_fifo_path), os.O_RDWR | os.O_NONBLOCK)
+        stdin_r_fd = os.open(str(stdin_fifo_path), os.O_RDONLY | os.O_NONBLOCK)
+        stdin_w_fd = os.open(str(stdin_fifo_path), os.O_WRONLY | os.O_NONBLOCK)
+        # Переводим читающий дескриптор для дочернего процесса в стандартный блокирующий режим
+        r_flags = fcntl.fcntl(stdin_r_fd, fcntl.F_GETFL)
+        fcntl.fcntl(stdin_r_fd, fcntl.F_SETFL, r_flags & ~os.O_NONBLOCK)
     except Exception:
-        stdin_fd = None
+        if stdin_r_fd is not None:
+            try:
+                os.close(stdin_r_fd)
+            except OSError:
+                pass
+        if stdin_w_fd is not None:
+            try:
+                os.close(stdin_w_fd)
+            except OSError:
+                pass
+        stdin_r_fd = None
+        stdin_w_fd = None
 
     try:
         proc = subprocess.Popen(
             cmd_args,
             cwd=str(workdir),
             env=env,
-            stdin=stdin_fd if stdin_fd is not None else subprocess.DEVNULL,
+            stdin=stdin_r_fd if stdin_r_fd is not None else subprocess.DEVNULL,
             stdout=log_fd,
             stderr=log_fd,
             close_fds=True,
@@ -311,11 +408,20 @@ async def start_project_run(
     except Exception as e:
         log_fd.write(f"\n[Hub Launch Error]: {e}\n".encode("utf-8"))
         log_fd.close()
-        if stdin_fd is not None:
+        if stdin_r_fd is not None:
             try:
-                os.close(stdin_fd)
+                os.close(stdin_r_fd)
             except OSError:
                 pass
+        if stdin_w_fd is not None:
+            try:
+                os.close(stdin_w_fd)
+            except OSError:
+                pass
+        try:
+            stdin_fifo_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         execute_sql(
             "UPDATE runs SET status = 'failed', finished_at = ?, exit_code = -1, error_summary = ? WHERE id = ?",
             (int(time.time()), str(e), run_id),
@@ -324,9 +430,9 @@ async def start_project_run(
     finally:
         if not log_fd.closed:
             log_fd.close()
-        if stdin_fd is not None:
+        if stdin_r_fd is not None:
             try:
-                os.close(stdin_fd)
+                os.close(stdin_r_fd)
             except OSError:
                 pass
 
@@ -358,6 +464,7 @@ async def start_project_run(
         "started_at": now,
         "log_path": str(log_path),
         "stdin_fifo": str(stdin_fifo_path),
+        "stdin_keepalive_fd": stdin_w_fd,
         "popen": proc,
         "rss_mb": 0.0,
         "cpu_percent": 0.0,
@@ -387,17 +494,27 @@ def send_stdin_to_run(run_id: int, text: str) -> bool:
     except OSError:
         pass
 
+    payload = (clean_line + "\n").encode("utf-8")
+    mem_info = ACTIVE_RUNS.get(run_id)
+    keep_fd = mem_info.get("stdin_keepalive_fd") if mem_info else None
+    if isinstance(keep_fd, int):
+        try:
+            os.write(keep_fd, payload)
+            return True
+        except OSError:
+            pass
+
     if fifo_path.exists():
         try:
             fd = os.open(str(fifo_path), os.O_WRONLY | os.O_NONBLOCK)
             try:
-                os.write(fd, (clean_line + "\n").encode("utf-8"))
+                os.write(fd, payload)
             finally:
                 os.close(fd)
             return True
         except OSError:
-            pass
-    return True
+            return False
+    return False
 
 
 async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str = "") -> bool:
@@ -426,6 +543,7 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
 
     mem_info = ACTIVE_RUNS.pop(run_id, None)
     popen_obj: Optional[subprocess.Popen[bytes]] = mem_info.get("popen") if mem_info else None
+    _cleanup_run_fifo(run_id, mem_info, proj["name"] if proj else None)
 
     if pgid and pgid > 1:
         can_signal = False
@@ -449,6 +567,7 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
             for _ in range(25):
                 if popen_obj is not None:
                     popen_obj.poll()
+                _reap_zombies()
                 alive = _get_pgid_processes(int(pgid))
                 if not alive:
                     break
@@ -463,6 +582,7 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
                 await asyncio.sleep(0.1)
                 if popen_obj is not None:
                     popen_obj.poll()
+                _reap_zombies()
 
     now = int(time.time())
     log_path = row.get("log_path", "")
@@ -534,6 +654,13 @@ def recover_running_processes() -> dict[str, int]:
                 is_alive = False
 
         if is_alive:
+            fifo_path = LOGS_DIR / r["project_name"] / f"stdin_{run_id}.fifo"
+            keep_fd: Optional[int] = None
+            if fifo_path.exists():
+                try:
+                    keep_fd = os.open(str(fifo_path), os.O_WRONLY | os.O_NONBLOCK)
+                except OSError:
+                    keep_fd = None
             ACTIVE_RUNS[run_id] = {
                 "run_id": run_id,
                 "project_id": r["project_id"],
@@ -544,6 +671,8 @@ def recover_running_processes() -> dict[str, int]:
                 "proc_create_time": float(expected_ctime),
                 "started_at": int(r["started_at"]),
                 "log_path": r["log_path"],
+                "stdin_fifo": str(fifo_path),
+                "stdin_keepalive_fd": keep_fd,
                 "popen": None,  # ECHILD-safe: процесс усыновлён init (PID 1), мониторим только через psutil!
                 "rss_mb": 0.0,
                 "cpu_percent": 0.0,
@@ -551,6 +680,7 @@ def recover_running_processes() -> dict[str, int]:
             }
             recovered += 1
         else:
+            _cleanup_run_fifo(run_id, None, r["project_name"])
             execute_sql(
                 """UPDATE runs
                    SET status = 'failed', exit_code = -1, finished_at = ?,
@@ -570,21 +700,27 @@ def recover_running_processes() -> dict[str, int]:
 async def watch_processes_loop() -> None:
     """
     Фоновый сторож процессов (каждые 2 секунды):
+    - Неблокирующе собирает осиротевших зомби (os.waitpid(-1, os.WNOHANG)).
     - Проверяет завершение всех ACTIVE_RUNS.
-    - Считает суммарный RSS и CPU% по всем процессам с os.getpgid(p.pid) == run.pgid.
+    - За ОДИН проход по psutil.process_iter() считает суммарный RSS и CPU% для всех активных PGID.
     - При превышении project.ram_limit_mb убивает группу, ставит killed_oom и шлёт уведомление.
     - При превышении project.timeout_sec для job убивает группу и ставит timeout.
     """
     while True:
         try:
+            _reap_zombies()
             now = int(time.time())
+            target_pgids = {int(info["pgid"]) for info in ACTIVE_RUNS.values() if info.get("pgid")}
+            pgid_metrics_map = collect_all_pgid_metrics(target_pgids)
+
             for run_id, info in list(ACTIVE_RUNS.items()):
                 pid = info["pid"]
                 pgid = info["pgid"]
                 popen_obj: Optional[subprocess.Popen[bytes]] = info.get("popen")
                 project = query_one("SELECT * FROM projects WHERE id = ?", (info["project_id"],))
                 if not project:
-                    ACTIVE_RUNS.pop(run_id, None)
+                    mem_info = ACTIVE_RUNS.pop(run_id, None)
+                    _cleanup_run_fifo(run_id, mem_info)
                     continue
 
                 # 1. Проверка завершения процесса
@@ -621,7 +757,8 @@ async def watch_processes_loop() -> None:
                         except Exception:
                             pass
 
-                    ACTIVE_RUNS.pop(run_id, None)
+                    mem_info = ACTIVE_RUNS.pop(run_id, None)
+                    _cleanup_run_fifo(run_id, mem_info, project["name"])
                     code = exit_code if exit_code is not None else 0
                     final_status = "success" if code == 0 else "failed"
                     tail = _read_log_tail(info["log_path"], max_lines=15)
@@ -652,8 +789,8 @@ async def watch_processes_loop() -> None:
                         await _ON_FINISH_CALLBACK(project, code, final_status, tail)
                     continue
 
-                # 2. Сбор метрик RSS и CPU% по всей группе PGID
-                rss_mb, cpu_pct, _ = get_pgid_metrics(pgid)
+                # 2. Метрики RSS и CPU% по всей группе PGID из единого снимка за тик
+                rss_mb, cpu_pct, _ = pgid_metrics_map.get(int(pgid), (0.0, 0.0, 0))
                 info["rss_mb"] = rss_mb
                 info["cpu_percent"] = cpu_pct
 

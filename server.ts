@@ -29,7 +29,7 @@ function isHubPortListening(): Promise<boolean> {
       {
         hostname: '127.0.0.1',
         port: HUB_BACKEND_PORT,
-        path: '/api/auth/me?autostart=1',
+        path: '/api/auth/me',
         timeout: 800,
       },
       (res) => {
@@ -135,9 +135,14 @@ function callHubBackendJson(
 }
 
 async function getAdminHeaders(): Promise<Record<string, string>> {
-  const authRes = await callHubBackendJson('GET', '/api/auth/me?autostart=1', undefined, {
-    'X-Hub-Auto-Session': '1',
-  });
+  let pw = process.env.HUB_ADMIN_PASSWORD || '';
+  if (!pw) {
+    const initPwPath = path.join(WORKSPACE_ROOT, 'data', 'initial_password');
+    if (fs.existsSync(initPwPath)) {
+      pw = fs.readFileSync(initPwPath, 'utf-8').trim();
+    }
+  }
+  const authRes = await callHubBackendJson('POST', '/api/auth/login', { password: pw });
   return {
     'X-CSRF-Token': authRes.data.csrf_token || '',
     'X-Hub-Session': authRes.data.session_token || '',
@@ -146,7 +151,7 @@ async function getAdminHeaders(): Promise<Record<string, string>> {
 
 async function startServer() {
   ensureOptHubLink();
-  await ensurePythonHubRunning();
+  ensurePythonHubRunning().catch(() => {});
 
   const app = express();
 

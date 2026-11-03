@@ -195,7 +195,8 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
         }
       }
       if (runsRes.ok) {
-        const rList: RunItem[] = await runsRes.json();
+        const rData = await runsRes.json();
+        const rList: RunItem[] = Array.isArray(rData) ? rData : [];
         setRuns(rList);
         const targetRun = proj.active_run_id || (rList[0] ? rList[0].id : null);
         setSelectedRunId(targetRun);
@@ -298,13 +299,15 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
       const res = await apiFetch(`/api/runs/${selectedRunId}/log`);
       if (!res.ok || cancelled) return;
       const data = await res.json();
-      setLogText(data.log || '');
+      const initialLog = data.log || '';
+      const startOffset = typeof data.log_size === 'number' ? data.log_size : 0;
+      setLogText(initialLog);
 
       if (data.status === 'running' || data.status === 'waiting_input') {
         setIsStreaming(true);
-        const es = new EventSource(`/api/runs/${selectedRunId}/stream`);
+        const es = new EventSource(`/api/runs/${selectedRunId}/stream?offset=${startOffset}`);
         sseRef.current = es;
-        let accumulated = '';
+        let accumulated = initialLog;
 
         es.onmessage = (ev) => {
           try {

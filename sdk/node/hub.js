@@ -9,12 +9,13 @@ const fs = require('fs');
 function getApiConfig() {
   const apiUrl = (process.env.HUB_API_URL || 'http://127.0.0.1:8050/internal').replace(/\/+$/, '');
   const runToken = process.env.HUB_RUN_TOKEN || '';
-  return { apiUrl, runToken };
+  const internalToken = process.env.HUB_INTERNAL_TOKEN || '';
+  return { apiUrl, runToken, internalToken };
 }
 
 function requestJson(method, path, payload = null, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
-    const { apiUrl, runToken } = getApiConfig();
+    const { apiUrl, runToken, internalToken } = getApiConfig();
     const target = new URL(`${apiUrl}/${path.replace(/^\/+/, '')}`);
     const bodyStr = payload !== null ? JSON.stringify(payload) : null;
 
@@ -22,6 +23,9 @@ function requestJson(method, path, payload = null, timeoutMs = 15000) {
       'X-Hub-Token': runToken,
       'Accept': 'application/json',
     };
+    if (internalToken) {
+      headers['X-Hub-Internal-Token'] = internalToken;
+    }
     if (bodyStr !== null) {
       headers['Content-Type'] = 'application/json; charset=utf-8';
       headers['Content-Length'] = Buffer.byteLength(bodyStr);

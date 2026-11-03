@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from hub.compat import psutil
-from hub.config import BASE_DIR, LOGS_DIR
-from hub.db import execute_sql, get_all_settings, query_all
+from hub.config import BASE_DIR, DB_PATH, LOGS_DIR
+from hub.db import checkpoint_wal, execute_sql, get_all_settings, query_all
 from hub.notifier import send_notification
 
 _LAST_DISK_WARN_TS: float = 0.0
@@ -28,6 +28,9 @@ def get_disk_status() -> dict[str, Any]:
     total_mb = round(usage.total / (1024 * 1024), 1)
     used_mb = round(usage.used / (1024 * 1024), 1)
 
+    wal_path = DB_PATH.with_name(f"{DB_PATH.name}-wal")
+    wal_size_kb = round((wal_path.stat().st_size if wal_path.exists() else 0) / 1024.0, 1)
+
     state = "ok"
     if free_mb < crit_mb:
         state = "critical"
@@ -43,6 +46,7 @@ def get_disk_status() -> dict[str, Any]:
         "crit_mb": crit_mb,
         "state": state,
         "can_start_runs": free_mb >= crit_mb,
+        "wal_size_kb": wal_size_kb,
     }
 
 
@@ -71,19 +75,25 @@ def rotate_and_prune_logs() -> dict[str, int]:
     rotated_files = 0
     deleted_runs = 0
 
-    # 1. Ротация по размеру файла
+    # 1. Безопасная ротация по размеру файла (copytruncate: ftruncate(0) + запись хвоста без смены inode)
     if LOGS_DIR.exists():
         for log_file in LOGS_DIR.rglob("*.log"):
             try:
                 sz = log_file.stat().st_size
                 if sz > max_bytes:
                     keep_bytes = max_bytes // 2
-                    with open(log_file, "rb") as f:
-                        f.seek(max(0, sz - keep_bytes))
-                        tail = f.read()
-                    header = f"\n--- [HUB LOG ROTATED AT {int(time.time())}: EXCEEDED {max_size_mb} MB] ---\n".encode("utf-8")
-                    with open(log_file, "wb") as f:
-                        f.write(header + tail)
+                    fd = os.open(str(log_file), os.O_RDWR)
+                    try:
+                        os.lseek(fd, max(0, sz - keep_bytes), os.SEEK_SET)
+                        tail = os.read(fd, keep_bytes)
+                        header = (
+                            f"\n--- [HUB LOG ROTATED AT {int(time.time())}: EXCEEDED {max_size_mb} MB (copytruncate)] ---\n"
+                        ).encode("utf-8")
+                        os.ftruncate(fd, 0)
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        os.write(fd, header + tail)
+                    finally:
+                        os.close(fd)
                     rotated_files += 1
             except OSError:
                 continue
@@ -128,9 +138,10 @@ def rotate_and_prune_logs() -> dict[str, int]:
 
 
 async def check_disk_and_maintain() -> None:
-    """Периодическая проверка диска и ротация логов."""
+    """Периодическая проверка диска, ротация логов и чекпоинт SQLite WAL."""
     global _LAST_DISK_WARN_TS
     rotate_and_prune_logs()
+    checkpoint_wal(truncate_threshold_mb=4.0)
     st = get_disk_status()
     now = time.time()
     if st["state"] in ("warning", "critical") and (now - _LAST_DISK_WARN_TS > 3600):
@@ -142,9 +153,12 @@ async def check_disk_and_maintain() -> None:
 
 
 def cleanup_system_caches() -> dict[str, Any]:
-    """Очищает кэш pip, npm и старые логи."""
+    """Очищает кэш pip, npm, старые логи и выполняет чекпоинт SQLite WAL."""
     prune_stats = rotate_and_prune_logs()
-    outputs: list[str] = []
+    wal_stats = checkpoint_wal(truncate_threshold_mb=0.0)
+    outputs: list[str] = [
+        f"SQLite WAL checkpoint ({wal_stats['mode']}): {wal_stats['wal_size_before_kb']} КБ -> {wal_stats['wal_size_after_kb']} КБ"
+    ]
 
     for cmd in (["pip", "cache", "purge"], ["python3", "-m", "pip", "cache", "purge"], ["npm", "cache", "clean", "--force"]):
         try:
@@ -158,6 +172,8 @@ def cleanup_system_caches() -> dict[str, Any]:
         "ok": True,
         "rotated_files": prune_stats["rotated_files"],
         "deleted_runs": prune_stats["deleted_runs"],
+        "wal_checkpoint": wal_stats,
         "cache_commands": outputs or ["Локальные кэши очищены"],
         "disk": get_disk_status(),
     }
+
