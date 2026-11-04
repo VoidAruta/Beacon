@@ -1,69 +1,287 @@
-# Beacon (Hub ControlPanel) v2.2.0 — Autonomous Lightweight Operations Console & Containerless PaaS
+# Beacon
 
-**Beacon** (ранее **Hub ControlPanel**, обратная совместимость с `hub` полностью сохранена) — автономная легковесная веб-панель и супервизор процессов для круглосуточного (24/7) управления ботами, сервисами, веб-API и фоновыми задачами **без использования Docker**, со встроенным **MCP-сервером (`/mcp`)** и **REST API (`/api/v1/`)** для безопасного управления проектами через ИИ-агентов (Claude Code, Cursor, OpenAI Codex, локальные LLM).
+**Beacon** — автономная легковесная панель управления процессами и серверная консоль (Containerless PaaS), созданная для круглосуточного (24/7) запуска и мониторинга ботов, фоновых сервисов, веб-бэкендов и периодических задач **без использования Docker**.
 
-Панель потребляет **< 45–60 МБ ОЗУ** в простое и одинаково стабильно работает в двух целевых средах:
-1. **Домашние серверы на базе Android-смартфонов** (Ubuntu 24.04 в chroot / Termux, `aarch64`, без `systemd` и Docker, с жёсткими лимитами памяти, `aid_inet=3003` и аппаратным контролем температуры батареи).
-2. **Классические Linux-серверы** (бюджетные VPS, Raspberry Pi / Orange Pi, мини-ПК, LXC-контейнеры с `systemd` или без него).
+Панель спроектирована с жёстким бюджетом ресурсов (**< 60 МБ ОЗУ** в простое, нулевая нагрузка на CPU в фоне) и одинаково нативно работает в двух средах:
+
+1. **Классические Linux-серверы** — бюджетные VPS, одноплатные компьютеры (Raspberry Pi, Orange Pi), мини-ПК и LXC-контейнеры (`x86_64` / `aarch64`, с `systemd` или без него).
+2. **Домашние серверы на базе Android-устройств** — Linux в `chroot` / Termux (`aarch64`, без `systemd` и Docker, с жёсткими лимитами памяти, поддержкой сетевых групп ядра Android `aid_inet` / `aid_net_raw` и мониторингом температуры/заряда батареи).
 
 ---
 
-## Быстрый старт и CLI
+## Содержание
+
+- [Ключевые возможности](#ключевые-возможности)
+- [Архитектура супервизора](#архитектура-супервизора)
+- [Быстрый старт](#быстрый-старт)
+- [Команды CLI и режимы запуска](#команды-cli-и-режимы-запуска)
+- [Типы проектов и Config-as-Code (`project.yaml`)](#типы-проектов-и-config-as-code-projectyaml)
+- [Встроенный SDK (`beacon`) для Python и Node.js](#встроенный-sdk-beacon-для-python-и-nodejs)
+- [Доступ для ИИ-агентов (MCP и REST API)](#доступ-для-ии-агентов-mcp-и-rest-api)
+- [Безопасность](#безопасность)
+- [Переменные окружения](#переменные-окружения)
+- [Тестирование](#тестирование)
+
+---
+
+## Ключевые возможности
+
+### 1. Управление процессами без контейнеров
+- **Три класса нагрузок:**
+  - **Services (`service`)** — постоянные демоны, Telegram/Discord-боты, парсеры и воркеры с автоматическим перезапуском при падении и защитой от `crash-loop`.
+  - **Web / API (`web`)** — HTTP-сервисы с передачей `$PORT`, проверкой занятости порта и активными **HTTP/TCP Healthchecks** (авторестарт после серии неудачных проверок).
+  - **Jobs (`job`)** — периодические задачи по расписанию (`interval` / `daily`), запуск по внешнему вебхуку, цепочки запуска (`on_success_project_id`) и контроль **Dead Man's Switch** (`/api/ping/{project}`).
+- **Живая консоль и интерактивный ввод:** потоковое чтение логов в реальном времени (SSE) и отправка команд в `stdin` запущенного процесса через неблокирующий именованный FIFO-канал без разрыва пайпа.
+- **Изоляция окружения каждого проекта:**
+  - Автоматическое создание и подключение `.venv` (с поддержкой `uv` или стандартного `venv`) для Python и `node_modules/.bin` для Node.js.
+  - Изолированные каталоги `<workdir>/.tmp` (`TMPDIR`), `<workdir>/.home` (`HOME`) и `<workdir>/.cache` (`XDG_CACHE_HOME`) внутри директории проекта.
+
+### 2. Встроенный SDK для проектов
+Любой скрипт, запущенный через Beacon, может без установки внешних пакетов импортировать модуль `beacon` (`import beacon` в Python или `const beacon = require('beacon')` в Node.js):
+- отправка уведомлений владельцу в Telegram или через Webhook (`beacon.notify`);
+- чтение секретов и файлов cookies из зашифрованного хранилища (`beacon.secret`);
+- **интерактивный запрос (`beacon.ask`)** — процесс может запросить у владельца одноразовый код (2FA/SMS/капчу) прямо в веб-интерфейсе или Telegram и дождаться ответа без перезапуска скрипта;
+- **персистентное KV-хранилище (`beacon.state`)** — сохранение курсоров, ID последних обработанных сообщений и состояния между перезапусками.
+
+### 3. Безопасное подключение ИИ-агентов (MCP + REST API)
+- Встроенный **MCP-сервер (Streamable HTTP `/mcp`)** и **REST API (`/api/v1/`)** с OpenAPI-спецификацией (`/api/v1/openapi.json`).
+- Позволяет подключить Claude Code, Cursor, Windsurf или собственных агентов для диагностики логов, проверки метрик, чтения кода и деплоя правок.
+- **Токены с гранулярными правами (`beacon_ai_...`)**, привязкой к конкретным проектам, IP-подсетям и лимитам запросов.
+- **Очередь одобрений (Human-in-the-Loop):** изменение файлов, команд запуска или настроек проекта формирует заявку с визуальным `unified diff`, которую владелец подтверждает или отклоняет в один клик.
+- **Защита от Prompt Injection** в логах и мгновенная кнопка **«Пауза ИИ»** (Kill-Switch) в шапке панели.
+
+### 4. Веб-интерфейс и инструментарий
+- Встроенный файловый менеджер, редактор кода с проверкой изменений, просмотрщик таблиц SQLite-баз проекта (Read-Only) и установка зависимостей (`pip` / `uv` / `npm`) в один клик.
+- Хранилище секретов (`env` и файловые секреты с правами `0600`) с жёстким списком доступа (ACL) по проектам и автоматическим редактированием (`[REDACTED]`) секретов в логах.
+- Менеджер веб-авторизаций и импорт/проверка `cookies.txt` / JSON-сессий.
+- Экспорт и импорт проектов в `.zip` вместе с декларативным манифестом `project.yaml`, а также полные бэкапы состояния панели.
+
+---
+
+## Архитектура супервизора
+
+Ядро управления процессами построено вокруг пяти жёстких инвариантов, обеспечивающих выживаемость сервисов на любом оборудовании:
+
+1. **Изоляция групп процессов (`os.setsid` / `os.killpg`):** каждый проект запускается в собственной группе процессов (`PGID`). При остановке сигналами `SIGTERM` → (ожидание 5 с) → `SIGKILL` гарантированно завершается всё дерево дочерних процессов (включая воркеры, браузеры и субпроцессы), не оставляя процессов-зомби.
+2. **Прямая запись логов в файловый дескриптор (`buffering=0`, без `subprocess.PIPE`):** `stdout` и `stderr` дочернего процесса направляются напрямую в открытый файловый дескриптор лога. Благодаря этому **перезапуск или обновление самого Beacon не вызывает `SIGPIPE`** и не убивает работающие боты и веб-сервисы.
+3. **Подхват выживших процессов при старте:** при запуске Beacon сверяет сохранённые в БД `pid` и время старта процесса в ОС (`abs(psutil.Process(pid).create_time() - proc_create_time) < 0.5`) и продолжает мониторинг выживших проектов в `ECHILD`-безопасном режиме.
+4. **Контроль памяти по сумме RSS группы `PGID`:** лимит ОЗУ проверяется за один проход по дереву процессов группы без использования `RLIMIT_AS` (который ломает аллокатор виртуальной памяти V8/Node.js и многопоточный Python на `aarch64`).
+5. **Бережная работа с накопителем (UFS / microSD):** SQLite работает в режиме `WAL` (`synchronous=NORMAL`), чтение хвоста логов выполняется через `os.SEEK_END` за `O(1)`, а ротация логов сжимает старые файлы в `.gz`.
+
+---
+
+## Быстрый старт
+
+### Требования
+- **Python 3.10+** (зависимости: `fastapi`, `uvicorn`, `psutil`, `pydantic`, `python-multipart`)
+- **Node.js 18+** (только на этапе сборки фронтенда; в рантайме не требуется, если не запускаются Node.js-проекты)
+
+### 1. Установка и сборка
 
 ```bash
-# Установка зависимостей и сборка фронтенда
+git clone https://github.com/VoidAruta/Hub-server.git beacon
+cd beacon
+
+# Установка зависимостей, подготовка директорий и сборка статики
 bash scripts/install.sh
+```
 
-# Запуск панели (по умолчанию порт 8050)
+Либо вручную в локальном окружении:
+
+```bash
+pip install -r requirements.txt
+npm install && npm run build
 python3 -m beacon --port 8050
-# Или через совместимый алиас:
-python3 -m hub --port 8050
+```
 
-# Запуск в Safe Mode (без автозапуска сервисов и крон-задач)
-python3 -m beacon --safe-mode
+После запуска панель доступна по адресу `http://127.0.0.1:8050` (или IP вашего сервера в локальной сети).
 
-# Самодиагностика среды и безопасности
+- **Пароль по умолчанию:** `admin`
+- Сразу после первого входа рекомендуется сменить пароль во вкладке **«Настройки»** (минимум 8 символов). Пока установлен пароль `admin`, вход разрешён только из локальной сети (`127.0.0.1` и частные диапазоны `192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`), а модуль ИИ-доступа выключен.
+
+---
+
+## Команды CLI и режимы запуска
+
+```bash
+# Стандартный запуск на указанном хосте и порту
+python3 -m beacon --host 0.0.0.0 --port 8050
+
+# Безопасный режим (Safe Mode): запуск панели БЕЗ автозапуска сервисов и расписаний
+python3 -m beacon --safe-mode --port 8050
+
+# Диагностика окружения, прав, портов, зависимостей и безопасности
 python3 -m beacon doctor
 
-# Мгновенная блокировка/разблокировка ИИ-доступа из терминала
+# Экстренная приостановка и возобновление доступа для ИИ-агентов
 python3 -m beacon ai-pause
 python3 -m beacon ai-resume
 
-# Миграция схемы БД и проверка путей
+# Проверка и применение миграций БД SQLite
 python3 -m beacon migrate
+
+# Вывод шаблона systemd-юнита для Linux-сервера
+python3 -m beacon systemd
+```
+
+### Установка как `systemd`-сервис (Linux VPS / Raspberry Pi)
+
+```bash
+sudo cp scripts/beacon.service /etc/systemd/system/beacon.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now beacon
+sudo systemctl status beacon
+```
+
+### Запуск в Android chroot / Termux (без `systemd`)
+
+```bash
+bash scripts/start-chroot.sh
+```
+
+Скрипт запускает Beacon в фоне через `nohup`, записывает PID в `run/beacon.pid` и проверяет доступность локального сокета.
+
+---
+
+## Типы проектов и Config-as-Code (`project.yaml`)
+
+Настройки каждого проекта автоматически синхронизируются с файлом `project.yaml` в рабочей папке проекта (`projects/<имя>/project.yaml`). При экспорте/импорте архива или переносе папки проект восстанавливает свою конфигурацию:
+
+```yaml
+name: weather-bot
+type: service
+runtime: python
+command: python3 main.py
+autostart: true
+restart_policy: on-failure
+max_retries: 5
+max_ram_mb: 150
+stop_timeout_sec: 5
+schedule_type: manual
+secret_names:
+  - TG_BOT_TOKEN
+  - OPENWEATHER_KEY
 ```
 
 ---
 
-## Безопасность, пароль по умолчанию и права `hub-runner`
+## Встроенный SDK (`beacon`) для Python и Node.js
 
-- **Пароль по умолчанию `admin`:** меняется в разделе «Настройки» (минимум 8 символов для любого нового пароля). На диск пароль никогда не записывается открытым текстом (`data/initial_password` не создаётся). Пока активен пароль `admin`:
-  - В интерфейсе отображается постоянный жёлтый баннер предупреждения, а `beacon doctor` выводит `WARN`.
-  - Вход в панель разрешён **только** с loopback (`127.0.0.0/8`, `::1/128`) и частных сетей RFC1918 (`192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`).
-  - Доступ для ИИ-агентов принудительно заблокирован.
-- **Пользователь запуска процессов (`hub-runner`):** если в системе существует изолированный пользователь `hub-runner` (с группами `3003 aid_inet` и `3004 aid_net_raw` для Android), Beacon по умолчанию запускает дочерние проекты от его имени. При ошибке сброса привилегий в `_preexec` дочерний процесс завершается с кодом `126`.
-  - **Как вернуть `root`:** откройте вкладку **«Настройки»** → **«Расширенные системные настройки»** → выберите `root (полные права)` в поле «Пользователь запуска процессов» и сохраните настройки.
+В каждом запускаемом проекте пути к SDK (`PYTHONPATH` и `NODE_PATH`) подключаются автоматически.
 
----
-
-## Внутренний SDK (`import beacon` / `import hub`)
+### Python (`import beacon`)
 
 ```python
-import beacon  # также поддерживается import hub (с DeprecationWarning)
+import beacon
 
-beacon.notify("Сервис запущен", level="info")
-api_key = beacon.secret("MY_API_KEY")
-code = beacon.ask("Введите код из СМС:", timeout=300)
-cursor = beacon.state.get("cursor", default=0)
-beacon.state.set("cursor", cursor + 1)
+# 1. Уведомление владельцу (level: "info" | "warn" | "error")
+beacon.notify("Парсер успешно запущен", level="info")
+
+# 2. Получение секрета (строкой или путём к защищённому файлу 0600)
+api_key = beacon.secret("OPENWEATHER_KEY")
+cookies_file = beacon.secret("ACCOUNT_COOKIES", as_path=True)
+
+# 3. Запрос интерактивного ввода у владельца (например, код подтверждения / 2FA)
+code = beacon.ask("Введите 6-значный код подтверждения:", timeout=300)
+
+# 4. Уведомление о протухших cookies (переводит сессию в статус "Требуется вход")
+beacon.cookies_expired("ACCOUNT_COOKIES", note="Получен HTTP 403 при запросе профиля")
+
+# 5. Персистентное KV-хранилище состояния проекта
+last_id = beacon.state.get("last_processed_id", default=0)
+beacon.state.set("last_processed_id", last_id + 1)
+beacon.state.delete("temp_flag")
+```
+
+### Node.js (`require('beacon')`)
+
+```javascript
+const beacon = require('beacon');
+
+async function main() {
+  await beacon.notify('Воркер запущен', 'info');
+
+  const token = await beacon.secret('API_TOKEN');
+  const cursor = await beacon.state.get('cursor', 0);
+
+  await beacon.state.set('cursor', cursor + 10);
+}
+
+main();
 ```
 
 ---
 
-## English Overview (EN)
+## Доступ для ИИ-агентов (MCP и REST API)
 
-**Beacon** (formerly **Hub ControlPanel**, fully backward-compatible with `hub`) is a self-hosted, lightweight operations console and containerless process supervisor designed for both **Android chroot / Termux home servers (`aarch64`)** and **standard Linux VPS / SBCs (`x86_64` / `aarch64`)**.
+Beacon включает встроенный сервер **Model Context Protocol (Streamable HTTP)** на эндпоинте `/mcp` и версионированный REST API на `/api/v1/`.
 
-- **< 80 MB Idle RAM Footprint:** Built on FastAPI + Uvicorn + SQLite WAL + React/Vite static bundle with zero external CDN dependencies.
-- **Resilient Process Supervisor:** Process group isolation (`os.setsid` / `os.killpg`), direct unbuffered file-descriptor logging (no `subprocess.PIPE` / no `SIGPIPE` when restarting the panel), surviving process re-adoption across restarts, and single-pass PGID RSS memory enforcement.
-- **Built-in AI Access (`/mcp` & `/api/v1/`):** Native Streamable HTTP Model Context Protocol server with 17 tools, scoped SHA-256 API tokens (`beacon_ai_...`), human-in-the-loop approval queue with unified diffs, prompt-injection log redaction (`<untrusted_content>`), and an instant «Pause AI» kill-switch.
+### Как подключить ИИ-агента:
+1. Смените стандартный пароль администратора во вкладке **«Настройки»**.
+2. Откройте вкладку **«Доступ ИИ»** и включите модуль.
+3. Создайте новый токен (`beacon_ai_...`), выберите разрешённые области прав (`read`, `logs`, `metrics`, `process`, `files:read`, `files:write`, `db:read`, `approvals:request`) и список проектов.
+4. Добавьте MCP-сервер в ваш клиент:
+
+```bash
+# Подключение в Claude Code
+claude mcp add --transport http beacon http://<IP-СЕРВЕРА>:8050/mcp \
+  --header "Authorization: Bearer beacon_ai_ваш_токен"
+```
+
+Либо в `mcp.json` (Cursor / Claude Desktop / другие клиенты):
+
+```json
+{
+  "mcpServers": {
+    "beacon": {
+      "url": "http://127.0.0.1:8050/mcp",
+      "headers": {
+        "Authorization": "Bearer beacon_ai_ваш_токен"
+      }
+    }
+  }
+}
+```
+
+### Основные MCP-инструменты (17 tools)
+- **Наблюдение и диагностика:** `system_overview`, `doctor_report`, `projects_list`, `project_inspect`, `project_metrics`, `logs_tail`, `logs_search`, `project_env_names`, `project_db_tables`, `project_db_query` (строго `SELECT`).
+- **Работа с файлами:** `files_list`, `files_read`, `files_write` (создаёт заявку с unified diff или пишет напрямую согласно политике токена).
+- **Управление жизненным циклом:** `project_action` (`start` / `stop` / `restart`), `project_create`, `project_update_config`, `request_approval`.
+
+Подробная документация по API и областям прав находится в [`docs/AI-ACCESS.md`](docs/AI-ACCESS.md).
+
+---
+
+## Безопасность
+
+- **Сетевой фильтр подсетей (`ALLOWED_SUBNETS`):** доступ к панели по умолчанию разрешён только с loopback и локальных подсетей RFC1918 (`127.0.0.0/8`, `192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`). Подсеть Tailscale/CGNAT (`100.64.0.0/10`) включается отдельной опцией в настройках.
+- **Сброс привилегий (`beacon-runner`):** если в системе создан непривилегированный пользователь `beacon-runner`, дочерние проекты запускаются от его имени (на Android автоматически добавляются дополнительные группы `3003 aid_inet` и `3004 aid_net_raw`). При любой ошибке сброса привилегий в `_preexec` дочерний процесс немедленно завершается с кодом `126`.
+  - *Как переключить обратно на `root`:* откройте **«Настройки» → «Расширенные системные настройки» → «Пользователь запуска процессов»** и выберите `root`.
+- **Защита веб-сессий:** `HttpOnly`, `SameSite=Strict`, проверка `X-CSRF-Token` через `hmac.compare_digest` на всех изменяющих запросах (`POST`, `PUT`, `PATCH`, `DELETE`), одноразовые короткоживущие тикеты для SSE-стримов (`/api/auth/stream_ticket`) и строгий `Content-Security-Policy` без внешних источников.
+- **Безопасная распаковка архивов:** потоковая проверка ZIP-архивов с лимитами на размер архива (`50 МБ`), суммарный распакованный объём (`150 МБ`), число файлов (`1000`), степень сжатия (`50:1`) и блокировкой симлинков и Path Traversal (`..`).
+
+---
+
+## Переменные окружения
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `BEACON_BASE_DIR` | `/opt/hub` (или текущая папка) | Базовая директория данных, логов и проектов |
+| `BEACON_HOST` | `0.0.0.0` | Хост привязки HTTP-сервера |
+| `BEACON_PORT` | `8050` | Порт веб-панели |
+| `BEACON_ADMIN_PASSWORD` | `admin` | Начальный пароль администратора (при инициализации БД) |
+| `BEACON_ALLOWED_SUBNETS` | `127.0.0.0/8,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,::1/128` | Разрешённые подсети для доступа к панели |
+
+---
+
+## Тестирование
+
+В проекте предусмотрены модульные и интеграционные тесты ядра супервизора, механизмов безопасности, SDK, MCP-сервера и фронтенд-логики:
+
+```bash
+# Запуск тестов серверного ядра и безопасности (Python unittest)
+python3 -m unittest discover -s tests -v
+
+# Запуск тестов фронтенд-логики (TypeScript / Node test runner)
+npx tsx --test src/utils/hubLogic.test.ts
+```
