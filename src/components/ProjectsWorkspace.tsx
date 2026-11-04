@@ -1,46 +1,116 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import {
   Play,
   Square,
   RotateCcw,
-  Save,
-  Package,
-  FileCode,
-  Folder,
-  FolderPlus,
-  FilePlus,
   Trash2,
-  Upload,
-  Settings2,
+  Save,
+  FolderCode,
+  FileText,
   Terminal,
   Plus,
-  Check,
   Copy,
-  RefreshCw,
-  Cookie,
   Send,
-  Clock,
-  Bot,
-  Sliders,
-  HardDrive,
+  Settings2,
+  Cookie,
+  Upload,
   AlertTriangle,
-  CheckCircle2,
-  HelpCircle,
+  Bot,
+  Clock,
   Globe,
+  Package,
+  Search,
+  Database,
+  Maximize2,
+  Minimize2,
+  FolderPlus,
+  FilePlus,
+  ChevronDown,
+  ChevronUp,
+  Sparkles,
   ShieldCheck,
-  GitBranch,
-  CornerDownLeft,
-  XCircle,
 } from 'lucide-react';
-import { FileTreeNode, ProjectItem, RunItem, SecretItem, WebAuthSession } from '../types/hub';
-import {
-  describeScheduleHuman,
-  formatBytes,
-  validateCookieEditorJson,
-  validateScheduleConfig,
-} from '../utils/hubLogic';
+import { ProjectItem, RunItem, SecretItem, WorkspaceSubTab, WebAuthSession } from '../types/hub';
+import { formatBytes } from '../utils/hubLogic';
 
-export type WorkspaceSubTab = 'editor' | 'cookies_tg' | 'terminal_git' | 'simple_cfg' | 'advanced_cfg';
+function formatShortTime(ts: number | string | null | undefined): string {
+  if (!ts) return '—';
+  try {
+    const ms = typeof ts === 'number' ? (ts < 1e12 ? ts * 1000 : ts) : Date.parse(ts);
+    const d = new Date(ms);
+    if (isNaN(d.getTime())) return String(ts);
+    return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  } catch {
+    return String(ts);
+  }
+}
+
+function statusBadge(status: string | undefined): { label: string; cls: string } {
+  const s = (status || 'stopped').toLowerCase();
+  if (s === 'running') {
+    return {
+      label: 'РАБОТАЕТ',
+      cls: 'bg-emerald-950/60 text-emerald-300 border border-emerald-800/70',
+    };
+  }
+  if (s === 'waiting_input') {
+    return {
+      label: 'ЖДЁТ ВВОД',
+      cls: 'bg-amber-950/70 text-amber-300 border border-amber-700/70',
+    };
+  }
+  if (s === 'failed' || s === 'crashed' || s === 'killed_oom' || s === 'timeout') {
+    return {
+      label: s === 'killed_oom' ? 'OOM KILL' : s === 'timeout' ? 'ТАЙМАУТ' : 'СБОЙ',
+      cls: 'bg-rose-950/70 text-rose-300 border border-rose-800/70',
+    };
+  }
+  if (s === 'success' || s === 'completed') {
+    return {
+      label: 'УСПЕХ',
+      cls: 'bg-indigo-950/60 text-indigo-300 border border-indigo-800/70',
+    };
+  }
+  return {
+    label: 'ОСТАНОВЛЕН',
+    cls: 'bg-slate-800/80 text-slate-300 border border-slate-700/70',
+  };
+}
+
+interface FlatFileEntry {
+  path: string;
+  name: string;
+  size: number;
+  is_dir: boolean;
+}
+
+function flattenFileTree(nodes: any[]): FlatFileEntry[] {
+  const result: FlatFileEntry[] = [];
+  const walk = (list: any[]) => {
+    for (const item of list || []) {
+      if (item.type === 'dir') {
+        result.push({
+          path: item.path,
+          name: item.name,
+          size: 0,
+          is_dir: true,
+        });
+        if (Array.isArray(item.children)) {
+          walk(item.children);
+        }
+      } else {
+        result.push({
+          path: item.path,
+          name: item.name,
+          size: Number(item.size || 0),
+          is_dir: false,
+        });
+      }
+    }
+  };
+  walk(nodes);
+  return result;
+}
 
 interface ProjectsWorkspaceProps {
   projects: ProjectItem[];
@@ -49,22 +119,23 @@ interface ProjectsWorkspaceProps {
   initialSubTab?: WorkspaceSubTab;
   onSelectProject: (p: ProjectItem) => void;
   onOpenCreateModal: () => void;
+  onImportExamples?: () => Promise<any>;
   onStartProject: (id: number) => Promise<any>;
   onStopProject: (id: number) => Promise<any>;
   onRestartProject: (id: number) => Promise<any>;
-  onUpdateProject: (id: number, payload: Record<string, any>) => Promise<ProjectItem>;
-  onDeleteProject: (id: number) => Promise<void>;
-  onCloneProject?: (id: number) => Promise<void>;
-  onRefreshAll: () => Promise<void>;
+  onUpdateProject: (id: number, data: Record<string, any>) => Promise<any>;
+  onDeleteProject: (id: number) => Promise<any>;
+  onCloneProject?: (id: number) => Promise<any>;
+  onRefreshAll: () => void;
   apiFetch: (path: string, options?: RequestInit) => Promise<Response>;
 }
 
-const SAMPLE_PROJECT_COOKIES = JSON.stringify(
+const DEFAULT_COOKIE_SAMPLE = JSON.stringify(
   [
     {
       domain: '.example.com',
       name: 'session_id',
-      value: 'project_individual_cookie_99182',
+      value: 'paste_real_cookie_here',
       path: '/',
       httpOnly: true,
       secure: true,
@@ -81,6 +152,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   initialSubTab = 'editor',
   onSelectProject,
   onOpenCreateModal,
+  onImportExamples,
   onStartProject,
   onStopProject,
   onRestartProject,
@@ -90,102 +162,199 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   onRefreshAll,
   apiFetch,
 }) => {
-  const activeProj = selectedProject || projects[0] || null;
-
   const [subTab, setSubTab] = useState<WorkspaceSubTab>(initialSubTab);
-  const [fileTree, setFileTree] = useState<FileTreeNode[]>([]);
-  const [currentFilePath, setCurrentFilePath] = useState<string>('');
-  const [fileContent, setFileContent] = useState<string>('');
-  const [fileDirty, setFileDirty] = useState<boolean>(false);
-  const [savingFile, setSavingFile] = useState<boolean>(false);
-  const [saveMessage, setSaveMessage] = useState<string>('');
-  const [showSdkHints, setShowSdkHints] = useState<boolean>(false);
 
+  // Поиск и фильтрация в левой панели проектов
+  const [projectSearch, setProjectSearch] = useState<string>('');
+  const [projectTypeFilter, setProjectTypeFilter] = useState<'all' | 'service' | 'web' | 'job'>('all');
+  const [importingExamples, setImportingExamples] = useState<boolean>(false);
+
+  // Всегда берём актуальный объект проекта из свежего массива projects
+  const activeProj: ProjectItem | null =
+    (selectedProject ? projects.find((p) => p.id === selectedProject.id) : null) ||
+    selectedProject ||
+    projects[0] ||
+    null;
+
+  // Вкладка 1: Файлы и код
+  const [files, setFiles] = useState<FlatFileEntry[]>([]);
+  const [activeFilePath, setActiveFilePath] = useState<string>('');
+  const [fileContent, setFileContent] = useState<string>('');
+  const [fileStatus, setFileStatus] = useState<string>('');
+  const [newFileName, setNewFileName] = useState<string>('');
+  const [newFolderName, setNewFolderName] = useState<string>('');
+  const [fileActionMode, setFileActionMode] = useState<'none' | 'new_file' | 'new_folder'>('none');
+  const [zipUploadStatus, setZipUploadStatus] = useState<string>('');
+  const [showSdkCheatsheet, setShowSdkCheatsheet] = useState<boolean>(false);
+  const zipInputRef = useRef<HTMLInputElement | null>(null);
+
+  // История запусков и живой лог
   const [runs, setRuns] = useState<RunItem[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null);
   const [logText, setLogText] = useState<string>('');
-  const [isStreaming, setIsStreaming] = useState<boolean>(false);
-  const [clearingLogs, setClearingLogs] = useState<boolean>(false);
+  const [stdinInput, setStdinInput] = useState<string>('');
+  const [stdinStatus, setStdinStatus] = useState<string>('');
+  const logBoxRef = useRef<HTMLPreElement | null>(null);
 
-  const [newFileName, setNewFileName] = useState<string>('');
-  const [showNewFileInput, setShowNewFileInput] = useState<'file' | 'dir' | null>(null);
-  const [mobileFilesDrawer, setMobileFilesDrawer] = useState<boolean>(false);
+  // Вкладка 2: Куки, HTTP-проверка и Telegram
+  const [cookieSecretName, setCookieSecretName] = useState<string>('');
+  const [cookieJsonText, setCookieJsonText] = useState<string>('');
+  const [cookieSaveStatus, setCookieSaveStatus] = useState<string>('');
+  const cookieFileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Поля конфигурации проекта (Простые + Расширенные)
-  const [cfgDescription, setCfgDescription] = useState<string>('');
-  const [cfgGroupTag, setCfgGroupTag] = useState<string>('Мои проекты');
-  const [cfgCustomProxy, setCfgCustomProxy] = useState<string>('');
-  const [cfgCmd, setCfgCmd] = useState<string>('');
-  const [cfgType, setCfgType] = useState<'job' | 'service' | 'web'>('service');
-  const [cfgRuntime, setCfgRuntime] = useState<'python' | 'node' | 'bash' | 'custom'>('python');
-  const [cfgUseProxy, setCfgUseProxy] = useState<boolean>(false);
-  const [cfgRamLimit, setCfgRamLimit] = useState<number>(0);
-  const [cfgPort, setCfgPort] = useState<number>(0);
-  const [cfgHealthcheckUrl, setCfgHealthcheckUrl] = useState<string>('');
-  const [cfgHealthcheckInterval, setCfgHealthcheckInterval] = useState<number>(30);
-  const [cfgScheduleType, setCfgScheduleType] = useState<'manual' | 'cron' | 'interval'>('manual');
+  const [tgBotToken, setTgBotToken] = useState<string>('');
+  const [tgChatId, setTgChatId] = useState<string>('');
+  const [tgApiId, setTgApiId] = useState<string>('');
+  const [tgApiHash, setTgApiHash] = useState<string>('');
+  const [customProxyUrl, setCustomProxyUrl] = useState<string>('');
+  const [tgSaveStatus, setTgSaveStatus] = useState<string>('');
+
+  // HTTP-проверка сайта и захват Set-Cookie
+  const [webAuthUrl, setWebAuthUrl] = useState<string>('https://example.com');
+  const [webAuthProxy, setWebAuthProxy] = useState<string>('');
+  const [webAuthSession, setWebAuthSession] = useState<WebAuthSession | null>(null);
+  const [webAuthLoading, setWebAuthLoading] = useState<boolean>(false);
+  const [webAuthStatusMsg, setWebAuthStatusMsg] = useState<string>('');
+
+  // Вкладка 3: Терминал и Git
+  const [cliCommand, setCliCommand] = useState<string>('pip install -r requirements.txt');
+  const [cliRunning, setCliRunning] = useState<boolean>(false);
+  const [cliOutput, setCliOutput] = useState<string>('');
+
+  // Вкладка 4/5: Настройки, Расписание, Лимиты и Секреты
+  const [cfgName, setCfgName] = useState<string>('');
+  const [cfgType, setCfgType] = useState<'service' | 'web' | 'job'>('service');
+  const [cfgRuntime, setCfgRuntime] = useState<string>('python');
+  const [cfgCommand, setCfgCommand] = useState<string>('');
+  const [cfgWorkdir, setCfgWorkdir] = useState<string>('');
+  const [cfgScheduleType, setCfgScheduleType] = useState<string>('manual');
   const [cfgScheduleExpr, setCfgScheduleExpr] = useState<string>('');
-  const [cfgTimeoutSec, setCfgTimeoutSec] = useState<number>(0);
-  const [cfgMaxRetries, setCfgMaxRetries] = useState<number>(0);
-  const [cfgRetryDelay, setCfgRetryDelay] = useState<number>(30);
-  const [cfgAutostart, setCfgAutostart] = useState<boolean>(false);
-  const [cfgRestartPolicy, setCfgRestartPolicy] = useState<'no' | 'on-failure' | 'always'>('on-failure');
-  const [cfgBackoffMin, setCfgBackoffMin] = useState<number>(2);
-  const [cfgBackoffMax, setCfgBackoffMax] = useState<number>(300);
-  const [cfgNotifyError, setCfgNotifyError] = useState<boolean>(true);
-  const [cfgNotifySuccess, setCfgNotifySuccess] = useState<boolean>(false);
-  const [cfgSecrets, setCfgSecrets] = useState<string[]>([]);
+  const [cfgPort, setCfgPort] = useState<string>('');
+  const [cfgHealthcheckUrl, setCfgHealthcheckUrl] = useState<string>('');
+  const [cfgRestartPolicy, setCfgRestartPolicy] = useState<string>('on-failure');
+  const [cfgMaxRetries, setCfgMaxRetries] = useState<number>(3);
+  const [cfgRetryDelaySec, setCfgRetryDelaySec] = useState<number>(30);
+  const [cfgMaxRam, setCfgMaxRam] = useState<number>(128);
+  const [cfgTimeout, setCfgTimeout] = useState<number>(0);
   const [cfgEnvJson, setCfgEnvJson] = useState<string>('{}');
-  const [cfgError, setCfgError] = useState<string>('');
-  const [cfgSaved, setCfgSaved] = useState<boolean>(false);
-  const [copiedWebhook, setCopiedWebhook] = useState<boolean>(false);
+  const [cfgSelectedSecrets, setCfgSelectedSecrets] = useState<string[]>([]);
+  const [cfgStatus, setCfgStatus] = useState<string>('');
 
-  // Нижняя выдвижная консоль (VS Code / Dockge стиль): Логи + hub.state KV + Shell
+  // Конструктор расписания
+  const [schedBuilderMode, setSchedBuilderMode] = useState<'minutes' | 'hours' | 'daily' | 'interval' | 'raw'>('minutes');
+  const [schedEveryMin, setSchedEveryMin] = useState<number>(15);
+  const [schedEveryHour, setSchedEveryHour] = useState<number>(2);
+  const [schedDailyTime, setSchedDailyTime] = useState<string>('09:00');
+  const [schedIntervalSec, setSchedIntervalSec] = useState<number>(300);
+
+  // Нижняя консоль (Лог / hub.state / Быстрый Shell)
   const [bottomConsoleTab, setBottomConsoleTab] = useState<'logs' | 'kv' | 'shell'>('logs');
   const [consoleExpanded, setConsoleExpanded] = useState<boolean>(false);
-  const [logSearch, setLogSearch] = useState<string>('');
+  const [logSearchQuery, setLogSearchQuery] = useState<string>('');
   const [kvItems, setKvItems] = useState<Array<{ key: string; value: any; updated_at: number }>>([]);
   const [newKvKey, setNewKvKey] = useState<string>('');
-  const [newKvValue, setNewKvValue] = useState<string>('');
-
-  // Визуальный конструктор расписания (для простых настроек)
-  const [schedBuilderMode, setSchedBuilderMode] = useState<'manual' | 'minutes' | 'hours' | 'daily' | 'custom'>('minutes');
-  const [schedMinutes, setSchedMinutes] = useState<number>(15);
-  const [schedHours, setSchedHours] = useState<number>(1);
-  const [schedDailyTime, setSchedDailyTime] = useState<string>('09:00');
-
-  // Индивидуальные Куки и данные Telegram самого проекта
-  const [projCookieJson, setProjCookieJson] = useState<string>(SAMPLE_PROJECT_COOKIES);
-  const [projCookieMsg, setProjCookieMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
-  const [projBotToken, setProjBotToken] = useState<string>('');
-  const [projChatId, setProjChatId] = useState<string>('');
-  const [projApiId, setProjApiId] = useState<string>('');
-  const [projApiHash, setProjApiHash] = useState<string>('');
-  const [projTgMsg, setProjTgMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
-
-  // Интерактивная авторизация прямо на сайте (Антибот / Капча / Cloudflare)
-  const [webAuthTargetUrl, setWebAuthTargetUrl] = useState<string>('https://fragment.com/login');
-  const [webAuthSession, setWebAuthSession] = useState<WebAuthSession | null>(null);
-  const [webAuthLogin, setWebAuthLogin] = useState<string>('poco_user@example.com');
-  const [webAuthPassword, setWebAuthPassword] = useState<string>('••••••••••••');
-  const [webAuthOtp, setWebAuthOtp] = useState<string>('');
-  const [webAuthBusy, setWebAuthBusy] = useState<boolean>(false);
-  const [webAuthMsg, setWebAuthMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
-
-  // Терминал проекта (CLI-команды + интерактивный stdin)
-  const [cliCommandInput, setCliCommandInput] = useState<string>('pip install -r requirements.txt');
-  const [cliRunning, setCliRunning] = useState<boolean>(false);
-  const [cliMsg, setCliMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
-  const [stdinText, setStdinText] = useState<string>('');
-  const [stdinSending, setStdinSending] = useState<boolean>(false);
-
-  const logContainerRef = useRef<HTMLPreElement | null>(null);
-  const sseRef = useRef<EventSource | null>(null);
-  const fileUploadInputRef = useRef<HTMLInputElement | null>(null);
+  const [newKvVal, setNewKvVal] = useState<string>('');
+  const [kvStatus, setKvStatus] = useState<string>('');
+  const [venvSetupRunning, setVenvSetupRunning] = useState<boolean>(false);
 
   useEffect(() => {
     setSubTab(initialSubTab);
   }, [initialSubTab]);
+
+  // Инициализация полей при смене выбранного проекта
+  useEffect(() => {
+    if (!activeProj) return;
+    setCfgName(activeProj.name);
+    const pType = (activeProj.type === 'web' ? 'web' : activeProj.type === 'job' ? 'job' : 'service') as
+      | 'service'
+      | 'web'
+      | 'job';
+    setCfgType(pType);
+    setCfgRuntime(activeProj.runtime || 'python');
+    setCfgCommand(activeProj.cmd || 'python3 main.py');
+    setCfgWorkdir(activeProj.workdir);
+    setCfgScheduleType(activeProj.schedule_type || (pType === 'job' ? 'cron' : 'manual'));
+    setCfgScheduleExpr(activeProj.schedule_expr || (pType === 'job' ? '*/15 * * * *' : ''));
+    setCfgPort(activeProj.port ? String(activeProj.port) : '');
+    setCfgHealthcheckUrl(activeProj.healthcheck_url || '');
+    setCfgRestartPolicy(activeProj.restart_policy || 'on-failure');
+    setCfgMaxRetries(activeProj.max_retries ?? 3);
+    setCfgRetryDelaySec(activeProj.retry_delay_sec ?? 30);
+    setCfgMaxRam(activeProj.ram_limit_mb || 128);
+    setCfgTimeout(activeProj.timeout_sec || 0);
+    setCfgEnvJson(activeProj.env_json || '{}');
+
+    const expr = (activeProj.schedule_expr || '').trim();
+    if (activeProj.schedule_type === 'interval') {
+      setSchedBuilderMode('interval');
+      setSchedIntervalSec(Number(expr) || 300);
+    } else if (/^\*\/(\d+) \* \* \* \*$/.test(expr)) {
+      const m = expr.match(/^\*\/(\d+) \* \* \* \*$/);
+      setSchedBuilderMode('minutes');
+      setSchedEveryMin(Number(m?.[1] || 15));
+    } else if (/^0 \*\/(\d+) \* \* \*$/.test(expr)) {
+      const m = expr.match(/^0 \*\/(\d+) \* \* \*$/);
+      setSchedBuilderMode('hours');
+      setSchedEveryHour(Number(m?.[1] || 2));
+    } else if (/^(\d+) (\d+) \* \* \*$/.test(expr)) {
+      const m = expr.match(/^(\d+) (\d+) \* \* \*$/);
+      const mm = String(m?.[1] || '0').padStart(2, '0');
+      const hh = String(m?.[2] || '9').padStart(2, '0');
+      setSchedBuilderMode('daily');
+      setSchedDailyTime(`${hh}:${mm}`);
+    } else if (expr) {
+      setSchedBuilderMode('raw');
+    } else {
+      setSchedBuilderMode('minutes');
+    }
+
+    try {
+      const parsedEnv = JSON.parse(activeProj.env_json || '{}');
+      setTgBotToken(parsedEnv.BOT_TOKEN || parsedEnv.TG_BOT_TOKEN || '');
+      setTgChatId(parsedEnv.TG_CHAT_ID || parsedEnv.ADMIN_CHAT_ID || '');
+      setTgApiId(parsedEnv.TG_API_ID || '');
+      setTgApiHash(parsedEnv.TG_API_HASH || '');
+      setCustomProxyUrl(
+        parsedEnv.CUSTOM_PROXY_URL || parsedEnv.HTTPS_PROXY || parsedEnv.HTTP_PROXY || parsedEnv.ALL_PROXY || ''
+      );
+      if (parsedEnv.CUSTOM_PROXY_URL || parsedEnv.HTTPS_PROXY || parsedEnv.ALL_PROXY) {
+        setWebAuthProxy(parsedEnv.CUSTOM_PROXY_URL || parsedEnv.HTTPS_PROXY || parsedEnv.ALL_PROXY);
+      }
+    } catch {
+      setTgBotToken('');
+      setTgChatId('');
+      setTgApiId('');
+      setTgApiHash('');
+      setCustomProxyUrl('');
+    }
+
+    let secList: string[] = [];
+    try {
+      const parsed = JSON.parse(activeProj.secrets_json || '[]');
+      if (Array.isArray(parsed)) secList = parsed;
+    } catch {
+      secList = [];
+    }
+    setCfgSelectedSecrets(secList);
+
+    const defaultCookieName =
+      activeProj.cookie_status?.secret_name ||
+      secList.find((s) => s.includes('cookie')) ||
+      `${activeProj.name}_cookies`;
+    setCookieSecretName(defaultCookieName);
+    setCookieJsonText('');
+    setCookieSaveStatus('');
+    setTgSaveStatus('');
+    setCfgStatus('');
+    setCliOutput('');
+    setZipUploadStatus('');
+    setWebAuthSession(null);
+    setWebAuthStatusMsg('');
+
+    loadProjectFiles(activeProj.id);
+    loadProjectRuns(activeProj.id);
+    loadProjectKv(activeProj.id);
+  }, [activeProj?.id]);
 
   const loadProjectKv = async (projId: number) => {
     try {
@@ -194,6 +363,8 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
         const data = await res.json();
         if (Array.isArray(data)) {
           setKvItems(data);
+        } else if (data && Array.isArray(data.items)) {
+          setKvItems(data.items);
         }
       }
     } catch {
@@ -201,408 +372,412 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     }
   };
 
-  const handleSaveKvItem = async (e: React.FormEvent) => {
+  const handleSaveKv = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeProj || !newKvKey.trim()) return;
-    let parsedVal: any = newKvValue;
+    setKvStatus('Сохранение...');
+    let parsedValue: any = newKvVal;
     try {
-      parsedVal = JSON.parse(newKvValue);
+      parsedValue = JSON.parse(newKvVal);
     } catch {
-      parsedVal = newKvValue;
+      parsedValue = newKvVal;
     }
     const res = await apiFetch(`/api/projects/${activeProj.id}/kv/${encodeURIComponent(newKvKey.trim())}`, {
       method: 'PUT',
-      body: JSON.stringify({ value: parsedVal }),
+      body: JSON.stringify({ value: parsedValue }),
     });
     if (res.ok) {
       setNewKvKey('');
-      setNewKvValue('');
+      setNewKvVal('');
+      setKvStatus('Ключ сохранён в hub.state');
+      await loadProjectKv(activeProj.id);
+      setTimeout(() => setKvStatus(''), 2500);
+    } else {
+      setKvStatus('Ошибка сохранения ключа');
+    }
+  };
+
+  const handleDeleteKv = async (key: string) => {
+    if (!activeProj) return;
+    const res = await apiFetch(`/api/projects/${activeProj.id}/kv/${encodeURIComponent(key)}`, {
+      method: 'DELETE',
+    });
+    if (res.ok) {
       await loadProjectKv(activeProj.id);
     }
   };
 
-  const handleDeleteKvItem = async (key: string) => {
+  const handleQuickSetupVenv = async () => {
     if (!activeProj) return;
-    await apiFetch(`/api/projects/${activeProj.id}/kv/${encodeURIComponent(key)}`, {
-      method: 'DELETE',
-    });
-    await loadProjectKv(activeProj.id);
-  };
-
-  const loadFilesAndRuns = async (proj: ProjectItem) => {
+    setVenvSetupRunning(true);
+    setBottomConsoleTab('logs');
     try {
-      const [filesRes, runsRes] = await Promise.all([
-        apiFetch(`/api/projects/${proj.id}/files`),
-        apiFetch(`/api/projects/${proj.id}/runs`),
-      ]);
-      await loadProjectKv(proj.id);
-      if (filesRes.ok) {
-        const fData = await filesRes.json();
-        const tree: FileTreeNode[] = fData.tree || [];
-        setFileTree(tree);
-        const firstFile = findFirstFile(tree);
-        if (firstFile) {
-          await openFile(proj.id, firstFile.path);
-        } else {
-          setCurrentFilePath('');
-          setFileContent('');
-        }
-      }
-      if (runsRes.ok) {
-        const rData = await runsRes.json();
-        const rList: RunItem[] = Array.isArray(rData) ? rData : [];
-        setRuns(rList);
-        const targetRun = proj.active_run_id || (rList[0] ? rList[0].id : null);
-        setSelectedRunId(targetRun);
-      }
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
-  const syncConfigState = (proj: ProjectItem) => {
-    const envObj = proj.env || {};
-    setCfgDescription(String(envObj.PROJECT_DESCRIPTION || proj.description || ''));
-    setCfgGroupTag(String(envObj.PROJECT_GROUP || proj.group_tag || 'Мои проекты'));
-    setCfgCustomProxy(String(envObj.CUSTOM_PROXY_URL || proj.custom_proxy || ''));
-    setCfgCmd(proj.cmd);
-    setCfgType(proj.type);
-    setCfgRuntime(proj.runtime);
-    setCfgUseProxy(proj.use_proxy === 1);
-    setCfgRamLimit(proj.ram_limit_mb);
-    setCfgPort(proj.port || 0);
-    setCfgHealthcheckUrl(proj.healthcheck_url || '');
-    setCfgHealthcheckInterval(proj.healthcheck_interval_sec || 30);
-    setCfgScheduleType(proj.schedule_type);
-    setCfgScheduleExpr(proj.schedule_expr);
-    setCfgTimeoutSec(proj.timeout_sec);
-    setCfgMaxRetries(proj.max_retries);
-    setCfgRetryDelay(proj.retry_delay_sec);
-    setCfgAutostart(proj.autostart === 1);
-    setCfgRestartPolicy(proj.restart_policy);
-    setCfgBackoffMin(proj.backoff_min_sec);
-    setCfgBackoffMax(proj.backoff_max_sec);
-    setCfgNotifyError(proj.notify_on_error === 1);
-    setCfgNotifySuccess(proj.notify_on_success === 1);
-    setCfgSecrets(proj.secrets || []);
-    setCfgEnvJson(proj.env_json || '{}');
-    setCfgError('');
-
-    // Синхронизируем поля Telegram этого проекта
-    setProjBotToken(String(envObj.BOT_TOKEN || ''));
-    setProjChatId(String(envObj.TG_CHAT_ID || ''));
-    setProjApiId(String(envObj.TG_API_ID || ''));
-    setProjApiHash(String(envObj.TG_API_HASH || ''));
-    setProjCookieMsg(null);
-    setProjTgMsg(null);
-    setWebAuthSession(null);
-    setWebAuthMsg(null);
-    setCliMsg(null);
-
-    // Определяем пресет конструктора расписания
-    if (proj.schedule_type === 'manual') {
-      setSchedBuilderMode('manual');
-    } else if (proj.schedule_type === 'interval') {
-      const sec = Number(proj.schedule_expr || 0);
-      if (sec >= 3600 && sec % 3600 === 0) {
-        setSchedBuilderMode('hours');
-        setSchedHours(sec / 3600);
-      } else {
-        setSchedBuilderMode('minutes');
-        setSchedMinutes(Math.max(1, Math.round(sec / 60)));
-      }
-    } else if (proj.schedule_type === 'cron') {
-      const parts = (proj.schedule_expr || '').trim().split(/\s+/);
-      if (parts.length === 5 && parts[0].startsWith('*/') && parts[1] === '*') {
-        setSchedBuilderMode('minutes');
-        setSchedMinutes(Number(parts[0].slice(2)) || 15);
-      } else if (parts.length === 5 && /^\d+$/.test(parts[0]) && /^\d+$/.test(parts[1]) && parts[2] === '*') {
-        setSchedBuilderMode('daily');
-        setSchedDailyTime(`${parts[1].padStart(2, '0')}:${parts[0].padStart(2, '0')}`);
-      } else {
-        setSchedBuilderMode('custom');
-      }
-    }
-  };
-
-  useEffect(() => {
-    if (activeProj) {
-      syncConfigState(activeProj);
-      loadFilesAndRuns(activeProj);
-    }
-    return () => {
-      if (sseRef.current) {
-        sseRef.current.close();
-        sseRef.current = null;
-      }
-    };
-  }, [activeProj?.id]);
-
-  // Живой лог (SSE)
-  useEffect(() => {
-    if (sseRef.current) {
-      sseRef.current.close();
-      sseRef.current = null;
-    }
-    if (!selectedRunId) {
-      setLogText('// Запусков пока нет. Нажмите зелёную кнопку «Старт» вверху справа.');
-      setIsStreaming(false);
-      return;
-    }
-
-    let cancelled = false;
-
-    const connectLog = async () => {
-      const res = await apiFetch(`/api/runs/${selectedRunId}/log`);
-      if (!res.ok || cancelled) return;
-      const data = await res.json();
-      const initialLog = data.log || '';
-      const startOffset = typeof data.log_size === 'number' ? data.log_size : 0;
-      setLogText(initialLog);
-
-      if (data.status === 'running' || data.status === 'waiting_input') {
-        setIsStreaming(true);
-        const es = new EventSource(`/api/runs/${selectedRunId}/stream?offset=${startOffset}`);
-        sseRef.current = es;
-        let accumulated = initialLog;
-
-        es.onmessage = (ev) => {
-          try {
-            const msg = JSON.parse(ev.data);
-            if (msg.type === 'log') {
-              accumulated += msg.data;
-              setLogText(accumulated);
-              if (logContainerRef.current) {
-                logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
-              }
-            } else if (msg.type === 'status') {
-              setIsStreaming(false);
-              es.close();
-            }
-          } catch {
-            // ignore keepalive
-          }
-        };
-
-        es.onerror = () => {
-          setIsStreaming(false);
-          es.close();
-        };
-      } else {
-        setIsStreaming(false);
-      }
-    };
-
-    connectLog();
-
-    return () => {
-      cancelled = true;
-      if (sseRef.current) {
-        sseRef.current.close();
-        sseRef.current = null;
-      }
-    };
-  }, [selectedRunId]);
-
-  const findFirstFile = (nodes: FileTreeNode[]): FileTreeNode | null => {
-    for (const n of nodes) {
-      if (n.type === 'file') return n;
-      if (n.children) {
-        const found = findFirstFile(n.children);
-        if (found) return found;
-      }
-    }
-    return null;
-  };
-
-  const openFile = async (projId: number, relPath: string) => {
-    const res = await apiFetch(`/api/projects/${projId}/files/content?path=${encodeURIComponent(relPath)}`);
-    if (res.ok) {
-      const data = await res.json();
-      setCurrentFilePath(relPath);
-      setFileContent(data.content || '');
-      setFileDirty(false);
-      setMobileFilesDrawer(false);
-    }
-  };
-
-  const handleSaveFile = async () => {
-    if (!activeProj || !currentFilePath) return;
-    setSavingFile(true);
-    try {
-      const res = await apiFetch(`/api/projects/${activeProj.id}/files/content`, {
-        method: 'PUT',
-        body: JSON.stringify({ path: currentFilePath, content: fileContent }),
-      });
-      if (res.ok) {
-        setFileDirty(false);
-        setSaveMessage('Файл сохранён');
-        await onRefreshAll();
-        setTimeout(() => setSaveMessage(''), 2000);
-      }
-    } finally {
-      setSavingFile(false);
-    }
-  };
-
-  const handleCreateFileOrDir = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!activeProj || !newFileName.trim() || !showNewFileInput) return;
-    const cleanPath = newFileName.trim();
-    if (showNewFileInput === 'dir') {
-      await apiFetch(`/api/projects/${activeProj.id}/files/mkdir`, {
-        method: 'POST',
-        body: JSON.stringify({ path: cleanPath }),
-      });
-    } else {
-      await apiFetch(`/api/projects/${activeProj.id}/files/content`, {
-        method: 'PUT',
-        body: JSON.stringify({ path: cleanPath, content: '# Новый файл\n' }),
-      });
-    }
-    setNewFileName('');
-    setShowNewFileInput(null);
-    await loadFilesAndRuns(activeProj);
-    await onRefreshAll();
-    if (showNewFileInput === 'file') {
-      await openFile(activeProj.id, cleanPath);
-    }
-  };
-
-  const handleDeleteCurrentFile = async (pathToDelete: string) => {
-    if (!activeProj) return;
-    await apiFetch(`/api/projects/${activeProj.id}/files?path=${encodeURIComponent(pathToDelete)}`, {
-      method: 'DELETE',
-    });
-    await loadFilesAndRuns(activeProj);
-    await onRefreshAll();
-  };
-
-  const handleUploadFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !activeProj) return;
-    const isZip = file.name.toLowerCase().endsWith('.zip');
-    const reader = new FileReader();
-    reader.onload = async () => {
-      const base64 = String(reader.result || '').split(',')[1] || '';
-      await apiFetch(`/api/projects/${activeProj.id}/files/upload`, {
-        method: 'POST',
-        body: JSON.stringify({
-          filename: file.name,
-          content_base64: base64,
-          extract: isZip,
-        }),
-      });
-      await loadFilesAndRuns(activeProj);
-      await onRefreshAll();
-    };
-    reader.readAsDataURL(file);
-    e.target.value = '';
-  };
-
-  const handleClearProjectLogs = async () => {
-    if (!activeProj) return;
-    setClearingLogs(true);
-    try {
-      const res = await apiFetch(`/api/projects/${activeProj.id}/clear_logs`, {
+      const res = await apiFetch(`/api/projects/${activeProj.id}/install_deps`, {
         method: 'POST',
         body: JSON.stringify({}),
       });
-      if (res.ok) {
-        await loadFilesAndRuns(activeProj);
-        await onRefreshAll();
+      const data = await res.json();
+      if (res.ok && data.run) {
+        await loadProjectRuns(activeProj.id);
+        setSelectedRunId(data.run.id);
+        onRefreshAll();
+      } else {
+        setCliOutput(`[ОШИБКА] ${data.detail || 'Не удалось запустить установку зависимостей'}`);
       }
+    } catch (e: any) {
+      setCliOutput(`[ОШИБКА] ${e?.message || 'Сбой запроса'}`);
     } finally {
-      setClearingLogs(false);
+      setVenvSetupRunning(false);
     }
   };
 
-  const handleInstallDeps = async () => {
+  const handleClearOldLogs = async () => {
     if (!activeProj) return;
-    const res = await apiFetch(`/api/projects/${activeProj.id}/install_deps`, {
+    const res = await apiFetch(`/api/projects/${activeProj.id}/clear_logs`, {
       method: 'POST',
       body: JSON.stringify({}),
     });
     if (res.ok) {
-      const data = await res.json();
-      const runsRes = await apiFetch(`/api/projects/${activeProj.id}/runs`);
-      if (runsRes.ok) setRuns(await runsRes.json());
-      if (data.run?.id) setSelectedRunId(data.run.id);
+      await loadProjectRuns(activeProj.id);
+      onRefreshAll();
     }
   };
 
-  const handleStart = async () => {
-    if (!activeProj) return;
-    const res = await onStartProject(activeProj.id);
-    const runsRes = await apiFetch(`/api/projects/${activeProj.id}/runs`);
-    if (runsRes.ok) setRuns(await runsRes.json());
-    if (res?.run?.id) setSelectedRunId(res.run.id);
+  const loadProjectFiles = async (projId: number, preferPath?: string) => {
+    try {
+      const res = await apiFetch(`/api/projects/${projId}/files`);
+      if (res.ok) {
+        const data = await res.json();
+        const list: FlatFileEntry[] = Array.isArray(data.tree)
+          ? flattenFileTree(data.tree)
+          : Array.isArray(data.files)
+          ? data.files
+          : [];
+        setFiles(list);
+        const onlyFiles = list.filter((f) => !f.is_dir);
+        if (preferPath && onlyFiles.some((f) => f.path === preferPath)) {
+          loadSingleFile(projId, preferPath);
+        } else if (onlyFiles.length > 0) {
+          const mainFile =
+            onlyFiles.find((f) => f.path === 'main.py' || f.path === 'index.js' || f.path === 'run.sh') ||
+            onlyFiles[0];
+          loadSingleFile(projId, mainFile.path);
+        } else {
+          setActiveFilePath('');
+          setFileContent('');
+        }
+      }
+    } catch {
+      // ignore
+    }
   };
 
-  const handleStop = async () => {
-    if (!activeProj) return;
-    await onStopProject(activeProj.id);
-    const runsRes = await apiFetch(`/api/projects/${activeProj.id}/runs`);
-    if (runsRes.ok) setRuns(await runsRes.json());
+  const loadSingleFile = async (projId: number, relPath: string) => {
+    setActiveFilePath(relPath);
+    setFileStatus('Загрузка...');
+    try {
+      const res = await apiFetch(`/api/projects/${projId}/files/content?path=${encodeURIComponent(relPath)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setFileContent(data.content || '');
+        setFileStatus('');
+      } else {
+        setFileStatus('Не удалось прочитать файл');
+      }
+    } catch {
+      setFileStatus('Ошибка чтения файла');
+    }
   };
 
-  const handleRestart = async () => {
+  const handleSaveFile = async (pathOverride?: string, contentOverride?: string) => {
     if (!activeProj) return;
-    const res = await onRestartProject(activeProj.id);
-    const runsRes = await apiFetch(`/api/projects/${activeProj.id}/runs`);
-    if (runsRes.ok) setRuns(await runsRes.json());
-    if (res?.run?.id) setSelectedRunId(res.run.id);
+    const targetPath = pathOverride || activeFilePath;
+    const targetContent = contentOverride !== undefined ? contentOverride : fileContent;
+    if (!targetPath) return;
+
+    setFileStatus('Сохранение...');
+    const res = await apiFetch(`/api/projects/${activeProj.id}/files/content`, {
+      method: 'PUT',
+      body: JSON.stringify({ path: targetPath, content: targetContent }),
+    });
+    if (res.ok) {
+      setFileStatus('Сохранено');
+      loadProjectFiles(activeProj.id, targetPath);
+      onRefreshAll();
+      setTimeout(() => setFileStatus(''), 2000);
+    } else {
+      const err = await res.json().catch(() => ({}));
+      setFileStatus(err.detail || 'Ошибка сохранения');
+    }
   };
 
-  // Интерактивная авторизация прямо на сайте (Антибот / Cloudflare / Капча)
+  const handleCreateNewFile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeProj || !newFileName.trim()) return;
+    const clean = newFileName.trim().replace(/^\/+/, '');
+    const initialBody = clean.endsWith('.py')
+      ? '# -*- coding: utf-8 -*-\nfrom hub_sdk import hub\n\nprint("Запуск скрипта...", flush=True)\n'
+      : clean.endsWith('.json')
+      ? '{\n  \n}\n'
+      : '';
+    await handleSaveFile(clean, initialBody);
+    setNewFileName('');
+    setFileActionMode('none');
+  };
+
+  const handleCreateNewFolder = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeProj || !newFolderName.trim()) return;
+    const res = await apiFetch(`/api/projects/${activeProj.id}/files/mkdir`, {
+      method: 'POST',
+      body: JSON.stringify({ path: newFolderName.trim() }),
+    });
+    if (res.ok) {
+      setNewFolderName('');
+      setFileActionMode('none');
+      loadProjectFiles(activeProj.id, activeFilePath);
+    } else {
+      const err = await res.json().catch(() => ({}));
+      setFileStatus(err.detail || 'Ошибка создания папки');
+    }
+  };
+
+  const handleDeleteFile = async (relPath: string) => {
+    if (!activeProj || !relPath) return;
+    const res = await apiFetch(`/api/projects/${activeProj.id}/files?path=${encodeURIComponent(relPath)}`, {
+      method: 'DELETE',
+    });
+    if (res.ok) {
+      setFileStatus(`Удалено: ${relPath}`);
+      loadProjectFiles(activeProj.id);
+      onRefreshAll();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      setFileStatus(err.detail || 'Ошибка удаления');
+    }
+  };
+
+  const handleUploadZip = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !activeProj) return;
+    setZipUploadStatus(`Загрузка ${file.name}...`);
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const rawUrl = String(reader.result || '');
+      const base64Part = rawUrl.includes(',') ? rawUrl.split(',')[1] : rawUrl;
+      const isZip = file.name.toLowerCase().endsWith('.zip');
+      const res = await apiFetch(`/api/projects/${activeProj.id}/files/upload?extract=${isZip ? 'true' : 'false'}`, {
+        method: 'POST',
+        body: JSON.stringify({
+          filename: file.name,
+          content_base64: base64Part,
+          extract: isZip,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setZipUploadStatus(
+          isZip ? `Распаковано файлов: ${data.files?.length || 0}` : `Загружен файл: ${file.name}`
+        );
+        loadProjectFiles(activeProj.id);
+        onRefreshAll();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        setZipUploadStatus(err.detail || 'Ошибка загрузки файла');
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const loadProjectRuns = async (projId: number) => {
+    try {
+      const res = await apiFetch(`/api/projects/${projId}/runs`);
+      if (res.ok) {
+        const list: RunItem[] = await res.json();
+        setRuns(list);
+        if (list.length > 0) {
+          setSelectedRunId((prev) => {
+            if (prev && list.some((r) => r.id === prev)) return prev;
+            return list[0].id;
+          });
+        } else {
+          setSelectedRunId(null);
+          setLogText('Запусков ещё не было. Нажмите «Запустить сейчас» в шапке проекта.');
+        }
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
+    if (!activeProj) return;
+    const timer = setInterval(() => {
+      loadProjectRuns(activeProj.id);
+    }, 2500);
+    return () => clearInterval(timer);
+  }, [activeProj?.id]);
+
+  // Загрузка лога и live-обновление (SSE + надёжный опрос для прокси/iframe)
+  useEffect(() => {
+    if (!selectedRunId) return;
+    let es: EventSource | null = null;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    let cancelled = false;
+
+    const loadLogAndStream = async () => {
+      const res = await apiFetch(`/api/runs/${selectedRunId}/log`);
+      let startOffset = 0;
+      if (res.ok && !cancelled) {
+        const data = await res.json();
+        setLogText(data.log || '');
+        startOffset = Number(data.log_size || 0);
+      }
+
+      if (cancelled) return;
+
+      const sToken = sessionStorage.getItem('hub_session_token') || '';
+      const streamUrl = `/api/runs/${selectedRunId}/stream?offset=${startOffset}${
+        sToken ? `&session_token=${encodeURIComponent(sToken)}` : ''
+      }`;
+      es = new EventSource(streamUrl);
+      es.onmessage = (ev) => {
+        try {
+          const payload = JSON.parse(ev.data);
+          if (payload.type === 'log' && payload.data) {
+            setLogText((prev) => prev + payload.data);
+            if (logBoxRef.current) {
+              logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
+            }
+          } else if (payload.chunk) {
+            setLogText((prev) => prev + payload.chunk);
+          }
+          if (payload.type === 'eof' || payload.eof) {
+            es?.close();
+          }
+        } catch {
+          // ignore
+        }
+      };
+
+      pollTimer = setInterval(async () => {
+        if (cancelled) return;
+        const rRes = await apiFetch(`/api/runs/${selectedRunId}/log`);
+        if (rRes.ok && !cancelled) {
+          const rData = await rRes.json();
+          if (typeof rData.log === 'string') {
+            setLogText(rData.log);
+          }
+        }
+      }, 2000);
+    };
+
+    loadLogAndStream();
+
+    return () => {
+      cancelled = true;
+      if (es) es.close();
+      if (pollTimer) clearInterval(pollTimer);
+    };
+  }, [selectedRunId]);
+
+  const handleSendStdin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedRunId || !stdinInput.trim()) return;
+    const text = stdinInput;
+    setStdinInput('');
+    setStdinStatus('Отправка в FIFO...');
+    const res = await apiFetch(`/api/runs/${selectedRunId}/stdin`, {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    });
+    if (res.ok) {
+      setStdinStatus('Отправлено в stdin процесса');
+      setTimeout(() => setStdinStatus(''), 2500);
+    } else {
+      const err = await res.json().catch(() => ({}));
+      setStdinStatus(err.detail || 'Процесс не ожидает ввод');
+    }
+  };
+
+  // Сохранение кук (и привязка к проекту через /api/projects/{id}/cookies)
+  const handleSaveAndAttachCookies = async () => {
+    if (!activeProj || !cookieSecretName.trim()) return;
+    const raw = cookieJsonText.trim() || DEFAULT_COOKIE_SAMPLE;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) {
+        setCookieSaveStatus('Ошибка: JSON должен быть массивом объектов Cookie [...]');
+        return;
+      }
+    } catch {
+      setCookieSaveStatus('Ошибка: невалидный JSON. Скопируйте экспорт из расширения Cookie-Editor');
+      return;
+    }
+
+    setCookieSaveStatus('Сохранение в сейф и запись cookies.json (0600)...');
+    const res = await apiFetch(`/api/projects/${activeProj.id}/cookies`, {
+      method: 'POST',
+      body: JSON.stringify({
+        name: cookieSecretName.trim(),
+        cookies_json: raw,
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      setCookieSaveStatus(err.detail || 'Ошибка сохранения кук');
+      return;
+    }
+
+    const updatedSecrets = Array.from(new Set([...cfgSelectedSecrets, cookieSecretName.trim()]));
+    setCfgSelectedSecrets(updatedSecrets);
+    onRefreshAll();
+    loadProjectFiles(activeProj.id, activeFilePath);
+    setCookieSaveStatus(`Куки сохранены в «${cookieSecretName.trim()}» (права 0600) и подключены к проекту!`);
+  };
+
+  const handleCookieFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const txt = String(reader.result || '');
+      setCookieJsonText(txt);
+      setCookieSaveStatus(`Загружен файл ${file.name}. Нажмите «Сохранить и привязать куки к проекту».`);
+    };
+    reader.readAsText(file);
+  };
+
+  // HTTP-проверка сайта и захват Set-Cookie через прокси
   const handleStartWebAuth = async () => {
     if (!activeProj) return;
-    setWebAuthBusy(true);
-    setWebAuthMsg(null);
+    setWebAuthLoading(true);
+    setWebAuthStatusMsg('Выполнение HTTP-запроса и захват заголовков Set-Cookie...');
     try {
       const res = await apiFetch(`/api/projects/${activeProj.id}/web_auth/start`, {
         method: 'POST',
-        body: JSON.stringify({ target_url: webAuthTargetUrl }),
-      });
-      const data = await res.json();
-      if (res.ok && data.session) {
-        setWebAuthSession(data.session);
-      } else {
-        setWebAuthMsg({ type: 'err', text: data.detail || 'Не удалось запустить браузерную сессию' });
-      }
-    } finally {
-      setWebAuthBusy(false);
-    }
-  };
-
-  const handleWebAuthAction = async (action: string, extra: Record<string, string> = {}) => {
-    if (!activeProj) return;
-    setWebAuthBusy(true);
-    try {
-      const res = await apiFetch(`/api/projects/${activeProj.id}/web_auth/action`, {
-        method: 'POST',
         body: JSON.stringify({
-          action,
-          login: webAuthLogin,
-          password: webAuthPassword,
-          otp_code: webAuthOtp,
-          url: webAuthTargetUrl,
-          ...extra,
+          url: webAuthUrl.trim(),
+          proxy_mode: webAuthProxy.trim() ? 'custom' : 'system',
+          custom_proxy: webAuthProxy.trim(),
         }),
       });
       const data = await res.json();
       if (res.ok && data.session) {
         setWebAuthSession(data.session);
+        setWebAuthStatusMsg(data.session.last_action || 'Проверка выполнена');
+      } else {
+        setWebAuthStatusMsg(data.detail || 'Ошибка HTTP-проверки');
       }
     } finally {
-      setWebAuthBusy(false);
+      setWebAuthLoading(false);
     }
   };
 
   const handleSaveWebAuth = async () => {
-    if (!activeProj) return;
-    setWebAuthBusy(true);
-    setWebAuthMsg(null);
+    if (!activeProj || !webAuthSession) return;
+    setWebAuthLoading(true);
     try {
       const res = await apiFetch(`/api/projects/${activeProj.id}/web_auth/save`, {
         method: 'POST',
@@ -610,1983 +785,1773 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
       });
       const data = await res.json();
       if (res.ok) {
-        setWebAuthSession(null);
-        await onRefreshAll();
-        await loadFilesAndRuns(activeProj);
-        setWebAuthMsg({
-          type: 'ok',
-          text: `Сессия с сайта (${data.domain}) успешно захвачена! Сохранены cookies.json (${data.cookies_count} шт., включая cf_clearance) + storage_state.json (localStorage). Процесс браузера полностью выгружен из ОЗУ (0 МБ).`,
-        });
+        setCookieJsonText(JSON.stringify(webAuthSession.cookies || [], null, 2));
+        setWebAuthStatusMsg(
+          `Перехваченные куки (${data.cookies_saved || webAuthSession.cookies?.length || 0} шт.) сохранены в «${data.cookie_secret}»!`
+        );
+        onRefreshAll();
       } else {
-        setWebAuthMsg({ type: 'err', text: data.detail || 'Ошибка сохранения сессии' });
+        setWebAuthStatusMsg(data.detail || 'Ошибка сохранения сессии');
       }
     } finally {
-      setWebAuthBusy(false);
+      setWebAuthLoading(false);
     }
   };
 
-  const handleCancelWebAuth = async () => {
+  // Сохранение Telegram-параметров и прокси в ENV проекта
+  const handleSaveTelegramAndProxy = async (e: React.FormEvent) => {
+    e.preventDefault();
     if (!activeProj) return;
-    await apiFetch(`/api/projects/${activeProj.id}/web_auth/cancel`, {
-      method: 'POST',
-      body: JSON.stringify({}),
-    });
-    setWebAuthSession(null);
+    setTgSaveStatus('Сохранение...');
+    let envObj: Record<string, string> = {};
+    try {
+      envObj = JSON.parse(cfgEnvJson || '{}');
+    } catch {
+      envObj = {};
+    }
+
+    if (tgBotToken.trim()) envObj.BOT_TOKEN = tgBotToken.trim();
+    else delete envObj.BOT_TOKEN;
+
+    if (tgChatId.trim()) envObj.TG_CHAT_ID = tgChatId.trim();
+    else delete envObj.TG_CHAT_ID;
+
+    if (tgApiId.trim()) envObj.TG_API_ID = tgApiId.trim();
+    else delete envObj.TG_API_ID;
+
+    if (tgApiHash.trim()) envObj.TG_API_HASH = tgApiHash.trim();
+    else delete envObj.TG_API_HASH;
+
+    if (customProxyUrl.trim()) {
+      envObj.CUSTOM_PROXY_URL = customProxyUrl.trim();
+      envObj.HTTPS_PROXY = customProxyUrl.trim();
+      envObj.HTTP_PROXY = customProxyUrl.trim();
+      envObj.ALL_PROXY = customProxyUrl.trim();
+    } else {
+      delete envObj.CUSTOM_PROXY_URL;
+      delete envObj.HTTPS_PROXY;
+      delete envObj.HTTP_PROXY;
+      delete envObj.ALL_PROXY;
+    }
+
+    const updatedEnvStr = JSON.stringify(envObj, null, 2);
+    setCfgEnvJson(updatedEnvStr);
+    await onUpdateProject(activeProj.id, { env_json: updatedEnvStr });
+    setTgSaveStatus('Настройки Telegram и прокси сохранены в переменные окружения проекта');
   };
 
-  // Выполнение произвольной команды в терминале проекта (git pull, pip install, chmod +x и т.д.)
-  const handleExecCommand = async (cmdToRun?: string) => {
-    if (!activeProj) return;
-    const finalCmd = (cmdToRun ?? cliCommandInput).trim();
-    if (!finalCmd) return;
+  // Терминал и быстрые команды в рабочей папке проекта
+  const runProjectCommand = async (cmd: string) => {
+    if (!activeProj || !cmd.trim()) return;
+    setCliCommand(cmd);
     setCliRunning(true);
-    setCliMsg(null);
+    setCliOutput(`$ ${cmd}\nЗапуск в ${activeProj.workdir}...\n`);
     try {
       const res = await apiFetch(`/api/projects/${activeProj.id}/exec`, {
         method: 'POST',
-        body: JSON.stringify({ command: finalCmd }),
+        body: JSON.stringify({ command: cmd }),
       });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok) {
-        const runsRes = await apiFetch(`/api/projects/${activeProj.id}/runs`);
-        if (runsRes.ok) setRuns(await runsRes.json());
-        if (data.run?.id) setSelectedRunId(data.run.id);
-        await loadFilesAndRuns(activeProj);
-        await onRefreshAll();
-        setCliMsg({
-          type: 'ok',
-          text: `Команда «${finalCmd}» запущена (Запуск #${data.run?.id}). Вывод отображается в живом логе внизу.`,
-        });
+      const data = await res.json();
+      if (res.ok && data.run) {
+        const rId = data.run.id;
+        setSelectedRunId(rId);
+        setCliOutput(
+          `$ ${cmd}\nЗапущен процесс Run #${rId} (PID ${data.run.pid || '—'}). Ожидание вывода...\n`
+        );
+        await new Promise((r) => setTimeout(r, 900));
+        const logRes = await apiFetch(`/api/runs/${rId}/log`);
+        if (logRes.ok) {
+          const logData = await logRes.json();
+          setCliOutput(`$ ${cmd}\n[Run #${rId} · ${logData.status}]\n\n${logData.log || 'Выполнено.'}`);
+          setLogText(logData.log || '');
+        }
+        loadProjectRuns(activeProj.id);
+        loadProjectFiles(activeProj.id, activeFilePath);
+        onRefreshAll();
       } else {
-        setCliMsg({ type: 'err', text: data.detail || 'Ошибка запуска команды' });
+        setCliOutput(`$ ${cmd}\n[Ошибка]: ${data.detail || 'Не удалось выполнить команду'}`);
       }
+    } catch (e: any) {
+      setCliOutput(`$ ${cmd}\n[Ошибка]: ${e?.message || 'Сбой сети'}`);
     } finally {
       setCliRunning(false);
     }
   };
 
-  // Отправка строки в интерактивный stdin запущенного процесса
-  const handleSendStdin = async (e: React.FormEvent) => {
+  const handleExecCommand = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedRunId || !stdinText.trim()) return;
-    setStdinSending(true);
-    try {
-      const res = await apiFetch(`/api/runs/${selectedRunId}/stdin`, {
-        method: 'POST',
-        body: JSON.stringify({ text: stdinText }),
-      });
-      if (res.ok) {
-        setStdinText('');
-        const logRes = await apiFetch(`/api/runs/${selectedRunId}/log`);
-        if (logRes.ok) {
-          const d = await logRes.json();
-          setLogText(d.log || '');
-        }
-      }
-    } finally {
-      setStdinSending(false);
-    }
+    await runProjectCommand(cliCommand);
   };
 
-  // Сохранение индивидуальных куки именно этого проекта
-  const handleSaveProjectCookies = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!activeProj) return;
-    setProjCookieMsg(null);
-    const check = validateCookieEditorJson(projCookieJson);
-    if (!check.valid) {
-      setProjCookieMsg({ type: 'err', text: check.error || 'Ошибка структуры JSON куки' });
-      return;
-    }
-
-    const res = await apiFetch(`/api/projects/${activeProj.id}/cookies`, {
-      method: 'POST',
-      body: JSON.stringify({
-        name: `${activeProj.name}_cookies`,
-        cookies_json: projCookieJson,
-      }),
-    });
-    if (res.ok) {
-      await onRefreshAll();
-      await loadFilesAndRuns(activeProj);
-      setProjCookieMsg({
-        type: 'ok',
-        text: `Индивидуальные куки проекта «${activeProj.name}» сохранены (${check.cookies.length} шт. для ${check.domains.join(', ')}). Доступны в коде через hub.secret("${activeProj.name}_cookies") и в файле cookies.json.`,
-      });
-    } else {
-      const err = await res.json().catch(() => ({}));
-      setProjCookieMsg({ type: 'err', text: err.detail || 'Ошибка сохранения куки проекта' });
-    }
-  };
-
-  // Сохранение индивидуальных настроек Telegram и индивидуального прокси этого проекта
-  const handleSaveProjectTelegram = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!activeProj) return;
-    setProjTgMsg(null);
-    let parsedEnv: Record<string, string> = {};
-    try {
-      parsedEnv = JSON.parse(cfgEnvJson || '{}');
-    } catch {
-      parsedEnv = { ...(activeProj.env || {}) };
-    }
-
-    if (projBotToken.trim()) parsedEnv.BOT_TOKEN = projBotToken.trim();
-    else delete parsedEnv.BOT_TOKEN;
-
-    if (projChatId.trim()) parsedEnv.TG_CHAT_ID = projChatId.trim();
-    else delete parsedEnv.TG_CHAT_ID;
-
-    if (projApiId.trim()) parsedEnv.TG_API_ID = projApiId.trim();
-    else delete parsedEnv.TG_API_ID;
-
-    if (projApiHash.trim()) parsedEnv.TG_API_HASH = projApiHash.trim();
-    else delete parsedEnv.TG_API_HASH;
-
-    if (cfgCustomProxy.trim()) parsedEnv.CUSTOM_PROXY_URL = cfgCustomProxy.trim();
-    else delete parsedEnv.CUSTOM_PROXY_URL;
-
-    try {
-      const updated = await onUpdateProject(activeProj.id, {
-        env: parsedEnv,
-        use_proxy: cfgUseProxy ? 1 : 0,
-      });
-      setCfgEnvJson(updated.env_json);
-      setProjTgMsg({
-        type: 'ok',
-        text: `Индивидуальные данные Telegram и прокси для проекта «${activeProj.name}» сохранены и будут переданы скрипту при запуске.`,
-      });
-    } catch (err: any) {
-      setProjTgMsg({ type: 'err', text: err?.message || 'Ошибка сохранения данных Telegram' });
-    }
-  };
-
-  // Применение конструктора расписания к полям cfgScheduleType / cfgScheduleExpr
-  const applyBuilderToSchedule = (
-    mode: typeof schedBuilderMode,
-    mins: number,
-    hrs: number,
-    daily: string
+  // Переключение режима конструктора расписания
+  const applyScheduleBuilder = (
+    mode: 'minutes' | 'hours' | 'daily' | 'interval' | 'raw',
+    minVal = schedEveryMin,
+    hourVal = schedEveryHour,
+    dailyVal = schedDailyTime,
+    intVal = schedIntervalSec
   ) => {
     setSchedBuilderMode(mode);
-    if (mode === 'manual') {
-      setCfgScheduleType('manual');
-      setCfgScheduleExpr('');
-    } else if (mode === 'minutes') {
-      const m = Math.max(1, Math.min(59, mins || 15));
+    if (mode === 'minutes') {
       setCfgScheduleType('cron');
-      setCfgScheduleExpr(`*/${m} * * * *`);
+      setCfgScheduleExpr(`*/${Math.max(1, minVal)} * * * *`);
     } else if (mode === 'hours') {
-      const h = Math.max(1, Math.min(24, hrs || 1));
-      setCfgScheduleType('interval');
-      setCfgScheduleExpr(String(h * 3600));
-    } else if (mode === 'daily') {
-      const [hhStr, mmStr] = (daily || '09:00').split(':');
-      const hh = Math.max(0, Math.min(23, Number(hhStr) || 9));
-      const mm = Math.max(0, Math.min(59, Number(mmStr) || 0));
       setCfgScheduleType('cron');
-      setCfgScheduleExpr(`${mm} ${hh} * * *`);
-    }
-  };
-
-  const handleSaveProjectConfig = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!activeProj) return;
-    setCfgError('');
-
-    if (cfgType === 'job') {
-      const schedCheck = validateScheduleConfig(cfgScheduleType, cfgScheduleExpr);
-      if (!schedCheck.valid) {
-        setCfgError(schedCheck.error || 'Ошибка расписания');
-        return;
+      setCfgScheduleExpr(`0 */${Math.max(1, hourVal)} * * *`);
+    } else if (mode === 'daily') {
+      const [hh, mm] = (dailyVal || '09:00').split(':');
+      setCfgScheduleType('cron');
+      setCfgScheduleExpr(`${Number(mm || 0)} ${Number(hh || 9)} * * *`);
+    } else if (mode === 'interval') {
+      setCfgScheduleType('interval');
+      setCfgScheduleExpr(String(Math.max(5, intVal)));
+    } else {
+      setCfgScheduleType('cron');
+      if (!cfgScheduleExpr.trim()) {
+        setCfgScheduleExpr('*/15 * * * *');
       }
     }
+  };
 
-    let parsedEnv: Record<string, string> = {};
+  const handleSaveConfig = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeProj) return;
+    setCfgStatus('Сохранение конфигурации...');
     try {
-      parsedEnv = JSON.parse(cfgEnvJson || '{}');
-    } catch {
-      setCfgError('Поле переменных окружения (JSON) содержит синтаксическую ошибку');
-      return;
-    }
+      const parsedPort = cfgPort.trim() ? Number(cfgPort.trim()) : 0;
+      const finalSchedType = cfgType === 'job' ? (cfgScheduleType === 'manual' ? 'cron' : cfgScheduleType) : 'manual';
+      const finalSchedExpr =
+        cfgType === 'job' ? (cfgScheduleExpr.trim() || '*/15 * * * *') : '';
 
-    if (cfgDescription.trim()) {
-      parsedEnv.PROJECT_DESCRIPTION = cfgDescription.trim();
-    }
-    if (cfgGroupTag.trim()) {
-      parsedEnv.PROJECT_GROUP = cfgGroupTag.trim();
-    }
-    if (cfgCustomProxy.trim()) {
-      parsedEnv.CUSTOM_PROXY_URL = cfgCustomProxy.trim();
-    } else {
-      delete parsedEnv.CUSTOM_PROXY_URL;
-    }
-
-    try {
       await onUpdateProject(activeProj.id, {
+        name: cfgName,
         type: cfgType,
         runtime: cfgRuntime,
-        cmd: cfgCmd,
-        use_proxy: cfgUseProxy ? 1 : 0,
-        ram_limit_mb: cfgRamLimit,
-        port: cfgPort,
+        cmd: cfgCommand,
+        workdir: cfgWorkdir,
+        schedule_type: finalSchedType,
+        schedule_expr: finalSchedExpr,
+        port: parsedPort,
         healthcheck_url: cfgHealthcheckUrl.trim(),
-        healthcheck_interval_sec: cfgHealthcheckInterval,
-        schedule_type: cfgScheduleType,
-        schedule_expr: cfgScheduleExpr,
-        timeout_sec: cfgTimeoutSec,
-        max_retries: cfgMaxRetries,
-        retry_delay_sec: cfgRetryDelay,
-        autostart: cfgAutostart ? 1 : 0,
         restart_policy: cfgRestartPolicy,
-        backoff_min_sec: cfgBackoffMin,
-        backoff_max_sec: cfgBackoffMax,
-        notify_on_error: cfgNotifyError ? 1 : 0,
-        notify_on_success: cfgNotifySuccess ? 1 : 0,
-        secrets: cfgSecrets,
-        env: parsedEnv,
+        max_retries: Number(cfgMaxRetries),
+        retry_delay_sec: Number(cfgRetryDelaySec),
+        ram_limit_mb: Number(cfgMaxRam),
+        timeout_sec: Number(cfgTimeout),
+        env_json: cfgEnvJson,
+        secrets_json: JSON.stringify(cfgSelectedSecrets),
       });
-      setCfgSaved(true);
-      setTimeout(() => setCfgSaved(false), 2500);
+      setCfgStatus('Конфигурация проекта успешно сохранена');
+      setTimeout(() => setCfgStatus(''), 3000);
     } catch (err: any) {
-      setCfgError(err?.message || 'Ошибка сохранения настроек проекта');
+      setCfgStatus(err?.message || 'Ошибка сохранения конфигурации');
     }
   };
+
+  const toggleSecretAttachment = (secName: string) => {
+    setCfgSelectedSecrets((prev) =>
+      prev.includes(secName) ? prev.filter((x) => x !== secName) : [...prev, secName]
+    );
+  };
+
+  const insertSdkSnippet = (snippet: string) => {
+    setFileContent((prev) => `${prev.trimEnd()}\n\n${snippet}\n`);
+    setFileStatus('Сниппет вставлен в конец файла — нажмите Сохранить');
+  };
+
+  const filteredProjects = projects.filter((p) => {
+    if (projectTypeFilter !== 'all' && p.type !== projectTypeFilter) return false;
+    if (!projectSearch.trim()) return true;
+    const q = projectSearch.toLowerCase();
+    return (
+      p.name.toLowerCase().includes(q) ||
+      (p.cmd || '').toLowerCase().includes(q) ||
+      (p.runtime || '').toLowerCase().includes(q) ||
+      (p.description || '').toLowerCase().includes(q)
+    );
+  });
 
   if (!activeProj) {
     return (
-      <div className="bg-[#1e293b] border border-slate-800 rounded-xl p-10 text-center">
-        <p className="text-slate-300 text-sm">Проекты ещё не созданы.</p>
-        <button
-          type="button"
-          onClick={onOpenCreateModal}
-          className="mt-4 px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
-        >
-          <Plus className="w-4 h-4" />
-          Создать первый проект
-        </button>
+      <div className="bg-[#111622] border border-[#1e2638] rounded-xl p-10 text-center space-y-4">
+        <FolderCode className="w-10 h-10 text-indigo-400 mx-auto" />
+        <div className="space-y-1">
+          <h3 className="text-base font-bold text-white">Рабочая область проектов пуста</h3>
+          <p className="text-xs text-slate-400 max-w-md mx-auto">
+            Создайте новый проект (бота, веб-сервис с портом $PORT или периодическую задачу) либо загрузите готовые
+            эталонные шаблоны в один клик.
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center justify-center gap-3 pt-1">
+          <button
+            type="button"
+            onClick={onOpenCreateModal}
+            className="px-4 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg inline-flex items-center gap-2 cursor-pointer"
+          >
+            <Plus className="w-4 h-4" />
+            Создать новый проект
+          </button>
+          {onImportExamples && (
+            <button
+              type="button"
+              disabled={importingExamples}
+              onClick={async () => {
+                setImportingExamples(true);
+                try {
+                  await onImportExamples();
+                } finally {
+                  setImportingExamples(false);
+                }
+              }}
+              className="px-4 py-2 text-xs font-semibold text-slate-200 bg-[#0b0f17] hover:bg-slate-800 border border-[#1e2638] rounded-lg inline-flex items-center gap-2 cursor-pointer disabled:opacity-50"
+            >
+              <Sparkles className="w-4 h-4 text-indigo-400" />
+              {importingExamples ? 'Импорт шаблонов...' : 'Импортировать 5 демо-проектов'}
+            </button>
+          )}
+        </div>
       </div>
     );
   }
 
-  const isRunning = activeProj.current_status === 'running' || activeProj.current_status === 'waiting_input';
-  const lineCount = Math.max(1, fileContent.split('\n').length);
-  const cookieStatus = activeProj.cookie_status;
+  const webhookUrl = `${window.location.origin}/api/webhook/${activeProj.webhook_token}`;
+  const isConfigTab = subTab === 'simple_cfg' || subTab === 'advanced_cfg';
 
-  const renderTreeNodes = (nodes: FileTreeNode[], depth = 0) =>
-    nodes.map((node) => (
-      <div key={node.path} style={{ paddingLeft: `${depth * 12}px` }}>
-        {node.type === 'dir' ? (
-          <div>
-            <div className="flex items-center gap-1.5 py-1.5 px-2 text-xs text-slate-300 font-medium">
-              <Folder className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-              <span className="truncate">{node.name}</span>
-            </div>
-            {node.children && renderTreeNodes(node.children, depth + 1)}
-          </div>
-        ) : (
-          <div
-            className={`group flex items-center justify-between py-1.5 px-2 rounded-md text-xs transition-colors ${
-              currentFilePath === node.path
-                ? 'bg-indigo-600/20 text-indigo-300 font-medium'
-                : 'text-slate-300 hover:bg-slate-800/70'
-            }`}
-          >
-            <button
-              type="button"
-              onClick={() => openFile(activeProj.id, node.path)}
-              className="flex items-center gap-1.5 truncate text-left flex-1 cursor-pointer"
-            >
-              <FileCode className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-              <span className="font-mono truncate">{node.name}</span>
-              {node.size !== undefined && (
-                <span className="text-[10px] text-slate-500 font-mono ml-auto pr-1">
-                  {formatBytes(node.size)}
-                </span>
-              )}
-            </button>
-            <button
-              type="button"
-              aria-label={`Удалить файл ${node.name}`}
-              onClick={() => handleDeleteCurrentFile(node.path)}
-              className="opacity-0 group-hover:opacity-100 p-0.5 text-slate-500 hover:text-red-400 transition-opacity cursor-pointer"
-            >
-              <Trash2 className="w-3 h-3" />
-            </button>
-          </div>
-        )}
-      </div>
-    ));
+  const getProjectTypeMeta = (p: ProjectItem) => {
+    if (p.type === 'web') {
+      return {
+        label: p.port ? `Web API :${p.port}` : 'Web API (:PORT)',
+        color: 'text-cyan-300',
+      };
+    }
+    if (p.type === 'service') {
+      return {
+        label: 'Service 24/7',
+        color: 'text-indigo-300',
+      };
+    }
+    return {
+      label: p.schedule_expr
+        ? p.schedule_type === 'interval'
+          ? `Каждые ${p.schedule_expr}с`
+          : `Cron (${p.schedule_expr})`
+        : 'Job / Скрипт',
+      color: 'text-amber-300',
+    };
+  };
+
+  const activeTypeMeta = getProjectTypeMeta(activeProj);
+  const activeStatus = activeProj.current_status || 'stopped';
+  const activeCookieInfo = activeProj.cookie_status;
 
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-12 gap-5">
-      {/* ЛЕВАЯ КОЛОНКА: Наглядный список всех проектов с их типом и занимаемым местом на диске */}
-      <aside className="xl:col-span-3 space-y-3">
-        <div className="bg-[#1e293b] border border-slate-800 rounded-xl p-3.5">
-          <div className="flex items-center justify-between pb-3 mb-2.5 border-b border-slate-800">
-            <div>
-              <h2 className="text-xs font-bold text-white uppercase tracking-wider">Ваши проекты</h2>
-              <p className="text-[11px] text-slate-400">Выберите проект для настройки</p>
-            </div>
+    <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 items-start">
+      {/* Левая колонка: Навигатор проектов */}
+      <aside className="xl:col-span-3 bg-[#111622] border border-[#1e2638] rounded-xl p-3.5 space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <div>
+            <h2 className="text-xs font-bold uppercase tracking-wider text-slate-300">
+              Проекты ({projects.length})
+            </h2>
+            <p className="text-[11px] text-slate-400">Выберите сервис или скрипт</p>
+          </div>
+          <button
+            type="button"
+            onClick={onOpenCreateModal}
+            className="px-2.5 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg inline-flex items-center gap-1 cursor-pointer shrink-0"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            Создать
+          </button>
+        </div>
+
+        {/* Поиск по имени/команде */}
+        <div className="relative">
+          <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+          <input
+            type="text"
+            value={projectSearch}
+            onChange={(e) => setProjectSearch(e.target.value)}
+            placeholder="Фильтр проектов..."
+            className="w-full bg-[#0b0f17] border border-[#1e2638] focus:border-indigo-500 rounded-lg pl-8 pr-3 py-1.5 text-xs text-white placeholder-slate-400 outline-none"
+          />
+        </div>
+
+        {/* Быстрый фильтр по архитектуре */}
+        <div className="grid grid-cols-4 gap-1 bg-[#0b0f17] p-1 rounded-lg border border-[#1e2638]">
+          {[
+            { id: 'all', label: 'Все' },
+            { id: 'service', label: '24/7' },
+            { id: 'web', label: 'Web' },
+            { id: 'job', label: 'Jobs' },
+          ].map((tab) => (
             <button
+              key={tab.id}
               type="button"
-              onClick={onOpenCreateModal}
-              className="px-2.5 py-1.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg inline-flex items-center gap-1 cursor-pointer"
+              onClick={() => setProjectTypeFilter(tab.id as any)}
+              className={`py-1 rounded text-[11px] font-semibold transition-colors cursor-pointer ${
+                projectTypeFilter === tab.id
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
             >
-              <Plus className="w-3.5 h-3.5" />
-              Создать
+              {tab.label}
             </button>
-          </div>
+          ))}
+        </div>
 
-          <div className="space-y-1.5 max-h-[540px] overflow-y-auto pr-0.5">
-            {projects.map((p) => {
-              const selected = p.id === activeProj.id;
-              const running = p.current_status === 'running' || p.current_status === 'waiting_input';
-              return (
-                <button
-                  key={p.id}
-                  type="button"
-                  onClick={() => onSelectProject(p)}
-                  className={`w-full text-left p-2.5 rounded-xl border transition-all cursor-pointer ${
-                    selected
-                      ? 'bg-indigo-600/15 border-indigo-500/60 text-white'
-                      : 'bg-[#0f172a]/70 border-slate-800/80 text-slate-300 hover:border-slate-700'
-                  }`}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-1.5 min-w-0">
-                      <span
-                        className={`w-2 h-2 rounded-full shrink-0 ${
-                          running
-                            ? 'bg-emerald-400'
-                            : p.current_status === 'failed'
-                            ? 'bg-red-400'
-                            : 'bg-slate-600'
-                        }`}
-                      />
-                      <span className="font-semibold text-xs text-white truncate">{p.name}</span>
-                    </div>
-                    <span className="text-[10px] font-mono text-slate-400 shrink-0">
-                      {formatBytes(p.total_size_bytes || 0)}
-                    </span>
-                  </div>
+        {/* Список карточек проектов */}
+        <div className="space-y-1.5 max-h-[600px] overflow-y-auto pr-0.5">
+          {filteredProjects.map((p) => {
+            const isSelected = p.id === activeProj.id;
+            const pStatus = p.current_status || 'stopped';
+            const st = statusBadge(pStatus);
+            const tMeta = getProjectTypeMeta(p);
+            const isRunning = pStatus === 'running' || pStatus === 'waiting_input';
 
-                  <div className="mt-1 flex items-center justify-between text-[11px] text-slate-400">
-                    <span className="inline-flex items-center gap-1">
-                      {p.type === 'service' ? (
-                        <>
-                          <Bot className="w-3 h-3 text-emerald-400" />
-                          <span>Программа 24/7</span>
-                        </>
-                      ) : (
-                        <>
-                          <Clock className="w-3 h-3 text-indigo-400" />
-                          <span>Скрипт по расписанию</span>
-                        </>
-                      )}
-                    </span>
-                    <span className="font-mono">{p.runtime}</span>
+            return (
+              <div
+                key={p.id}
+                onClick={() => onSelectProject(p)}
+                className={`group rounded-lg p-2.5 border transition-all cursor-pointer ${
+                  isSelected
+                    ? 'bg-indigo-950/35 border-indigo-500/60 shadow-sm'
+                    : 'bg-[#0b0f17]/80 border-[#1e2638] hover:border-slate-700 hover:bg-[#0b0f17]'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span
+                      className={`w-2 h-2 rounded-full shrink-0 ${
+                        pStatus === 'running'
+                          ? 'bg-emerald-400'
+                          : pStatus === 'waiting_input'
+                          ? 'bg-amber-400 animate-pulse'
+                          : pStatus === 'failed' || pStatus === 'killed_oom'
+                          ? 'bg-rose-500'
+                          : 'bg-slate-600'
+                      }`}
+                    />
+                    <span className="text-xs font-bold text-white truncate">{p.name}</span>
                   </div>
-                </button>
-              );
-            })}
-          </div>
+                  <span className={`px-1.5 py-0.5 text-[10px] font-mono rounded ${st.cls}`}>{st.label}</span>
+                </div>
+
+                <div className="mt-1.5 flex items-center justify-between text-[11px] font-mono text-slate-400 tabular-nums">
+                  <span className={tMeta.color}>{tMeta.label}</span>
+                  <span>
+                    {isRunning && p.rss_mb ? `${p.rss_mb} МБ · ` : ''}
+                    {formatBytes(p.total_size_bytes || 0)}
+                  </span>
+                </div>
+
+                {p.cookie_status?.has_cookies && p.cookie_status.is_expired === 1 && (
+                  <div className="mt-1.5 text-[10px] font-mono text-rose-300 flex items-center gap-1">
+                    <AlertTriangle className="w-3 h-3 shrink-0" />
+                    <span>Куки истекли — обновите JSON</span>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          {filteredProjects.length === 0 && (
+            <div className="py-6 text-center text-xs text-slate-400">
+              Проекты по фильтру не найдены
+            </div>
+          )}
         </div>
       </aside>
 
-      {/* ПРАВАЯ РАБОЧАЯ ОБЛАСТЬ ПРОЕКТА */}
+      {/* Правая колонка: Рабочее пространство выбранного проекта */}
       <div className="xl:col-span-9 space-y-4">
-        {/* Шапка выбранного проекта: название, описание, занимаемое место на диске и кнопки Старт/Стоп */}
-        <div className="bg-[#1e293b] border border-slate-800 rounded-xl p-4 space-y-3">
-          <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-4">
-            <div className="space-y-1">
-              <div className="flex flex-wrap items-center gap-2">
-                <h2 className="text-lg font-bold text-white">{activeProj.name}</h2>
-                {activeProj.type === 'service' ? (
-                  <span className="px-2 py-0.5 text-xs font-medium bg-emerald-950/70 text-emerald-300 border border-emerald-500/30 rounded-md inline-flex items-center gap-1">
-                    <Bot className="w-3 h-3" />
-                    Постоянная программа 24/7
-                  </span>
-                ) : (
-                  <span className="px-2 py-0.5 text-xs font-medium bg-indigo-950/70 text-indigo-300 border border-indigo-500/30 rounded-md inline-flex items-center gap-1">
-                    <Clock className="w-3 h-3" />
-                    Скрипт по расписанию / кнопке
+        {/* Верхний паспорт и панель управления проектом */}
+        <div className="bg-[#111622] border border-[#1e2638] rounded-xl p-4 space-y-3.5">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="space-y-1 min-w-0">
+              <div className="flex items-center gap-2.5 flex-wrap">
+                <h2 className="text-lg font-bold tracking-tight text-white">{activeProj.name}</h2>
+                <span className={`px-2 py-0.5 text-xs font-mono rounded ${statusBadge(activeStatus).cls}`}>
+                  {statusBadge(activeStatus).label}
+                </span>
+                {activeCookieInfo?.has_cookies && (
+                  <span
+                    className={`px-2 py-0.5 text-[11px] font-mono rounded border ${
+                      activeCookieInfo.is_expired === 0
+                        ? 'bg-emerald-950/50 text-emerald-300 border-emerald-800/60'
+                        : 'bg-rose-950/60 text-rose-300 border-rose-800/70'
+                    }`}
+                  >
+                    Cookies: {activeCookieInfo.is_expired === 0 ? `OK (${formatBytes(activeCookieInfo.size_bytes)})` : 'ИСТЕКЛИ'}
                   </span>
                 )}
-                <span className="text-xs font-mono text-slate-400">
-                  {describeScheduleHuman(
-                    activeProj.type,
-                    activeProj.schedule_type,
-                    activeProj.schedule_expr,
-                    activeProj.restart_policy,
-                    activeProj.autostart
-                  )}
-                </span>
               </div>
 
-              {activeProj.description && (
-                <p className="text-xs text-slate-300">{activeProj.description}</p>
-              )}
-
-              {/* Полоска занимаемого места этим проектом на диске */}
-              <div className="pt-1 flex flex-wrap items-center gap-3 text-xs text-slate-400 font-mono">
-                <span className="inline-flex items-center gap-1 text-slate-200">
-                  <HardDrive className="w-3.5 h-3.5 text-indigo-400" />
-                  Занимает на диске: <strong>{formatBytes(activeProj.total_size_bytes || 0)}</strong>
+              {/* Метаданные одной строкой без визуального мусора */}
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs font-mono text-slate-300 tabular-nums">
+                <span className={activeTypeMeta.color}>{activeTypeMeta.label}</span>
+                <span className="text-slate-600">·</span>
+                <span>{activeProj.runtime}</span>
+                <span className="text-slate-600">·</span>
+                <span className="text-slate-400 truncate max-w-xs" title={activeProj.cmd}>
+                  {activeProj.cmd}
                 </span>
-                <span>
-                  (Файлы проекта: {formatBytes(activeProj.code_size_bytes || 0)} · Логи: {formatBytes(activeProj.logs_size_bytes || 0)})
-                </span>
-                {(activeProj.logs_size_bytes || 0) > 0 && (
-                  <button
-                    type="button"
-                    disabled={clearingLogs}
-                    onClick={handleClearProjectLogs}
-                    className="text-amber-300 hover:underline cursor-pointer"
-                  >
-                    {clearingLogs ? 'Очистка...' : 'Очистить старые логи'}
-                  </button>
+                {activeProj.pid && (
+                  <>
+                    <span className="text-slate-600">·</span>
+                    <span className="text-emerald-300">
+                      PID {activeProj.pid} (PGID {activeProj.pgid || activeProj.pid})
+                    </span>
+                  </>
                 )}
+                <span className="text-slate-600">·</span>
+                <span>
+                  ОЗУ {activeProj.rss_mb || 0}/{activeProj.ram_limit_mb || 128} МБ
+                </span>
+                <span className="text-slate-600">·</span>
+                <span>Диск {formatBytes(activeProj.total_size_bytes || 0)}</span>
               </div>
             </div>
 
-            {/* Кнопки запуска, остановки и установки зависимостей */}
+            {/* Главные кнопки управления процессом */}
             <div className="flex flex-wrap items-center gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={handleInstallDeps}
-                title="Устанавливает библиотеки из requirements.txt или package.json"
-                className="px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg inline-flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
-              >
-                <Package className="w-3.5 h-3.5 text-indigo-400" />
-                Установить зависимости
-              </button>
-
-              {!isRunning ? (
-                <button
-                  type="button"
-                  onClick={handleStart}
-                  className="px-4 py-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg inline-flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
-                >
-                  <Play className="w-3.5 h-3.5" />
-                  Старт
-                </button>
-              ) : (
+              {activeStatus === 'running' || activeStatus === 'waiting_input' ? (
                 <>
                   <button
                     type="button"
-                    onClick={handleStop}
-                    className="px-4 py-1.5 text-xs font-semibold bg-red-600 hover:bg-red-500 text-white rounded-lg inline-flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+                    onClick={() => onStopProject(activeProj.id)}
+                    className="px-3.5 py-2 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-500 rounded-lg inline-flex items-center gap-1.5 cursor-pointer transition-colors"
                   >
                     <Square className="w-3.5 h-3.5" />
-                    Стоп (PGID {activeProj.pgid})
+                    Остановить
                   </button>
                   <button
                     type="button"
-                    onClick={handleRestart}
-                    className="px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg inline-flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+                    onClick={() => onRestartProject(activeProj.id)}
+                    className="px-3 py-2 text-xs font-semibold text-slate-200 bg-[#0b0f17] hover:bg-slate-800 border border-[#1e2638] rounded-lg inline-flex items-center gap-1.5 cursor-pointer transition-colors"
                   >
                     <RotateCcw className="w-3.5 h-3.5" />
                     Рестарт
                   </button>
                 </>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => onStartProject(activeProj.id)}
+                  className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+                >
+                  <Play className="w-3.5 h-3.5" />
+                  Запустить сейчас
+                </button>
               )}
+
+              <button
+                type="button"
+                disabled={venvSetupRunning}
+                onClick={handleQuickSetupVenv}
+                className="px-3 py-2 text-xs font-semibold text-indigo-200 bg-indigo-950/50 hover:bg-indigo-900/60 border border-indigo-800/60 rounded-lg inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                title="Создать изолированный .venv и установить зависимости через uv / pip"
+              >
+                <Package className="w-3.5 h-3.5 text-indigo-400" />
+                {venvSetupRunning ? 'Установка...' : '.venv / Пакеты'}
+              </button>
+
+              {onCloneProject && (
+                <button
+                  type="button"
+                  onClick={() => onCloneProject(activeProj.id)}
+                  className="px-2.5 py-2 text-xs font-medium text-slate-300 hover:text-white bg-[#0b0f17] hover:bg-slate-800 border border-[#1e2638] rounded-lg inline-flex items-center gap-1 cursor-pointer"
+                  title="Создать копию проекта"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  Клон
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => onDeleteProject(activeProj.id)}
+                className="p-2 text-xs text-rose-400 hover:text-rose-200 bg-rose-950/30 hover:bg-rose-900/50 border border-rose-900/50 rounded-lg inline-flex items-center cursor-pointer"
+                title="Удалить проект"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
             </div>
           </div>
 
-          {/* 5 ПОНЯТНЫХ ВКЛАДОК ВНУТРИ ПРОЕКТА */}
-          <div className="pt-2 border-t border-slate-800 flex flex-wrap items-center gap-1.5">
+          {/* Навигация по 4 рабочим вкладкам проекта */}
+          <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-[#1e2638]">
             <button
               type="button"
               onClick={() => setSubTab('editor')}
-              className={`px-3.5 py-2 text-xs font-medium rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer ${
+              className={`px-3.5 py-2 rounded-lg text-xs font-semibold inline-flex items-center gap-2 transition-colors cursor-pointer ${
                 subTab === 'editor'
                   ? 'bg-indigo-600 text-white'
-                  : 'bg-slate-900/70 text-slate-300 hover:text-white'
+                  : 'text-slate-300 hover:bg-[#0b0f17] hover:text-white'
               }`}
             >
-              <FileCode className="w-3.5 h-3.5" />
-              1. Код и Файлы
+              <FileText className="w-3.5 h-3.5" />
+              Код и Файлы ({files.filter((f) => !f.is_dir).length})
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setSubTab('simple_cfg')}
+              className={`px-3.5 py-2 rounded-lg text-xs font-semibold inline-flex items-center gap-2 transition-colors cursor-pointer ${
+                isConfigTab
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-slate-300 hover:bg-[#0b0f17] hover:text-white'
+              }`}
+            >
+              <Settings2 className="w-3.5 h-3.5" />
+              Конфигурация и Расписание
             </button>
 
             <button
               type="button"
               onClick={() => setSubTab('cookies_tg')}
-              className={`px-3.5 py-2 text-xs font-medium rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer ${
+              className={`px-3.5 py-2 rounded-lg text-xs font-semibold inline-flex items-center gap-2 transition-colors cursor-pointer ${
                 subTab === 'cookies_tg'
                   ? 'bg-indigo-600 text-white'
-                  : 'bg-slate-900/70 text-slate-300 hover:text-white'
+                  : 'text-slate-300 hover:bg-[#0b0f17] hover:text-white'
               }`}
             >
-              <Cookie className="w-3.5 h-3.5 text-amber-400" />
-              2. Куки, Вход на сайте и ТГ
-              {cookieStatus?.is_expired === 1 && (
-                <span className="w-2 h-2 rounded-full bg-red-400" />
+              <Cookie className="w-3.5 h-3.5" />
+              Куки, Прокси и Telegram
+              {activeCookieInfo?.has_cookies && activeCookieInfo.is_expired === 1 && (
+                <span className="w-2 h-2 rounded-full bg-rose-400 animate-ping" />
               )}
             </button>
 
             <button
               type="button"
               onClick={() => setSubTab('terminal_git')}
-              className={`px-3.5 py-2 text-xs font-medium rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer ${
+              className={`px-3.5 py-2 rounded-lg text-xs font-semibold inline-flex items-center gap-2 transition-colors cursor-pointer ${
                 subTab === 'terminal_git'
                   ? 'bg-indigo-600 text-white'
-                  : 'bg-slate-900/70 text-slate-300 hover:text-white'
+                  : 'text-slate-300 hover:bg-[#0b0f17] hover:text-white'
               }`}
             >
-              <Terminal className="w-3.5 h-3.5 text-sky-400" />
-              3. Терминал и GitHub (Команды)
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setSubTab('simple_cfg')}
-              className={`px-3.5 py-2 text-xs font-medium rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer ${
-                subTab === 'simple_cfg'
-                  ? 'bg-indigo-600 text-white'
-                  : 'bg-slate-900/70 text-slate-300 hover:text-white'
-              }`}
-            >
-              <Clock className="w-3.5 h-3.5 text-emerald-400" />
-              4. Расписание и Простые настройки
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setSubTab('advanced_cfg')}
-              className={`px-3.5 py-2 text-xs font-medium rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer ${
-                subTab === 'advanced_cfg'
-                  ? 'bg-indigo-600 text-white'
-                  : 'bg-slate-900/70 text-slate-300 hover:text-white'
-              }`}
-            >
-              <Sliders className="w-3.5 h-3.5 text-slate-400" />
-              5. Расширенные (Для профи)
+              <Terminal className="w-3.5 h-3.5" />
+              Терминал, Git и История ({runs.length})
             </button>
           </div>
         </div>
 
-        {/* СОДЕРЖИМОЕ ВКЛАДКИ 1: КОД И ФАЙЛЫ */}
+        {/* ==================== ВКЛАДКА 1: КОД И ФАЙЛЫ (IDE SPLIT VIEW) ==================== */}
         {subTab === 'editor' && (
-          <div className="space-y-3">
-            {/* Шпаргалка для начинающих по вызову куки и СМС в коде */}
-            <div className="bg-[#1e293b] border border-slate-800 rounded-xl px-4 py-2.5">
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-slate-300 flex items-center gap-1.5">
-                  <HelpCircle className="w-3.5 h-3.5 text-indigo-400" />
-                  Подсказка: как в коде этого проекта прочитать его индивидуальные куки, storage_state.json или запросить СМС-код?
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setShowSdkHints(!showSdkHints)}
-                  className="text-xs text-indigo-400 hover:underline cursor-pointer"
-                >
-                  {showSdkHints ? 'Скрыть примеры кода' : 'Показать готовые строчки кода'}
-                </button>
-              </div>
-              {showSdkHints && (
-                <div className="mt-2.5 pt-2.5 border-t border-slate-800 grid grid-cols-1 md:grid-cols-3 gap-3 text-[11px] font-mono text-slate-200">
-                  <div className="p-2.5 bg-[#0f172a] rounded-lg border border-slate-800">
-                    <div className="text-indigo-300 font-sans font-semibold mb-1">1. Прочитать куки или сессию сайта:</div>
-                    <code>import hub</code>
-                    <br />
-                    <code>cookies = hub.secret("{activeProj.name}_cookies")</code>
-                  </div>
-                  <div className="p-2.5 bg-[#0f172a] rounded-lg border border-slate-800">
-                    <div className="text-amber-300 font-sans font-semibold mb-1">2. Спросить код из СМС / 2FA:</div>
-                    <code>code = hub.ask("Код из СМС?")</code>
-                    <br />
-                    <span className="text-slate-400 font-sans">Скрипт подождёт ваш ответ в баннере</span>
-                  </div>
-                  <div className="p-2.5 bg-[#0f172a] rounded-lg border border-slate-800">
-                    <div className="text-emerald-300 font-sans font-semibold mb-1">3. Сообщить, что куки слетели:</div>
-                    <code>hub.cookies_expired("{activeProj.name}_cookies")</code>
-                    <br />
-                    <span className="text-slate-400 font-sans">Включит красный баннер замены куки</span>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-              <div className="lg:hidden flex items-center justify-between bg-[#1e293b] border border-slate-800 rounded-xl px-4 py-2.5">
-                <span className="text-xs font-mono text-slate-300">
-                  Файл: <strong className="text-white">{currentFilePath || 'не выбран'}</strong>
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setMobileFilesDrawer(!mobileFilesDrawer)}
-                  className="px-3 py-1.5 text-xs font-medium bg-slate-800 text-indigo-300 rounded-lg cursor-pointer"
-                >
-                  {mobileFilesDrawer ? 'Скрыть файлы' : 'Файлы проекта'}
-                </button>
-              </div>
-
-              <aside
-                aria-label="Файловый менеджер проекта"
-                className={`lg:col-span-3 bg-[#1e293b] border border-slate-800 rounded-xl p-3 flex flex-col justify-between ${
-                  mobileFilesDrawer ? 'block' : 'hidden lg:flex'
-                }`}
-              >
-                <div>
-                  <div className="flex items-center justify-between pb-2.5 mb-2 border-b border-slate-800">
-                    <span className="text-xs font-semibold text-slate-200">Файлы в папке</span>
+          <div className="bg-[#111622] border border-[#1e2638] rounded-xl overflow-hidden">
+            <div className="grid grid-cols-1 lg:grid-cols-12 min-h-[430px]">
+              {/* Левая боковая панель проводника файлов */}
+              <div className="lg:col-span-4 xl:col-span-3 border-b lg:border-b-0 lg:border-r border-[#1e2638] bg-[#0b0f17]/60 p-3 flex flex-col justify-between gap-3">
+                <div className="space-y-2.5">
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                      Файлы рабочей папки
+                    </span>
                     <div className="flex items-center gap-1">
                       <button
                         type="button"
-                        title="Создать файл"
-                        aria-label="Создать файл"
-                        onClick={() => setShowNewFileInput('file')}
-                        className="p-1 text-slate-400 hover:text-white rounded cursor-pointer"
+                        onClick={() => setFileActionMode(fileActionMode === 'new_file' ? 'none' : 'new_file')}
+                        className="p-1.5 text-slate-300 hover:text-white bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded cursor-pointer"
+                        title="Новый файл"
                       >
-                        <FilePlus className="w-3.5 h-3.5" />
+                        <FilePlus className="w-3.5 h-3.5 text-indigo-400" />
                       </button>
                       <button
                         type="button"
-                        title="Создать папку"
-                        aria-label="Создать папку"
-                        onClick={() => setShowNewFileInput('dir')}
-                        className="p-1 text-slate-400 hover:text-white rounded cursor-pointer"
+                        onClick={() => setFileActionMode(fileActionMode === 'new_folder' ? 'none' : 'new_folder')}
+                        className="p-1.5 text-slate-300 hover:text-white bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded cursor-pointer"
+                        title="Новая папка"
                       >
-                        <FolderPlus className="w-3.5 h-3.5" />
-                      </button>
-                      <button
-                        type="button"
-                        title="Загрузить файл или .zip архив (распакуется сам)"
-                        aria-label="Загрузить файл или архив"
-                        onClick={() => fileUploadInputRef.current?.click()}
-                        className="p-1 text-slate-400 hover:text-white rounded cursor-pointer"
-                      >
-                        <Upload className="w-3.5 h-3.5" />
+                        <FolderPlus className="w-3.5 h-3.5 text-amber-400" />
                       </button>
                       <input
-                        ref={fileUploadInputRef}
+                        ref={zipInputRef}
                         type="file"
-                        onChange={handleUploadFile}
+                        accept=".zip,.py,.js,.json,.txt,.sh"
+                        onChange={handleUploadZip}
                         className="hidden"
                       />
+                      <button
+                        type="button"
+                        onClick={() => zipInputRef.current?.click()}
+                        className="p-1.5 text-slate-300 hover:text-white bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded cursor-pointer"
+                        title="Загрузить файл или распаковать .zip архив в проект"
+                      >
+                        <Upload className="w-3.5 h-3.5 text-emerald-400" />
+                      </button>
                     </div>
                   </div>
 
-                  {showNewFileInput && (
-                    <form onSubmit={handleCreateFileOrDir} className="mb-2 flex items-center gap-1.5">
+                  {fileActionMode === 'new_file' && (
+                    <form onSubmit={handleCreateNewFile} className="flex items-center gap-1.5">
                       <input
                         type="text"
-                        placeholder={showNewFileInput === 'dir' ? 'Имя папки...' : 'script.py'}
                         value={newFileName}
                         onChange={(e) => setNewFileName(e.target.value)}
-                        className="flex-1 bg-[#0f172a] border border-slate-700 rounded px-2 py-1 text-xs font-mono text-white"
+                        placeholder="script.py или utils/db.py"
+                        autoFocus
+                        className="flex-1 bg-[#0b0f17] border border-indigo-500/70 rounded px-2 py-1 text-xs font-mono text-white outline-none"
                       />
                       <button
                         type="submit"
-                        className="px-2 py-1 text-xs bg-indigo-600 text-white rounded cursor-pointer"
+                        className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-semibold cursor-pointer"
                       >
-                        OK
+                        ОК
                       </button>
                     </form>
                   )}
 
-                  <div className="space-y-0.5 max-h-[340px] overflow-y-auto">
-                    {renderTreeNodes(fileTree)}
-                  </div>
-                </div>
+                  {fileActionMode === 'new_folder' && (
+                    <form onSubmit={handleCreateNewFolder} className="flex items-center gap-1.5">
+                      <input
+                        type="text"
+                        value={newFolderName}
+                        onChange={(e) => setNewFolderName(e.target.value)}
+                        placeholder="Имя папки (modules)"
+                        autoFocus
+                        className="flex-1 bg-[#0b0f17] border border-amber-500/70 rounded px-2 py-1 text-xs font-mono text-white outline-none"
+                      />
+                      <button
+                        type="submit"
+                        className="px-2.5 py-1 bg-amber-600 hover:bg-amber-500 text-white rounded text-xs font-semibold cursor-pointer"
+                      >
+                        ОК
+                      </button>
+                    </form>
+                  )}
 
-                <div className="pt-3 mt-3 border-t border-slate-800 text-[11px] text-slate-400 font-mono truncate">
-                  {activeProj.workdir}
-                </div>
-              </aside>
+                  {zipUploadStatus && (
+                    <div className="text-[11px] font-mono text-emerald-300 bg-emerald-950/30 border border-emerald-800/50 rounded px-2 py-1">
+                      {zipUploadStatus}
+                    </div>
+                  )}
 
-              <div className="lg:col-span-9 bg-[#1e293b] border border-slate-800 rounded-xl flex flex-col overflow-hidden">
-                <div className="px-4 py-2.5 border-b border-slate-800 bg-slate-900/60 flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 text-xs font-mono">
-                    <FileCode className="w-4 h-4 text-indigo-400" />
-                    <span className="text-white font-medium">{currentFilePath || 'Выберите файл слева'}</span>
-                    {fileDirty && <span className="text-amber-400">(не сохранено)</span>}
-                    {saveMessage && <span className="text-emerald-400">· {saveMessage}</span>}
-                  </div>
-
-                  <button
-                    type="button"
-                    disabled={!currentFilePath || savingFile}
-                    onClick={handleSaveFile}
-                    className="px-3 py-1 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <Save className="w-3.5 h-3.5" />
-                    {savingFile ? 'Сохранение...' : 'Сохранить файл (Ctrl+S)'}
-                  </button>
-                </div>
-
-                <div className="relative flex min-h-[300px] max-h-[400px] bg-[#0b1120] overflow-hidden">
-                  <div
-                    aria-hidden="true"
-                    className="w-12 py-3 px-2 bg-[#080d18] border-r border-slate-800/80 text-right font-mono text-xs text-slate-500 select-none overflow-hidden leading-[1.6]"
-                  >
-                    {Array.from({ length: lineCount }, (_, i) => (
-                      <div key={i + 1}>{i + 1}</div>
-                    ))}
-                  </div>
-                  <textarea
-                    aria-label="Редактор кода файла"
-                    spellCheck={false}
-                    value={fileContent}
-                    onChange={(e) => {
-                      setFileContent(e.target.value);
-                      setFileDirty(true);
-                    }}
-                    onKeyDown={(e) => {
-                      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-                        e.preventDefault();
-                        handleSaveFile();
-                      } else if (e.key === 'Tab') {
-                        e.preventDefault();
-                        const start = e.currentTarget.selectionStart;
-                        const end = e.currentTarget.selectionEnd;
-                        const updated = fileContent.substring(0, start) + '    ' + fileContent.substring(end);
-                        setFileContent(updated);
-                        setFileDirty(true);
+                  <div className="space-y-1 max-h-[340px] overflow-y-auto pr-0.5">
+                    {files.map((f) => {
+                      if (f.is_dir) {
+                        return (
+                          <div
+                            key={f.path}
+                            className="flex items-center justify-between px-2 py-1 text-xs font-mono text-amber-300/90"
+                          >
+                            <span>📁 {f.path}/</span>
+                          </div>
+                        );
                       }
-                    }}
-                    className="flex-1 p-3 bg-transparent text-slate-100 font-mono text-xs leading-[1.6] focus:outline-none resize-none overflow-auto"
-                  />
+                      const active = f.path === activeFilePath;
+                      return (
+                        <div
+                          key={f.path}
+                          onClick={() => loadSingleFile(activeProj.id, f.path)}
+                          className={`group flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg text-xs font-mono transition-colors cursor-pointer ${
+                            active
+                              ? 'bg-indigo-600 text-white font-semibold'
+                              : 'text-slate-300 hover:bg-[#111622] hover:text-white'
+                          }`}
+                        >
+                          <span className="truncate">{f.path}</span>
+                          <span
+                            className={`text-[10px] shrink-0 ${
+                              active ? 'text-indigo-100' : 'text-slate-400'
+                            }`}
+                          >
+                            {formatBytes(f.size || 0)}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="pt-2 border-t border-[#1e2638] text-[11px] font-mono text-slate-400 truncate" title={activeProj.workdir}>
+                  Путь: {activeProj.workdir}
                 </div>
               </div>
-            </div>
-          </div>
-        )}
 
-        {/* СОДЕРЖИМОЕ ВКЛАДКИ 2: ИНТЕРАКТИВНЫЙ ВХОД НА САЙТЕ (АНТИБОТ/КАПЧА), КУКИ И TELEGRAM ЭТОГО СКРИПТА */}
-        {subTab === 'cookies_tg' && (
-          <div className="space-y-4">
-            {/* БЛОК 0: Интерактивная авторизация прямо на сайте (когда обычные куки не подходят из-за Cloudflare / Антибот / TLS-отпечатка) */}
-            <div className="bg-[#1e293b] border border-indigo-500/40 rounded-xl p-5 space-y-4">
-              <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 pb-3 border-b border-slate-800">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <Globe className="w-4 h-4 text-indigo-400" />
-                    <h3 className="text-sm font-bold text-white">
-                      Авторизация прямо на сайте (Обход Антибот / Cloudflare Turnstile / Капчи)
-                    </h3>
-                    {activeProj.has_browser_profile && (
-                      <span className="px-2 py-0.5 text-[11px] font-semibold bg-emerald-950/70 text-emerald-300 border border-emerald-500/40 rounded">
-                        Профиль storage_state.json сохранён
-                      </span>
+              {/* Правая часть: Редактор кода */}
+              <div className="lg:col-span-8 xl:col-span-9 flex flex-col justify-between bg-[#070b14]">
+                <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 bg-[#111622] border-b border-[#1e2638]">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-xs font-mono font-bold text-indigo-300 truncate">
+                      {activeFilePath || 'Файл не выбран'}
+                    </span>
+                    {fileStatus && (
+                      <span className="text-[11px] font-mono text-emerald-400">{fileStatus}</span>
                     )}
                   </div>
-                  <p className="text-xs text-slate-300 mt-1">
-                    Если куки, скопированные с домашнего ПК, не работают из-за привязки к IP/User-Agent или защиты Cloudflare — откройте временный браузер прямо с Poco X3 NFC (через его прокси), пройдите капчу/вход и нажмите <strong>«Сохранить сессию»</strong>. После сохранения браузер полностью выгружается из ОЗУ (<code className="font-mono text-emerald-300">0 МБ</code>).
-                  </p>
-                </div>
-              </div>
 
-              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
-                <input
-                  type="text"
-                  value={webAuthTargetUrl}
-                  onChange={(e) => setWebAuthTargetUrl(e.target.value)}
-                  placeholder="https://fragment.com/login или адрес нужного сайта"
-                  className="flex-1 bg-[#0f172a] border border-slate-700 rounded-lg px-3.5 py-2 text-xs font-mono text-white"
-                />
-                {!webAuthSession ? (
-                  <button
-                    type="button"
-                    disabled={webAuthBusy}
-                    onClick={handleStartWebAuth}
-                    className="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
-                  >
-                    <Globe className="w-3.5 h-3.5" />
-                    {webAuthBusy ? 'Запуск браузера...' : 'Открыть сайт для входа'}
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={handleCancelWebAuth}
-                    className="px-3.5 py-2 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
-                  >
-                    <XCircle className="w-3.5 h-3.5 text-red-400" />
-                    Закрыть без сохранения
-                  </button>
-                )}
-              </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowSdkCheatsheet((v) => !v)}
+                      className="px-2.5 py-1 text-[11px] font-mono text-slate-300 hover:text-white bg-[#0b0f17] border border-[#1e2638] rounded-lg inline-flex items-center gap-1 cursor-pointer"
+                    >
+                      <span>Шпаргалка SDK</span>
+                      {showSdkCheatsheet ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                    </button>
 
-              {webAuthMsg && (
-                <div
-                  className={`p-3 rounded-lg text-xs ${
-                    webAuthMsg.type === 'ok'
-                      ? 'bg-emerald-950/60 border border-emerald-500/40 text-emerald-200'
-                      : 'bg-red-950/60 border border-red-500/40 text-red-200'
-                  }`}
-                >
-                  {webAuthMsg.text}
-                </div>
-              )}
-
-              {webAuthSession && (
-                <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 pt-2">
-                  <div className="lg:col-span-7 bg-[#0b1120] border border-slate-800 rounded-xl p-3 space-y-2">
-                    <div className="flex items-center justify-between text-[11px] font-mono text-slate-400">
-                      <span>Интерактивное окно браузера ({webAuthSession.domain})</span>
-                      <span className="text-indigo-300">Прокси: {webAuthSession.proxy}</span>
-                    </div>
-                    <img
-                      src={webAuthSession.screenshot_data_uri}
-                      alt="Окно авторизации на сайте"
-                      className="w-full rounded-lg border border-slate-800"
-                    />
-                  </div>
-
-                  <div className="lg:col-span-5 bg-[#0f172a] border border-slate-800 rounded-xl p-4 flex flex-col justify-between space-y-3">
-                    <div className="space-y-3">
-                      <div className="text-xs font-bold text-white flex items-center gap-1.5">
-                        <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                        Шаги прохождения защиты и входа:
-                      </div>
-
+                    {activeFilePath && files.filter((x) => !x.is_dir).length > 1 && (
                       <button
                         type="button"
-                        disabled={webAuthBusy}
-                        onClick={() => handleWebAuthAction('solve_cloudflare')}
-                        className="w-full py-2 px-3 text-xs font-semibold bg-amber-600/20 hover:bg-amber-600/30 text-amber-200 border border-amber-500/40 rounded-lg text-left cursor-pointer"
+                        onClick={() => handleDeleteFile(activeFilePath)}
+                        className="px-2.5 py-1 text-[11px] font-medium text-rose-300 hover:text-white bg-rose-950/40 hover:bg-rose-900/60 border border-rose-800/50 rounded-lg inline-flex items-center gap-1 cursor-pointer"
                       >
-                        1. Пройти антибот-проверку Cloudflare Turnstile (клик по чекбоксу)
+                        <Trash2 className="w-3 h-3" />
+                        Удалить файл
                       </button>
-
-                      <div className="space-y-2 pt-1 border-t border-slate-800">
-                        <label className="block text-[11px] text-slate-300">
-                          2. Введите логин / пароль на сайте (если требуется):
-                        </label>
-                        <input
-                          type="text"
-                          value={webAuthLogin}
-                          onChange={(e) => setWebAuthLogin(e.target.value)}
-                          placeholder="Логин / Email / Телефон"
-                          className="w-full bg-[#1e293b] border border-slate-700 rounded px-2.5 py-1.5 text-xs text-white"
-                        />
-                        <input
-                          type="password"
-                          value={webAuthPassword}
-                          onChange={(e) => setWebAuthPassword(e.target.value)}
-                          placeholder="Пароль"
-                          className="w-full bg-[#1e293b] border border-slate-700 rounded px-2.5 py-1.5 text-xs text-white"
-                        />
-                        <button
-                          type="button"
-                          disabled={webAuthBusy}
-                          onClick={() => handleWebAuthAction('fill_credentials')}
-                          className="w-full py-1.5 px-3 text-xs font-medium bg-indigo-600/30 hover:bg-indigo-600/40 text-indigo-200 border border-indigo-500/40 rounded-lg cursor-pointer"
-                        >
-                          Отправить логин и пароль на страницу
-                        </button>
-                      </div>
-
-                      <div className="flex items-center gap-2 pt-1 border-t border-slate-800">
-                        <input
-                          type="text"
-                          value={webAuthOtp}
-                          onChange={(e) => setWebAuthOtp(e.target.value)}
-                          placeholder="Код 2FA / СМС (если сайт спросил)"
-                          className="flex-1 bg-[#1e293b] border border-slate-700 rounded px-2.5 py-1.5 text-xs font-mono text-white"
-                        />
-                        <button
-                          type="button"
-                          disabled={webAuthBusy || !webAuthOtp.trim()}
-                          onClick={() => handleWebAuthAction('submit_2fa')}
-                          className="px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg cursor-pointer"
-                        >
-                          Ввести 2FA
-                        </button>
-                      </div>
-                    </div>
+                    )}
 
                     <button
                       type="button"
-                      disabled={webAuthBusy}
-                      onClick={handleSaveWebAuth}
-                      className="w-full py-2.5 px-3 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                      onClick={() => handleSaveFile()}
+                      disabled={!activeFilePath}
+                      className="px-3.5 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
                     >
-                      <CheckCircle2 className="w-4 h-4" />
-                      Сохранить сессию (cookies.json + storage_state.json) и закрыть браузер
+                      <Save className="w-3.5 h-3.5" />
+                      Сохранить (Ctrl+S)
                     </button>
                   </div>
                 </div>
-              )}
-            </div>
 
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              {/* Блок А: Индивидуальные Куки этого проекта */}
-              <form
-                onSubmit={handleSaveProjectCookies}
-                className="bg-[#1e293b] border border-slate-800 rounded-xl p-5 space-y-4"
-              >
-                <div className="flex items-start justify-between gap-2 pb-3 border-b border-slate-800">
-                  <div>
-                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                      <Cookie className="w-4 h-4 text-amber-400" />
-                      Ручная вставка JSON-куки проекта «{activeProj.name}»
-                    </h3>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                      Привязаны конкретно к этому скрипту (<code className="font-mono text-indigo-300">{activeProj.name}_cookies</code>) и лежат в <code className="font-mono text-slate-300">cookies.json</code> в папке проекта.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="p-3 bg-slate-900/70 border border-slate-800 rounded-lg text-xs flex items-center justify-between">
-                  <div>
-                    <span className="text-slate-400">Текущий статус куки скрипта: </span>
-                    {cookieStatus?.has_cookies ? (
-                      cookieStatus.is_expired ? (
-                        <span className="text-red-400 font-semibold inline-flex items-center gap-1">
-                          <AlertTriangle className="w-3.5 h-3.5" />
-                          Истекли ({cookieStatus.expired_note || 'нужна замена'})
-                        </span>
-                      ) : (
-                        <span className="text-emerald-400 font-semibold">
-                          Загружены и актуальны ({formatBytes(cookieStatus.size_bytes)})
-                        </span>
-                      )
-                    ) : (
-                      <span className="text-slate-400">Ещё не загружены</span>
-                    )}
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs text-slate-300 mb-1">
-                    Вставьте JSON-массив куки из браузерного расширения <strong>Cookie-Editor</strong>:
-                  </label>
-                  <textarea
-                    rows={6}
-                    value={projCookieJson}
-                    onChange={(e) => setProjCookieJson(e.target.value)}
-                    className="w-full bg-[#0f172a] border border-slate-700 rounded-lg p-3 font-mono text-xs text-white"
-                  />
-                </div>
-
-                {projCookieMsg && (
-                  <div
-                    className={`p-3 rounded-lg text-xs ${
-                      projCookieMsg.type === 'ok'
-                        ? 'bg-emerald-950/60 border border-emerald-500/40 text-emerald-200'
-                        : 'bg-red-950/60 border border-red-500/40 text-red-200'
-                    }`}
-                  >
-                    {projCookieMsg.text}
+                {/* Выдвижная панель быстрых сниппетов Hub SDK */}
+                {showSdkCheatsheet && (
+                  <div className="px-4 py-2.5 bg-[#0b0f17] border-b border-[#1e2638] flex flex-wrap items-center gap-2">
+                    <span className="text-[11px] text-slate-400 mr-1">Вставить в код:</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        insertSdkSnippet(
+                          'from hub_sdk import hub\n# Чтение и запись постоянного состояния (переживает рестарты):\ncount = int(hub.state.get("processed_count", 0))\nhub.state.set("processed_count", count + 1)'
+                        )
+                      }
+                      className="px-2 py-1 text-[11px] font-mono bg-[#111622] hover:bg-slate-800 text-indigo-300 border border-[#1e2638] rounded cursor-pointer"
+                    >
+                      + hub.state.get/set
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        insertSdkSnippet(
+                          'from hub_sdk import hub\n# Запрос 2FA/капчи в веб-панель и Telegram:\ncode = hub.ask("Введите код подтверждения из SMS:")\nprint("Получен код:", code, flush=True)'
+                        )
+                      }
+                      className="px-2 py-1 text-[11px] font-mono bg-[#111622] hover:bg-slate-800 text-amber-300 border border-[#1e2638] rounded cursor-pointer"
+                    >
+                      + hub.ask("2FA код")
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        insertSdkSnippet(
+                          `from hub_sdk import hub\nimport json\n# Чтение кук из защищённого хранилища:\nraw_cookies = hub.secret("${cookieSecretName || activeProj.name + '_cookies'}")\ncookies = json.loads(raw_cookies) if raw_cookies else []`
+                        )
+                      }
+                      className="px-2 py-1 text-[11px] font-mono bg-[#111622] hover:bg-slate-800 text-emerald-300 border border-[#1e2638] rounded cursor-pointer"
+                    >
+                      + hub.secret("cookies")
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        insertSdkSnippet(
+                          `from hub_sdk import hub\n# Сигнал об истечении кук (вызовет тревогу в панели):\nhub.cookies_expired("${cookieSecretName || activeProj.name + '_cookies'}", "Требуется свежий экспорт Cookie-Editor")`
+                        )
+                      }
+                      className="px-2 py-1 text-[11px] font-mono bg-[#111622] hover:bg-slate-800 text-rose-300 border border-[#1e2638] rounded cursor-pointer"
+                    >
+                      + hub.cookies_expired()
+                    </button>
                   </div>
                 )}
 
-                <button
-                  type="submit"
-                  className="w-full py-2.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
-                >
-                  <CheckCircle2 className="w-4 h-4" />
-                  Сохранить индивидуальные куки для «{activeProj.name}»
-                </button>
-              </form>
-
-              {/* Блок Б: Индивидуальные данные Telegram и прокси этого скрипта */}
-              <form
-                onSubmit={handleSaveProjectTelegram}
-                className="bg-[#1e293b] border border-slate-800 rounded-xl p-5 space-y-4"
-              >
-                <div className="pb-3 border-b border-slate-800">
-                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                    <Send className="w-4 h-4 text-indigo-400" />
-                    Данные Telegram и Прокси для скрипта «{activeProj.name}»
-                  </h3>
-                  <p className="text-xs text-slate-400 mt-0.5">
-                    Используются <strong>внутри кода вашего проекта</strong>. Системный бот для уведомлений самой панели настраивается отдельно во вкладке «Настройки».
-                  </p>
-                </div>
-
-                <div className="space-y-3">
-                  <div>
-                    <label className="block text-xs text-slate-300 mb-1">
-                      Токен бота этого проекта (<code className="font-mono text-indigo-300">BOT_TOKEN</code> из @BotFather)
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="7100223344:AAH..."
-                      value={projBotToken}
-                      onChange={(e) => setProjBotToken(e.target.value)}
-                      className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-xs text-slate-300 mb-1">
-                      ID чата / администратора (<code className="font-mono text-indigo-300">TG_CHAT_ID</code>)
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="Например: 192837465"
-                      value={projChatId}
-                      onChange={(e) => setProjChatId(e.target.value)}
-                      className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                    />
-                  </div>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
-                    <div>
-                      <label className="block text-xs text-slate-300 mb-1">
-                        API_ID (для Telethon / Pyrogram)
-                      </label>
-                      <input
-                        type="text"
-                        placeholder="2040"
-                        value={projApiId}
-                        onChange={(e) => setProjApiId(e.target.value)}
-                        className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs text-slate-300 mb-1">
-                        API_HASH (my.telegram.org)
-                      </label>
-                      <input
-                        type="text"
-                        placeholder="b18441a1ff..."
-                        value={projApiHash}
-                        onChange={(e) => setProjApiHash(e.target.value)}
-                        className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="pt-1 space-y-2">
-                    <label className="flex items-center gap-2 text-xs text-slate-200 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={cfgUseProxy}
-                        onChange={(e) => setCfgUseProxy(e.target.checked)}
-                      />
-                      Включить системный прокси <code className="font-mono text-indigo-300">127.0.0.1:10808</code>
-                    </label>
-
-                    <div>
-                      <label className="block text-[11px] text-slate-400 mb-1">
-                        Или укажите индивидуальный прокси только для этого проекта (мульти-аккаунт):
-                      </label>
-                      <input
-                        type="text"
-                        placeholder="socks5://user:pass@ip:port (пусто = 127.0.0.1:10808)"
-                        value={cfgCustomProxy}
-                        onChange={(e) => setCfgCustomProxy(e.target.value)}
-                        className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                {projTgMsg && (
-                  <div
-                    className={`p-3 rounded-lg text-xs ${
-                      projTgMsg.type === 'ok'
-                        ? 'bg-emerald-950/60 border border-emerald-500/40 text-emerald-200'
-                        : 'bg-red-950/60 border border-red-500/40 text-red-200'
-                    }`}
-                  >
-                    {projTgMsg.text}
-                  </div>
-                )}
-
-                <button
-                  type="submit"
-                  className="w-full py-2.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer"
-                >
-                  <Save className="w-4 h-4" />
-                  Сохранить данные Telegram и Прокси для проекта
-                </button>
-              </form>
+                <textarea
+                  value={fileContent}
+                  onChange={(e) => setFileContent(e.target.value)}
+                  onKeyDown={(e) => {
+                    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+                      e.preventDefault();
+                      handleSaveFile();
+                    }
+                  }}
+                  spellCheck={false}
+                  placeholder="Выберите файл слева для редактирования..."
+                  className="w-full flex-1 min-h-[370px] bg-[#070b14] p-4 text-xs font-mono text-slate-100 leading-relaxed focus:outline-none resize-y"
+                />
+              </div>
             </div>
           </div>
         )}
 
-        {/* СОДЕРЖИМОЕ ВКЛАДКИ 3: ТЕРМИНАЛ ПРОЕКТА И GITHUB (ВЫПОЛНЕНИЕ КОМАНД И ЗАВИСИМОСТЕЙ) */}
-        {subTab === 'terminal_git' && (
-          <div className="bg-[#1e293b] border border-slate-800 rounded-xl p-5 space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-800">
+        {/* ==================== ВКЛАДКА 2: КОНФИГУРАЦИЯ И РАСПИСАНИЕ ==================== */}
+        {isConfigTab && (
+          <form
+            onSubmit={handleSaveConfig}
+            className="bg-[#111622] border border-[#1e2638] rounded-xl p-5 space-y-5"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#1e2638] pb-3.5">
               <div>
-                <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                  <Terminal className="w-4 h-4 text-sky-400" />
-                  Встроенный терминал папки проекта «{activeProj.name}»
+                <h3 className="text-sm font-bold text-white">
+                  Архитектура, команда запуска, расписание и супервизор
                 </h3>
-                <p className="text-xs text-slate-400 mt-0.5">
-                  Выполняйте любые команды установки из инструкций GitHub (<code className="font-mono text-slate-300">git pull</code>, <code className="font-mono text-slate-300">pip install</code>, <code className="font-mono text-slate-300">npm install</code>, <code className="font-mono text-slate-300">python3 main.py --setup</code>) прямо в рабочей папке <code className="font-mono text-indigo-300">{activeProj.workdir}</code>.
+                <p className="text-xs text-slate-400">
+                  Настройте режим работы ({cfgType === 'service' ? 'Service 24/7' : cfgType === 'web' ? 'Web / API (:PORT)' : 'Scheduled Job'}), изоляцию и лимиты ОЗУ
                 </p>
               </div>
-              {activeProj.git_repo_url && (
-                <span className="px-2.5 py-1 text-xs font-mono bg-sky-950/60 text-sky-300 border border-sky-500/30 rounded-lg inline-flex items-center gap-1.5 shrink-0">
-                  <GitBranch className="w-3.5 h-3.5" />
-                  {activeProj.git_repo_url}
-                </span>
-              )}
+
+              <div className="flex items-center gap-2">
+                <div className="flex items-center bg-[#0b0f17] p-1 rounded-lg border border-[#1e2638]">
+                  <button
+                    type="button"
+                    onClick={() => setSubTab('simple_cfg')}
+                    className={`px-3 py-1 rounded text-xs font-semibold cursor-pointer ${
+                      subTab === 'simple_cfg' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Основные
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSubTab('advanced_cfg')}
+                    className={`px-3 py-1 rounded text-xs font-semibold cursor-pointer ${
+                      subTab === 'advanced_cfg' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    ENV, Секреты и Webhook
+                  </button>
+                </div>
+
+                <button
+                  type="submit"
+                  className="px-4 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Save className="w-3.5 h-3.5" />
+                  Сохранить настройки
+                </button>
+              </div>
             </div>
 
-            {/* Быстрые кнопки частых команд GitHub-проектов */}
-            <div>
-              <div className="text-xs font-medium text-slate-300 mb-2">
-                Быстрые команды в 1 клик (выполняются в папке проекта):
+            {cfgStatus && (
+              <div className="px-3.5 py-2 rounded-lg bg-emerald-950/40 border border-emerald-800/60 text-xs font-mono text-emerald-300">
+                {cfgStatus}
               </div>
-              <div className="flex flex-wrap items-center gap-2">
-                {[
-                  { label: 'git pull (Обновить из GitHub)', cmd: 'git pull' },
-                  { label: 'pip install -r requirements.txt', cmd: 'pip install -r requirements.txt' },
-                  { label: 'Создать .venv (Python)', cmd: 'python3 -m venv .venv' },
-                  { label: 'Список файлов (ls -la)', cmd: 'ls -la' },
-                  { label: 'Права на запуск (chmod +x *.sh)', cmd: 'chmod +x *.sh || true' },
-                  { label: 'Проверка Python и пакета', cmd: 'python3 --version && pip --version' },
-                ].map((item) => (
+            )}
+
+            {subTab === 'simple_cfg' ? (
+              <div className="space-y-5">
+                {/* Выбор типа архитектуры: Service / Web / Job */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                   <button
-                    key={item.cmd}
                     type="button"
-                    disabled={cliRunning}
                     onClick={() => {
-                      setCliCommandInput(item.cmd);
-                      handleExecCommand(item.cmd);
+                      setCfgType('service');
+                      setCfgScheduleType('manual');
                     }}
-                    className="px-3 py-1.5 text-xs font-mono bg-[#0f172a] hover:bg-slate-800 text-slate-200 border border-slate-700 rounded-lg transition-colors cursor-pointer"
+                    className={`p-3.5 rounded-xl border text-left transition-all cursor-pointer ${
+                      cfgType === 'service'
+                        ? 'bg-indigo-950/40 border-indigo-500 text-white'
+                        : 'bg-[#0b0f17] border-[#1e2638] text-slate-300 hover:border-slate-700'
+                    }`}
                   >
-                    $ {item.label}
+                    <div className="text-xs font-bold text-indigo-300">1. Постоянный сервис (Service 24/7)</div>
+                    <p className="text-[11px] text-slate-400 mt-1">
+                      Telegram-боты, воркеры и демоны. Супервизор автоматически перезапускает процесс при падении.
+                    </p>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCfgType('web');
+                      setCfgScheduleType('manual');
+                      if (!cfgPort || cfgPort === '0') setCfgPort('18081');
+                    }}
+                    className={`p-3.5 rounded-xl border text-left transition-all cursor-pointer ${
+                      cfgType === 'web'
+                        ? 'bg-cyan-950/35 border-cyan-500 text-white'
+                        : 'bg-[#0b0f17] border-[#1e2638] text-slate-300 hover:border-slate-700'
+                    }`}
+                  >
+                    <div className="text-xs font-bold text-cyan-300">2. Веб-сервис / API (:PORT)</div>
+                    <p className="text-[11px] text-slate-400 mt-1">
+                      FastAPI, Flask, Node.js, Go или бинарник с передачей переменной $PORT и HTTP Healthcheck.
+                    </p>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCfgType('job');
+                      if (!cfgScheduleExpr.trim()) {
+                        applyScheduleBuilder('minutes', 15);
+                      } else if (cfgScheduleType === 'manual') {
+                        setCfgScheduleType('cron');
+                      }
+                    }}
+                    className={`p-3.5 rounded-xl border text-left transition-all cursor-pointer ${
+                      cfgType === 'job'
+                        ? 'bg-amber-950/35 border-amber-500 text-white'
+                        : 'bg-[#0b0f17] border-[#1e2638] text-slate-300 hover:border-slate-700'
+                    }`}
+                  >
+                    <div className="text-xs font-bold text-amber-300">3. Задача по расписанию (Cron / Job)</div>
+                    <p className="text-[11px] text-slate-400 mt-1">
+                      Парсеры, чекеры кук и отчёты. Запускается по таймеру, выполняет работу и освобождает ОЗУ.
+                    </p>
+                  </button>
+                </div>
+
+                {/* Имя, Среда и Команда */}
+                <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
+                  <div className="md:col-span-4">
+                    <label className="block text-xs text-slate-400 mb-1">Название проекта</label>
+                    <input
+                      type="text"
+                      value={cfgName}
+                      onChange={(e) => setCfgName(e.target.value)}
+                      className="w-full bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-2 text-xs text-white font-mono"
+                    />
+                  </div>
+                  <div className="md:col-span-3">
+                    <label className="block text-xs text-slate-400 mb-1">Рантайм</label>
+                    <select
+                      value={cfgRuntime}
+                      onChange={(e) => setCfgRuntime(e.target.value)}
+                      className="w-full bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-2 text-xs text-white font-mono"
+                    >
+                      <option value="python">Python (.venv / uv)</option>
+                      <option value="node">Node.js (npm)</option>
+                      <option value="bash">Bash / Shell</option>
+                      <option value="custom">Custom / Бинарник</option>
+                    </select>
+                  </div>
+                  <div className="md:col-span-5">
+                    <label className="block text-xs text-slate-400 mb-1">Команда запуска (внутри рабочей папки)</label>
+                    <input
+                      type="text"
+                      value={cfgCommand}
+                      onChange={(e) => setCfgCommand(e.target.value)}
+                      className="w-full bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-2 text-xs text-white font-mono"
+                    />
+                  </div>
+                </div>
+
+                {/* Блок для Web / API (:PORT) */}
+                {cfgType === 'web' && (
+                  <div className="bg-[#0b0f17] border border-cyan-900/50 rounded-xl p-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-xs font-semibold text-cyan-300 mb-1">
+                        Порт веб-сервиса ($PORT)
+                      </label>
+                      <input
+                        type="number"
+                        value={cfgPort}
+                        onChange={(e) => setCfgPort(e.target.value)}
+                        placeholder="18081"
+                        className="w-full bg-[#111622] border border-[#1e2638] rounded-lg px-3 py-2 text-xs font-mono text-white"
+                      />
+                      <span className="text-[11px] text-slate-400 mt-1 block">
+                        Доступен процессу через переменную окружения <code className="text-cyan-300">$PORT</code>
+                      </span>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-cyan-300 mb-1">
+                        Healthcheck URL (опционально)
+                      </label>
+                      <input
+                        type="text"
+                        value={cfgHealthcheckUrl}
+                        onChange={(e) => setCfgHealthcheckUrl(e.target.value)}
+                        placeholder="http://127.0.0.1:18081/health"
+                        className="w-full bg-[#111622] border border-[#1e2638] rounded-lg px-3 py-2 text-xs font-mono text-white"
+                      />
+                      <span className="text-[11px] text-slate-400 mt-1 block">
+                        При падении проверки супервизор перезапустит сервис согласно политике
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Визуальный конструктор расписания для Job */}
+                {cfgType === 'job' && (
+                  <div className="bg-[#0b0f17] border border-amber-900/50 rounded-xl p-4 space-y-3.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
+                        <Clock className="w-4 h-4" />
+                        Расписание автоматического запуска
+                      </div>
+                      <span className="text-xs font-mono text-slate-300 bg-[#111622] px-2.5 py-1 rounded border border-[#1e2638]">
+                        Активно: {cfgScheduleType} ({cfgScheduleExpr || '*/15 * * * *'})
+                      </span>
+                    </div>
+
+                    <div className="flex flex-wrap gap-1.5">
+                      {[
+                        { id: 'minutes', label: 'Каждые N минут' },
+                        { id: 'hours', label: 'Каждые N часов' },
+                        { id: 'daily', label: 'Раз в сутки в HH:MM' },
+                        { id: 'interval', label: 'Интервал в секундах' },
+                        { id: 'raw', label: 'Своя Cron-строка' },
+                      ].map((m) => (
+                        <button
+                          key={m.id}
+                          type="button"
+                          onClick={() => applyScheduleBuilder(m.id as any)}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer ${
+                            schedBuilderMode === m.id
+                              ? 'bg-amber-600 text-white'
+                              : 'bg-[#111622] text-slate-300 border border-[#1e2638] hover:text-white'
+                          }`}
+                        >
+                          {m.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {schedBuilderMode === 'minutes' && (
+                      <div className="flex flex-wrap items-center gap-2 pt-1">
+                        {[5, 10, 15, 30, 45].map((m) => (
+                          <button
+                            key={m}
+                            type="button"
+                            onClick={() => {
+                              setSchedEveryMin(m);
+                              applyScheduleBuilder('minutes', m);
+                            }}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-mono cursor-pointer ${
+                              schedEveryMin === m
+                                ? 'bg-indigo-600 text-white font-bold'
+                                : 'bg-[#111622] text-slate-300 border border-[#1e2638]'
+                            }`}
+                          >
+                            Каждые {m} мин
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
+                    {schedBuilderMode === 'hours' && (
+                      <div className="flex flex-wrap items-center gap-2 pt-1">
+                        {[1, 2, 4, 6, 12].map((h) => (
+                          <button
+                            key={h}
+                            type="button"
+                            onClick={() => {
+                              setSchedEveryHour(h);
+                              applyScheduleBuilder('hours', schedEveryMin, h);
+                            }}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-mono cursor-pointer ${
+                              schedEveryHour === h
+                                ? 'bg-indigo-600 text-white font-bold'
+                                : 'bg-[#111622] text-slate-300 border border-[#1e2638]'
+                            }`}
+                          >
+                            Каждые {h} ч.
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
+                    {schedBuilderMode === 'daily' && (
+                      <div className="flex items-center gap-3 pt-1">
+                        <span className="text-xs text-slate-300">Время запуска (UTC/сервер):</span>
+                        <input
+                          type="time"
+                          value={schedDailyTime}
+                          onChange={(e) => {
+                            setSchedDailyTime(e.target.value);
+                            applyScheduleBuilder('daily', schedEveryMin, schedEveryHour, e.target.value);
+                          }}
+                          className="bg-[#111622] border border-[#1e2638] rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                        />
+                      </div>
+                    )}
+
+                    {schedBuilderMode === 'interval' && (
+                      <div className="flex items-center gap-3 pt-1">
+                        <span className="text-xs text-slate-300">Каждые (секунд):</span>
+                        <input
+                          type="number"
+                          min={5}
+                          value={schedIntervalSec}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            setSchedIntervalSec(v);
+                            applyScheduleBuilder('interval', schedEveryMin, schedEveryHour, schedDailyTime, v);
+                          }}
+                          className="w-32 bg-[#111622] border border-[#1e2638] rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                        />
+                      </div>
+                    )}
+
+                    {schedBuilderMode === 'raw' && (
+                      <div className="pt-1">
+                        <input
+                          type="text"
+                          value={cfgScheduleExpr}
+                          onChange={(e) => {
+                            setCfgScheduleType('cron');
+                            setCfgScheduleExpr(e.target.value);
+                          }}
+                          placeholder="*/15 * * * *"
+                          className="w-full max-w-sm bg-[#111622] border border-[#1e2638] rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Супервизор, Политика рестарта и Лимит памяти PGID */}
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-4 pt-2 border-t border-[#1e2638]">
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Политика перезапуска</label>
+                    <select
+                      value={cfgRestartPolicy}
+                      onChange={(e) => setCfgRestartPolicy(e.target.value)}
+                      className="w-full bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-2 text-xs font-mono text-white"
+                    >
+                      <option value="always">always (всегда)</option>
+                      <option value="on-failure">on-failure (при сбое)</option>
+                      <option value="no">no (без авто-рестарта)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Лимит ОЗУ дерева PGID (МБ)</label>
+                    <input
+                      type="number"
+                      min={16}
+                      max={4096}
+                      value={cfgMaxRam}
+                      onChange={(e) => setCfgMaxRam(Number(e.target.value))}
+                      className="w-full bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-2 text-xs font-mono text-white"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Макс. попыток (Retries)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      value={cfgMaxRetries}
+                      onChange={(e) => setCfgMaxRetries(Number(e.target.value))}
+                      className="w-full bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-2 text-xs font-mono text-white"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Таймаут выполнения (0 = без лимита)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={cfgTimeout}
+                      onChange={(e) => setCfgTimeout(Number(e.target.value))}
+                      className="w-full bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-2 text-xs font-mono text-white"
+                    />
+                  </div>
+                </div>
+              </div>
+            ) : (
+              /* Вкладка ENV, Секреты и Webhook */
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                      Переменные окружения (ENV JSON)
+                    </label>
+                    <textarea
+                      rows={7}
+                      value={cfgEnvJson}
+                      onChange={(e) => setCfgEnvJson(e.target.value)}
+                      spellCheck={false}
+                      className="w-full bg-[#070b14] border border-[#1e2638] rounded-lg p-3 text-xs font-mono text-slate-200"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                      Привязанные секреты из Сейфа (доступны через hub.secret)
+                    </label>
+                    <div className="bg-[#0b0f17] border border-[#1e2638] rounded-lg p-3 max-h-[172px] overflow-y-auto space-y-1.5">
+                      {secrets.map((s) => {
+                        const checked = cfgSelectedSecrets.includes(s.name);
+                        return (
+                          <label
+                            key={s.name}
+                            className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded hover:bg-[#111622] cursor-pointer text-xs font-mono"
+                          >
+                            <div className="flex items-center gap-2">
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() => toggleSecretAttachment(s.name)}
+                                className="rounded border-slate-700"
+                              />
+                              <span className="text-white">{s.name}</span>
+                            </div>
+                            <span className="text-[10px] text-slate-400">{s.type}</span>
+                          </label>
+                        );
+                      })}
+                      {secrets.length === 0 && (
+                        <div className="text-xs text-slate-400 py-4 text-center">
+                          В сейфе пока нет секретов
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-[#0b0f17] border border-[#1e2638] rounded-lg p-3.5 flex flex-wrap items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold text-slate-300">
+                      Внешний Webhook URL для удалённого запуска проекта (POST)
+                    </div>
+                    <div className="text-xs font-mono text-indigo-300 truncate mt-0.5">{webhookUrl}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => navigator.clipboard?.writeText(webhookUrl)}
+                    className="px-3 py-1.5 text-xs font-mono text-slate-200 bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                    Копировать URL
+                  </button>
+                </div>
+              </div>
+            )}
+          </form>
+        )}
+
+        {/* ==================== ВКЛАДКА 3: КУКИ, ПРОКСИ И TELEGRAM ==================== */}
+        {subTab === 'cookies_tg' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+            {/* Левая половина: Менеджер Cookie-Editor JSON + HTTP-проверка Set-Cookie */}
+            <div className="lg:col-span-7 bg-[#111622] border border-[#1e2638] rounded-xl p-4 space-y-4">
+              <div className="flex items-center justify-between gap-2 border-b border-[#1e2638] pb-3">
+                <div>
+                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                    <Cookie className="w-4 h-4 text-amber-400" />
+                    Куки авторизации (Cookie-Editor JSON · 0600)
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    Хранятся в защищённом файле и читаются скриптом через <code className="text-indigo-300">hub.secret(&quot;{cookieSecretName}&quot;)</code>
+                  </p>
+                </div>
+                <input
+                  ref={cookieFileInputRef}
+                  type="file"
+                  accept=".json,.txt"
+                  onChange={handleCookieFileUpload}
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  onClick={() => cookieFileInputRef.current?.click()}
+                  className="px-3 py-1.5 text-xs font-semibold text-slate-200 bg-[#0b0f17] hover:bg-slate-800 border border-[#1e2638] rounded-lg inline-flex items-center gap-1.5 cursor-pointer shrink-0"
+                >
+                  <Upload className="w-3.5 h-3.5 text-indigo-400" />
+                  Загрузить .json
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[11px] text-slate-400 mb-1">Имя секрета в Сейфе</label>
+                  <input
+                    type="text"
+                    value={cookieSecretName}
+                    onChange={(e) => setCookieSecretName(e.target.value)}
+                    className="w-full bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                  />
+                </div>
+                <div className="flex items-end">
+                  <button
+                    type="button"
+                    onClick={() => setCookieJsonText(DEFAULT_COOKIE_SAMPLE)}
+                    className="w-full py-1.5 px-3 text-xs font-mono text-slate-300 hover:text-white bg-[#0b0f17] border border-[#1e2638] rounded-lg cursor-pointer"
+                  >
+                    Вставить шаблон Cookie JSON
+                  </button>
+                </div>
+              </div>
+
+              <textarea
+                rows={7}
+                value={cookieJsonText}
+                onChange={(e) => setCookieJsonText(e.target.value)}
+                spellCheck={false}
+                placeholder='Вставьте JSON-массив кук из браузерного расширения Cookie-Editor: [{"domain": ".site.com", "name": "sid", "value": "..."}]'
+                className="w-full bg-[#070b14] border border-[#1e2638] rounded-lg p-3 text-xs font-mono text-slate-200"
+              />
+
+              {cookieSaveStatus && (
+                <div className="text-xs font-mono text-emerald-300 bg-emerald-950/30 border border-emerald-800/50 rounded-lg px-3 py-2">
+                  {cookieSaveStatus}
+                </div>
+              )}
+
+              <button
+                type="button"
+                onClick={handleSaveAndAttachCookies}
+                className="w-full py-2 px-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold inline-flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <ShieldCheck className="w-4 h-4" />
+                Сохранить и привязать куки к проекту
+              </button>
+
+              {/* Реальный HTTP-инспектор и захват Set-Cookie через прокси */}
+              <div className="pt-3 border-t border-[#1e2638] space-y-3">
+                <div className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
+                  <Globe className="w-3.5 h-3.5 text-cyan-400" />
+                  Проверка доступности сайта и захват первичных Set-Cookie через прокси
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-12 gap-2">
+                  <input
+                    type="text"
+                    value={webAuthUrl}
+                    onChange={(e) => setWebAuthUrl(e.target.value)}
+                    placeholder="https://example.com"
+                    className="sm:col-span-6 bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                  />
+                  <input
+                    type="text"
+                    value={webAuthProxy}
+                    onChange={(e) => setWebAuthProxy(e.target.value)}
+                    placeholder="Прокси (опционально)"
+                    className="sm:col-span-4 bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                  />
+                  <button
+                    type="button"
+                    disabled={webAuthLoading}
+                    onClick={handleStartWebAuth}
+                    className="sm:col-span-2 py-1.5 px-3 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-xs font-semibold cursor-pointer disabled:opacity-50"
+                  >
+                    {webAuthLoading ? '...' : 'Проверить'}
+                  </button>
+                </div>
+
+                {webAuthStatusMsg && (
+                  <div className="text-[11px] font-mono text-cyan-300 bg-cyan-950/30 border border-cyan-800/50 rounded-lg px-3 py-2">
+                    {webAuthStatusMsg}
+                  </div>
+                )}
+
+                {webAuthSession && (
+                  <div className="bg-[#0b0f17] border border-[#1e2638] rounded-lg p-3 space-y-2 text-xs font-mono">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-slate-300">
+                      <span>HTTP статус: <strong className="text-white">{webAuthSession.http_status || 0}</strong></span>
+                      <span>Заголовок: <strong className="text-white">{webAuthSession.page_title || '—'}</strong></span>
+                      <span>Set-Cookie: <strong className="text-emerald-300">{webAuthSession.cookies?.length || 0} шт.</strong></span>
+                    </div>
+                    {(webAuthSession.cookies?.length || 0) > 0 && (
+                      <button
+                        type="button"
+                        onClick={handleSaveWebAuth}
+                        className="w-full py-1.5 px-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs font-semibold cursor-pointer"
+                      >
+                        Сохранить перехваченные Set-Cookie ({webAuthSession.cookies?.length || 0} шт.) в сейф
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Правая половина: Telegram-интеграция и Прокси проекта */}
+            <form
+              onSubmit={handleSaveTelegramAndProxy}
+              className="lg:col-span-5 bg-[#111622] border border-[#1e2638] rounded-xl p-4 space-y-3.5"
+            >
+              <div className="border-b border-[#1e2638] pb-3">
+                <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                  <Bot className="w-4 h-4 text-indigo-400" />
+                  Telegram-токен и Прокси проекта
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Автоматически пробрасываются в окружение (BOT_TOKEN, TG_CHAT_ID, HTTPS_PROXY)
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">BOT_TOKEN (от @BotFather)</label>
+                <input
+                  type="password"
+                  value={tgBotToken}
+                  onChange={(e) => setTgBotToken(e.target.value)}
+                  placeholder="123456789:AAH..."
+                  className="w-full bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-2 text-xs font-mono text-white"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">TG_CHAT_ID (ID чата или администратора)</label>
+                <input
+                  type="text"
+                  value={tgChatId}
+                  onChange={(e) => setTgChatId(e.target.value)}
+                  placeholder="Например: 987654321"
+                  className="w-full bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-2 text-xs font-mono text-white"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">TG_API_ID (Telethon/Pyrogram)</label>
+                  <input
+                    type="text"
+                    value={tgApiId}
+                    onChange={(e) => setTgApiId(e.target.value)}
+                    placeholder="Опционально"
+                    className="w-full bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-2 text-xs font-mono text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">TG_API_HASH</label>
+                  <input
+                    type="password"
+                    value={tgApiHash}
+                    onChange={(e) => setTgApiHash(e.target.value)}
+                    placeholder="Опционально"
+                    className="w-full bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-2 text-xs font-mono text-white"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">
+                  Индивидуальный прокси проекта (HTTPS_PROXY / ALL_PROXY)
+                </label>
+                <input
+                  type="text"
+                  value={customProxyUrl}
+                  onChange={(e) => setCustomProxyUrl(e.target.value)}
+                  placeholder="socks5://user:pass@ip:1080 или http://ip:8080"
+                  className="w-full bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-2 text-xs font-mono text-white"
+                />
+              </div>
+
+              {tgSaveStatus && (
+                <div className="text-xs font-mono text-emerald-300 bg-emerald-950/30 border border-emerald-800/50 rounded-lg px-3 py-2">
+                  {tgSaveStatus}
+                </div>
+              )}
+
+              <button
+                type="submit"
+                className="w-full py-2 px-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold inline-flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <Save className="w-3.5 h-3.5" />
+                Сохранить Telegram и Прокси в ENV
+              </button>
+            </form>
+          </div>
+        )}
+
+        {/* ==================== ВКЛАДКА 4: ТЕРМИНАЛ, GIT И ИСТОРИЯ ЗАПУСКОВ ==================== */}
+        {subTab === 'terminal_git' && (
+          <div className="bg-[#111622] border border-[#1e2638] rounded-xl p-4 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-bold text-white">
+                  Командная строка в изолированном окружении ({activeProj.workdir})
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Команды выполняются с автоматически подключённым <code className="text-indigo-300">.venv/bin</code> в PATH
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                {[
+                  { label: 'pip install -r requirements.txt', cmd: 'pip install -r requirements.txt' },
+                  { label: 'git status', cmd: 'git status' },
+                  { label: 'git pull', cmd: 'git pull' },
+                  { label: 'ls -la', cmd: 'ls -la' },
+                ].map((btn) => (
+                  <button
+                    key={btn.label}
+                    type="button"
+                    onClick={() => runProjectCommand(btn.cmd)}
+                    className="px-2.5 py-1 text-[11px] font-mono text-slate-200 bg-[#0b0f17] hover:bg-slate-800 border border-[#1e2638] rounded-lg cursor-pointer"
+                  >
+                    {btn.label}
                   </button>
                 ))}
               </div>
             </div>
 
-            {/* Произвольная команда */}
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                handleExecCommand();
-              }}
-              className="space-y-2"
-            >
-              <label className="block text-xs text-slate-300">
-                Введите свою команду из README репозитория GitHub:
-              </label>
-              <div className="flex flex-col sm:flex-row gap-2">
-                <div className="flex-1 flex items-center bg-[#0f172a] border border-slate-700 rounded-lg px-3">
-                  <span className="text-xs font-mono text-emerald-400 mr-2">$</span>
-                  <input
-                    type="text"
-                    value={cliCommandInput}
-                    onChange={(e) => setCliCommandInput(e.target.value)}
-                    placeholder="Например: pip install telethon requests или python3 setup.py"
-                    className="w-full py-2 bg-transparent text-xs font-mono text-white focus:outline-none"
-                  />
-                </div>
-                <button
-                  type="submit"
-                  disabled={cliRunning || !cliCommandInput.trim()}
-                  className="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg inline-flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
-                >
-                  <Play className="w-3.5 h-3.5" />
-                  {cliRunning ? 'Выполнение...' : 'Выполнить в папке проекта'}
-                </button>
-              </div>
-            </form>
-
-            {cliMsg && (
-              <div
-                className={`p-3 rounded-lg text-xs ${
-                  cliMsg.type === 'ok'
-                    ? 'bg-emerald-950/60 border border-emerald-500/40 text-emerald-200'
-                    : 'bg-red-950/60 border border-red-500/40 text-red-200'
-                }`}
-              >
-                {cliMsg.text}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* СОДЕРЖИМОЕ ВКЛАДКИ 4: ПРОСТЫЕ НАСТРОЙКИ И КОНСТРУКТОР РАСПИСАНИЯ */}
-        {subTab === 'simple_cfg' && (
-          <form
-            onSubmit={handleSaveProjectConfig}
-            className="bg-[#1e293b] border border-slate-800 rounded-xl p-6 space-y-5"
-          >
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-800">
-              <div>
-                <h3 className="text-base font-bold text-white">
-                  Простые настройки запуска и расписания («{activeProj.name}»)
-                </h3>
-                <p className="text-xs text-slate-400">
-                  Понятные настройки без сложных команд. Для тонких технических лимитов есть вкладка «5. Расширенные».
-                </p>
+            <form onSubmit={handleExecCommand} className="flex items-center gap-2">
+              <div className="flex-1 flex items-center bg-[#070b14] border border-[#1e2638] rounded-lg px-3 py-2">
+                <span className="text-xs font-mono text-indigo-400 mr-2">$</span>
+                <input
+                  type="text"
+                  value={cliCommand}
+                  onChange={(e) => setCliCommand(e.target.value)}
+                  placeholder="Введите команду (например: pip install httpx или git pull)..."
+                  className="w-full bg-transparent text-xs font-mono text-white focus:outline-none"
+                />
               </div>
               <button
                 type="submit"
-                className="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg inline-flex items-center gap-1.5 cursor-pointer self-start sm:self-auto"
+                disabled={cliRunning}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold cursor-pointer"
               >
-                <Save className="w-4 h-4" />
-                Сохранить изменения
+                {cliRunning ? 'Выполнение...' : 'Выполнить'}
               </button>
-            </div>
+            </form>
 
-            {cfgError && (
-              <div className="p-3 bg-red-950/70 border border-red-500/40 rounded-lg text-xs text-red-200">
-                {cfgError}
-              </div>
-            )}
-            {cfgSaved && (
-              <div className="p-3 bg-emerald-950/70 border border-emerald-500/40 rounded-lg text-xs text-emerald-200">
-                Настройки проекта успешно сохранены!
-              </div>
+            {cliOutput && (
+              <pre className="bg-[#070b14] border border-[#1e2638] rounded-lg p-3.5 text-xs font-mono text-slate-200 max-h-56 overflow-y-auto whitespace-pre-wrap">
+                {cliOutput}
+              </pre>
             )}
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div className="sm:col-span-2">
-                <label className="block text-xs font-medium text-slate-200 mb-1">
-                  Описание проекта (понятная заметка для вас)
-                </label>
-                <input
-                  type="text"
-                  value={cfgDescription}
-                  onChange={(e) => setCfgDescription(e.target.value)}
-                  placeholder="Что именно делает этот проект?"
-                  className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3.5 py-2 text-xs text-white"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-200 mb-1">
-                  Группа / Категория
-                </label>
-                <input
-                  type="text"
-                  value={cfgGroupTag}
-                  onChange={(e) => setCfgGroupTag(e.target.value)}
-                  placeholder="Например: Боты ТГ, Парсеры"
-                  className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3.5 py-2 text-xs text-white"
-                />
-              </div>
-            </div>
-
-            {/* Выбор категории с объяснением */}
-            <div>
-              <label className="block text-xs font-semibold text-slate-200 mb-2">
-                Режим работы проекта:
-              </label>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {/* Таблица истории запусков */}
+            <div className="pt-3 border-t border-[#1e2638] space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                  История запусков ({runs.length})
+                </span>
                 <button
                   type="button"
-                  onClick={() => setCfgType('service')}
-                  className={`p-3.5 rounded-xl border text-left cursor-pointer ${
-                    cfgType === 'service'
-                      ? 'bg-emerald-950/40 border-emerald-500/60'
-                      : 'bg-[#0f172a] border-slate-800'
-                  }`}
+                  onClick={handleClearOldLogs}
+                  className="text-xs text-slate-400 hover:text-rose-300 font-mono cursor-pointer"
                 >
-                  <div className="flex items-center gap-2 font-bold text-xs text-white">
-                    <Bot className="w-4 h-4 text-emerald-400" />
-                    Постоянная программа 24/7 (Service)
-                  </div>
-                  <p className="mt-1 text-[11px] text-slate-300">
-                    Работает в фоне постоянно. Если программа вылетит — панель сама запустит её снова.
-                  </p>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setCfgType('job')}
-                  className={`p-3.5 rounded-xl border text-left cursor-pointer ${
-                    cfgType === 'job'
-                      ? 'bg-indigo-950/40 border-indigo-500/60'
-                      : 'bg-[#0f172a] border-slate-800'
-                  }`}
-                >
-                  <div className="flex items-center gap-2 font-bold text-xs text-white">
-                    <Clock className="w-4 h-4 text-indigo-400" />
-                    Скрипт по расписанию или кнопке (Job)
-                  </div>
-                  <p className="mt-1 text-[11px] text-slate-300">
-                    Запускается через заданные промежутки времени или в точный час, выполняет скрипт и закрывается.
-                  </p>
+                  Очистить старые логи
                 </button>
               </div>
-            </div>
 
-            {cfgType === 'service' ? (
-              <div className="p-4 bg-slate-900/60 border border-slate-800 rounded-xl space-y-3">
-                <h4 className="text-xs font-bold text-white">Настройки постоянной программы 24/7</h4>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-xs text-slate-300 mb-1">Что делать, если программа упала?</label>
-                    <select
-                      value={cfgRestartPolicy}
-                      onChange={(e) => setCfgRestartPolicy(e.target.value as any)}
-                      className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
-                    >
-                      <option value="on-failure">Автоматически перезапускать при ошибке (рекомендуется)</option>
-                      <option value="always">Перезапускать всегда при любой остановке</option>
-                      <option value="no">Не перезапускать</option>
-                    </select>
-                  </div>
-                  <div className="flex items-center pt-5">
-                    <label className="flex items-center gap-2 text-xs text-slate-200 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={cfgAutostart}
-                        onChange={(e) => setCfgAutostart(e.target.checked)}
-                      />
-                      Запускать автоматически при включении сервера
-                    </label>
-                  </div>
-                </div>
+              <div className="overflow-x-auto border border-[#1e2638] rounded-lg">
+                <table className="w-full text-left border-collapse text-xs font-mono tabular-nums">
+                  <thead>
+                    <tr className="bg-[#0b0f17] text-slate-400 border-b border-[#1e2638]">
+                      <th className="py-2 px-3">Run ID</th>
+                      <th className="py-2 px-3">Статус</th>
+                      <th className="py-2 px-3">Триггер</th>
+                      <th className="py-2 px-3">PID / PGID</th>
+                      <th className="py-2 px-3">Старт</th>
+                      <th className="py-2 px-3">Код выхода</th>
+                      <th className="py-2 px-3 text-right">Лог</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#1e2638]">
+                    {runs.slice(0, 15).map((r) => {
+                      const st = statusBadge(r.status);
+                      const isSel = r.id === selectedRunId;
+                      return (
+                        <tr
+                          key={r.id}
+                          onClick={() => {
+                            setSelectedRunId(r.id);
+                            setBottomConsoleTab('logs');
+                          }}
+                          className={`cursor-pointer transition-colors ${
+                            isSel ? 'bg-indigo-950/35' : 'hover:bg-[#0b0f17]/70'
+                          }`}
+                        >
+                          <td className="py-2 px-3 font-bold text-white">#{r.id}</td>
+                          <td className="py-2 px-3">
+                            <span className={`px-1.5 py-0.5 rounded text-[10px] ${st.cls}`}>{st.label}</span>
+                          </td>
+                          <td className="py-2 px-3 text-slate-300">{r.trigger}</td>
+                          <td className="py-2 px-3 text-slate-400">
+                            {r.pid || '—'} / {r.pgid || '—'}
+                          </td>
+                          <td className="py-2 px-3 text-slate-400">{formatShortTime(r.started_at)}</td>
+                          <td className="py-2 px-3 text-slate-300">
+                            {r.exit_code !== null && r.exit_code !== undefined ? r.exit_code : '—'}
+                          </td>
+                          <td className="py-2 px-3 text-right">
+                            <span className="text-indigo-400 hover:underline">Открыть лог</span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
               </div>
-            ) : (
-              <div className="p-4 bg-slate-900/60 border border-slate-800 rounded-xl space-y-4">
-                <div className="flex items-center justify-between">
-                  <h4 className="text-xs font-bold text-white">Конструктор расписания запуска</h4>
-                  <span className="text-xs font-mono text-indigo-300">
-                    {describeScheduleHuman('job', cfgScheduleType, cfgScheduleExpr)}
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => applyBuilderToSchedule('minutes', schedMinutes, schedHours, schedDailyTime)}
-                    className={`px-3 py-2 rounded-lg text-xs font-medium border cursor-pointer ${
-                      schedBuilderMode === 'minutes'
-                        ? 'bg-indigo-600 text-white border-indigo-500'
-                        : 'bg-[#0f172a] text-slate-300 border-slate-800'
-                    }`}
-                  >
-                    Каждые N минут
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => applyBuilderToSchedule('hours', schedMinutes, schedHours, schedDailyTime)}
-                    className={`px-3 py-2 rounded-lg text-xs font-medium border cursor-pointer ${
-                      schedBuilderMode === 'hours'
-                        ? 'bg-indigo-600 text-white border-indigo-500'
-                        : 'bg-[#0f172a] text-slate-300 border-slate-800'
-                    }`}
-                  >
-                    Каждые N часов
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => applyBuilderToSchedule('daily', schedMinutes, schedHours, schedDailyTime)}
-                    className={`px-3 py-2 rounded-lg text-xs font-medium border cursor-pointer ${
-                      schedBuilderMode === 'daily'
-                        ? 'bg-indigo-600 text-white border-indigo-500'
-                        : 'bg-[#0f172a] text-slate-300 border-slate-800'
-                    }`}
-                  >
-                    Раз в день в ЧЧ:ММ
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => applyBuilderToSchedule('manual', schedMinutes, schedHours, schedDailyTime)}
-                    className={`px-3 py-2 rounded-lg text-xs font-medium border cursor-pointer ${
-                      schedBuilderMode === 'manual'
-                        ? 'bg-indigo-600 text-white border-indigo-500'
-                        : 'bg-[#0f172a] text-slate-300 border-slate-800'
-                    }`}
-                  >
-                    Только вручную
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setSchedBuilderMode('custom')}
-                    className={`px-3 py-2 rounded-lg text-xs font-medium border cursor-pointer ${
-                      schedBuilderMode === 'custom'
-                        ? 'bg-indigo-600 text-white border-indigo-500'
-                        : 'bg-[#0f172a] text-slate-300 border-slate-800'
-                    }`}
-                  >
-                    Свой Cron
-                  </button>
-                </div>
-
-                {schedBuilderMode === 'minutes' && (
-                  <div className="flex flex-wrap items-center gap-3">
-                    <span className="text-xs text-slate-300">Запускать скрипт каждые:</span>
-                    {[5, 10, 15, 30].map((presetMin) => (
-                      <button
-                        key={presetMin}
-                        type="button"
-                        onClick={() => {
-                          setSchedMinutes(presetMin);
-                          applyBuilderToSchedule('minutes', presetMin, schedHours, schedDailyTime);
-                        }}
-                        className={`px-2.5 py-1 rounded text-xs font-mono cursor-pointer ${
-                          schedMinutes === presetMin
-                            ? 'bg-indigo-500 text-white'
-                            : 'bg-slate-800 text-slate-300'
-                        }`}
-                      >
-                        {presetMin} мин
-                      </button>
-                    ))}
-                    <input
-                      type="number"
-                      min={1}
-                      max={59}
-                      value={schedMinutes}
-                      onChange={(e) => {
-                        const v = Number(e.target.value);
-                        setSchedMinutes(v);
-                        applyBuilderToSchedule('minutes', v, schedHours, schedDailyTime);
-                      }}
-                      className="w-20 bg-[#0f172a] border border-slate-700 rounded-lg px-2.5 py-1 text-xs font-mono text-white"
-                    />
-                    <span className="text-xs text-slate-400">минут</span>
-                  </div>
-                )}
-
-                {schedBuilderMode === 'hours' && (
-                  <div className="flex flex-wrap items-center gap-3">
-                    <span className="text-xs text-slate-300">Запускать скрипт каждые:</span>
-                    {[1, 2, 6, 12, 24].map((presetHr) => (
-                      <button
-                        key={presetHr}
-                        type="button"
-                        onClick={() => {
-                          setSchedHours(presetHr);
-                          applyBuilderToSchedule('hours', schedMinutes, presetHr, schedDailyTime);
-                        }}
-                        className={`px-2.5 py-1 rounded text-xs font-mono cursor-pointer ${
-                          schedHours === presetHr
-                            ? 'bg-indigo-500 text-white'
-                            : 'bg-slate-800 text-slate-300'
-                        }`}
-                      >
-                        {presetHr} ч
-                      </button>
-                    ))}
-                  </div>
-                )}
-
-                {schedBuilderMode === 'daily' && (
-                  <div className="flex items-center gap-3">
-                    <span className="text-xs text-slate-300">Время ежедневного запуска:</span>
-                    <input
-                      type="time"
-                      value={schedDailyTime}
-                      onChange={(e) => {
-                        setSchedDailyTime(e.target.value);
-                        applyBuilderToSchedule('daily', schedMinutes, schedHours, e.target.value);
-                      }}
-                      className="bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
-                    />
-                  </div>
-                )}
-
-                {schedBuilderMode === 'custom' && (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-xs text-slate-300 mb-1">Тип расписания</label>
-                      <select
-                        value={cfgScheduleType}
-                        onChange={(e) => setCfgScheduleType(e.target.value as any)}
-                        className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white"
-                      >
-                        <option value="cron">Cron (5 полей, например */15 * * * *)</option>
-                        <option value="interval">Интервал в секундах (например 1800)</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-xs text-slate-300 mb-1">Выражение</label>
-                      <input
-                        type="text"
-                        value={cfgScheduleExpr}
-                        onChange={(e) => setCfgScheduleExpr(e.target.value)}
-                        className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
-                      />
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Простые переключатели прокси и уведомлений */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2">
-              <label className="p-3 bg-slate-900/50 border border-slate-800 rounded-xl flex items-start gap-2.5 text-xs text-slate-200 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={cfgUseProxy}
-                  onChange={(e) => setCfgUseProxy(e.target.checked)}
-                  className="mt-0.5"
-                />
-                <span>
-                  <strong className="block text-white">Использовать прокси 127.0.0.1:10808</strong>
-                  <span className="text-[11px] text-slate-400">Нужно для обхода блокировок Telegram и внешних API</span>
-                </span>
-              </label>
-
-              <label className="p-3 bg-slate-900/50 border border-slate-800 rounded-xl flex items-start gap-2.5 text-xs text-slate-200 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={cfgNotifyError}
-                  onChange={(e) => setCfgNotifyError(e.target.checked)}
-                  className="mt-0.5"
-                />
-                <span>
-                  <strong className="block text-white">Уведомлять при ошибке / сбое</strong>
-                  <span className="text-[11px] text-slate-400">Пришлёт лог ошибки в системный бот панели</span>
-                </span>
-              </label>
-
-              <label className="p-3 bg-slate-900/50 border border-slate-800 rounded-xl flex items-start gap-2.5 text-xs text-slate-200 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={cfgNotifySuccess}
-                  onChange={(e) => setCfgNotifySuccess(e.target.checked)}
-                  className="mt-0.5"
-                />
-                <span>
-                  <strong className="block text-white">Уведомлять о каждом успешном запуске</strong>
-                  <span className="text-[11px] text-slate-400">Полезно для редких ежедневных задач</span>
-                </span>
-              </label>
             </div>
-          </form>
+          </div>
         )}
 
-        {/* СОДЕРЖИМОЕ ВКЛАДКИ 5: РАСШИРЕННЫЕ НАСТРОЙКИ (ДЛЯ ПРОДВИНУТЫХ ПОЛЬЗОВАТЕЛЕЙ) */}
-        {subTab === 'advanced_cfg' && (
-          <form
-            onSubmit={handleSaveProjectConfig}
-            className="bg-[#1e293b] border border-slate-800 rounded-xl p-6 space-y-5"
-          >
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-800">
-              <div>
-                <h3 className="text-base font-bold text-white">
-                  Расширенные технические параметры («{activeProj.name}»)
-                </h3>
-                <p className="text-xs text-slate-400">
-                  Тонкая настройка команды запуска, лимитов памяти OOM-сторожа, экспоненциального backoff, вебхука и сырого JSON окружения
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                {onCloneProject && (
-                  <button
-                    type="button"
-                    onClick={() => onCloneProject(activeProj.id)}
-                    className="px-3 py-2 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <Copy className="w-3.5 h-3.5 text-indigo-400" />
-                    Клонировать проект
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => onDeleteProject(activeProj.id)}
-                  className="px-3 py-2 text-xs font-medium bg-red-950/60 hover:bg-red-900/70 text-red-300 border border-red-500/30 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  Удалить проект
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
-                >
-                  <Save className="w-3.5 h-3.5" />
-                  Сохранить технические настройки
-                </button>
-              </div>
-            </div>
-
-            {cfgError && (
-              <div className="p-3 bg-red-950/70 border border-red-500/40 rounded-lg text-xs text-red-200">
-                {cfgError}
-              </div>
-            )}
-            {cfgSaved && (
-              <div className="p-3 bg-emerald-950/70 border border-emerald-500/40 rounded-lg text-xs text-emerald-200">
-                Технические настройки сохранены в SQLite (WAL).
-              </div>
-            )}
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div>
-                <label className="block text-xs text-slate-300 mb-1">Рантайм (Runtime)</label>
-                <select
-                  value={cfgRuntime}
-                  onChange={(e) => setCfgRuntime(e.target.value as any)}
-                  className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
-                >
-                  <option value="python">python (.venv/bin/python или python3)</option>
-                  <option value="node">node (Node.js)</option>
-                  <option value="bash">bash (/bin/bash)</option>
-                  <option value="custom">custom</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs text-slate-300 mb-1">Команда запуска (cmd)</label>
-                <input
-                  type="text"
-                  value={cfgCmd}
-                  onChange={(e) => setCfgCmd(e.target.value)}
-                  className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs text-slate-300 mb-1">
-                  Лимит ОЗУ группы PGID (МБ, 0 = без лимита)
-                </label>
-                <input
-                  type="number"
-                  min={0}
-                  value={cfgRamLimit}
-                  onChange={(e) => setCfgRamLimit(Number(e.target.value))}
-                  className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 md:grid-cols-5 gap-3 p-4 bg-slate-900/60 border border-slate-800 rounded-xl">
-              <div>
-                <label className="block text-xs text-slate-300 mb-1">Backoff мин (сек)</label>
-                <input
-                  type="number"
-                  min={1}
-                  value={cfgBackoffMin}
-                  onChange={(e) => setCfgBackoffMin(Number(e.target.value))}
-                  className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-slate-300 mb-1">Backoff макс (сек)</label>
-                <input
-                  type="number"
-                  min={1}
-                  value={cfgBackoffMax}
-                  onChange={(e) => setCfgBackoffMax(Number(e.target.value))}
-                  className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-slate-300 mb-1">Таймаут (сек, 0=нет)</label>
-                <input
-                  type="number"
-                  min={0}
-                  value={cfgTimeoutSec}
-                  onChange={(e) => setCfgTimeoutSec(Number(e.target.value))}
-                  className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-slate-300 mb-1">Повторы (retries)</label>
-                <input
-                  type="number"
-                  min={0}
-                  value={cfgMaxRetries}
-                  onChange={(e) => setCfgMaxRetries(Number(e.target.value))}
-                  className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-slate-300 mb-1">Пауза повтора (сек)</label>
-                <input
-                  type="number"
-                  min={1}
-                  value={cfgRetryDelay}
-                  onChange={(e) => setCfgRetryDelay(Number(e.target.value))}
-                  className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white"
-                />
-              </div>
-            </div>
-
-            {activeProj.webhook_token && (
-              <div className="flex items-center justify-between p-3 bg-[#0f172a] border border-slate-800 rounded-lg text-xs font-mono">
-                <span className="text-slate-300 truncate">
-                  Внешний Webhook запуска: POST /api/webhook/{activeProj.webhook_token}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    navigator.clipboard?.writeText(
-                      `${window.location.origin}/api/webhook/${activeProj.webhook_token}`
-                    );
-                    setCopiedWebhook(true);
-                    setTimeout(() => setCopiedWebhook(false), 1500);
-                  }}
-                  className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded inline-flex items-center gap-1 cursor-pointer"
-                >
-                  {copiedWebhook ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                  {copiedWebhook ? 'Скопировано' : 'Копировать URL'}
-                </button>
-              </div>
-            )}
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs text-slate-300 mb-2">
-                  Привязанные секреты из хранилища (HUB_SECRET_FILE_&lt;NAME&gt;)
-                </label>
-                <div className="p-3 bg-[#0f172a] border border-slate-800 rounded-lg space-y-2 max-h-[150px] overflow-y-auto">
-                  {secrets.map((sec) => (
-                    <label key={sec.name} className="flex items-center gap-2 text-xs font-mono text-slate-200 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={cfgSecrets.includes(sec.name)}
-                        onChange={(e) => {
-                          if (e.target.checked) {
-                            setCfgSecrets([...cfgSecrets, sec.name]);
-                          } else {
-                            setCfgSecrets(cfgSecrets.filter((s) => s !== sec.name));
-                          }
-                        }}
-                      />
-                      <span>{sec.name}</span>
-                      <span className="text-slate-500">({sec.type})</span>
-                    </label>
-                  ))}
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs text-slate-300 mb-2">
-                  Сырой JSON переменных окружения (env_json)
-                </label>
-                <textarea
-                  rows={5}
-                  value={cfgEnvJson}
-                  onChange={(e) => setCfgEnvJson(e.target.value)}
-                  className="w-full p-3 bg-[#0f172a] border border-slate-800 rounded-lg font-mono text-xs text-white"
-                />
-              </div>
-            </div>
-            {/* Параметры Web / API ($PORT и Healthcheck) */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 p-4 bg-[#0b0f17] border border-cyan-500/30 rounded-xl">
-              <div>
-                <label className="block text-xs text-cyan-200 mb-1">Архитектурный тип</label>
-                <select
-                  value={cfgType}
-                  onChange={(e) => setCfgType(e.target.value as any)}
-                  className="w-full bg-[#111622] border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white"
-                >
-                  <option value="service">service (24/7 демон / бот)</option>
-                  <option value="web">web (HTTP/API бэкенд с $PORT)</option>
-                  <option value="job">job (периодическая задача / Cron)</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs text-cyan-200 mb-1">Порт ($PORT, 0 = не задан)</label>
-                <input
-                  type="number"
-                  min={0}
-                  max={65535}
-                  value={cfgPort}
-                  onChange={(e) => setCfgPort(Number(e.target.value))}
-                  className="w-full bg-[#111622] border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-cyan-200 mb-1">Healthcheck URL (HTTP 200..399 / tcp://)</label>
-                <input
-                  type="text"
-                  value={cfgHealthcheckUrl}
-                  onChange={(e) => setCfgHealthcheckUrl(e.target.value)}
-                  placeholder="http://127.0.0.1:18080/health"
-                  className="w-full bg-[#111622] border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
-                />
-              </div>
-            </div>
-          </form>
-        )}
-
-        {/* НИЖНЯЯ ВЫДВИЖНАЯ КОНСОЛЬ В СТИЛЕ VS CODE / DOCKGE: ЛОГИ + STDIN + ХРАНИЛИЩЕ HUB.STATE + SHELL */}
-        <section
-          aria-label="Консоль живых логов"
-          className="bg-[#111622] border border-slate-800 rounded-xl overflow-hidden"
-        >
-          <div className="px-4 py-2 bg-[#0b0f17] border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-1">
+        {/* ==================== НИЖНЯЯ ДОК-КОНСОЛЬ (ЖИВОЙ ЛОГ / HUB.STATE / БЫСТРЫЙ SHELL) ==================== */}
+        <div className="bg-[#111622] border border-[#1e2638] rounded-xl overflow-hidden">
+          <div className="px-4 py-2.5 bg-[#0b0f17] border-b border-[#1e2638] flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5">
               <button
                 type="button"
                 onClick={() => setBottomConsoleTab('logs')}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer ${
                   bottomConsoleTab === 'logs'
-                    ? 'bg-slate-800 text-white'
-                    : 'text-slate-400 hover:text-white'
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-slate-400 hover:text-white hover:bg-[#111622]'
                 }`}
               >
-                <Terminal className="w-3.5 h-3.5 text-emerald-400" />
-                <span>Живой лог и stdin</span>
-                {isStreaming && <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />}
+                <Terminal className="w-3.5 h-3.5" />
+                Живой лог и stdin
               </button>
 
               <button
                 type="button"
                 onClick={() => {
                   setBottomConsoleTab('kv');
-                  if (activeProj) loadProjectKv(activeProj.id);
+                  loadProjectKv(activeProj.id);
                 }}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer ${
                   bottomConsoleTab === 'kv'
-                    ? 'bg-slate-800 text-indigo-300'
-                    : 'text-slate-400 hover:text-white'
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-slate-400 hover:text-white hover:bg-[#111622]'
                 }`}
               >
-                <HardDrive className="w-3.5 h-3.5 text-indigo-400" />
-                <span>Хранилище hub.state ({kvItems.length})</span>
+                <Database className="w-3.5 h-3.5" />
+                Хранилище hub.state ({kvItems.length})
               </button>
 
               <button
                 type="button"
                 onClick={() => setBottomConsoleTab('shell')}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer ${
                   bottomConsoleTab === 'shell'
-                    ? 'bg-slate-800 text-amber-300'
-                    : 'text-slate-400 hover:text-white'
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-slate-400 hover:text-white hover:bg-[#111622]'
                 }`}
               >
-                <Package className="w-3.5 h-3.5 text-amber-400" />
-                <span>Быстрый Shell (.venv / uv)</span>
+                <Package className="w-3.5 h-3.5" />
+                Быстрый Shell (.venv / uv)
               </button>
             </div>
 
-            <div className="flex items-center gap-2">
-              {bottomConsoleTab === 'logs' && (
-                <>
-                  <input
-                    type="text"
-                    value={logSearch}
-                    onChange={(e) => setLogSearch(e.target.value)}
-                    placeholder="Поиск в логе..."
-                    className="bg-[#111622] border border-slate-700 rounded px-2.5 py-1 text-xs font-mono text-white w-36 focus:outline-none focus:border-indigo-500"
-                  />
-                  <select
-                    id="run-history-select"
-                    value={selectedRunId || ''}
-                    onChange={(e) => setSelectedRunId(Number(e.target.value))}
-                    className="bg-[#111622] border border-slate-700 rounded px-2.5 py-1 text-xs font-mono text-slate-200"
-                  >
-                    {runs.length === 0 && <option value="">Нет запусков</option>}
-                    {runs.map((r) => (
-                      <option key={r.id} value={r.id}>
-                        Run #{r.id} · {r.status} · PID {r.pid || '—'} ({r.trigger})
-                      </option>
-                    ))}
-                  </select>
-                </>
-              )}
-
-              <button
-                type="button"
-                onClick={() => setConsoleExpanded(!consoleExpanded)}
-                className="px-2 py-1 text-[11px] font-mono text-slate-300 hover:text-white bg-slate-800 rounded cursor-pointer"
-              >
-                {consoleExpanded ? 'Свернуть (224px)' : 'Развернуть (420px)'}
-              </button>
-
-              <button
-                type="button"
-                onClick={() => activeProj && loadFilesAndRuns(activeProj)}
-                className="p-1.5 text-slate-400 hover:text-white bg-slate-800 rounded cursor-pointer"
-                title="Обновить консоль"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-              </button>
-            </div>
+            {bottomConsoleTab === 'logs' && (
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="text"
+                  value={logSearchQuery}
+                  onChange={(e) => setLogSearchQuery(e.target.value)}
+                  placeholder="Поиск в логе..."
+                  className="bg-[#111622] border border-[#1e2638] rounded-lg px-2.5 py-1 text-xs text-white font-mono w-36 sm:w-44"
+                />
+                <select
+                  value={selectedRunId || ''}
+                  onChange={(e) => setSelectedRunId(Number(e.target.value))}
+                  aria-label="Выбор запуска для просмотра лога"
+                  className="bg-[#111622] border border-[#1e2638] rounded-lg px-2.5 py-1 text-xs font-mono text-slate-200"
+                >
+                  {runs.map((r) => (
+                    <option key={r.id} value={r.id}>
+                      Запуск #{r.id} · {r.status} ({formatShortTime(r.started_at)})
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => setConsoleExpanded((v) => !v)}
+                  className="p-1.5 text-slate-400 hover:text-white bg-[#111622] border border-[#1e2638] rounded-lg cursor-pointer"
+                  title={consoleExpanded ? 'Свернуть консоль' : 'Развернуть консоль по высоте'}
+                >
+                  {consoleExpanded ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
+                </button>
+              </div>
+            )}
           </div>
 
           {bottomConsoleTab === 'logs' && (
             <>
               <pre
-                ref={logContainerRef}
-                data-testid="live-log-console"
-                className={`p-4 bg-[#070b14] text-slate-200 font-mono text-xs leading-relaxed overflow-y-auto whitespace-pre-wrap ${
+                ref={logBoxRef}
+                className={`p-4 text-xs font-mono text-slate-200 overflow-y-auto whitespace-pre-wrap leading-relaxed bg-[#070b14] transition-all ${
                   consoleExpanded ? 'h-[420px]' : 'h-56'
                 }`}
               >
-                {(logSearch.trim()
+                {(logSearchQuery.trim()
                   ? (logText || '')
                       .split('\n')
-                      .filter((line) => line.toLowerCase().includes(logSearch.toLowerCase()))
+                      .filter((line) => line.toLowerCase().includes(logSearchQuery.toLowerCase()))
                       .join('\n')
-                  : logText) || '// Лог пуст'}
+                  : logText) || 'Ожидание вывода процесса...'}
               </pre>
 
-              {selectedRunId && (
-                <form
-                  onSubmit={handleSendStdin}
-                  className="px-3 py-2 bg-[#0b1120] border-t border-slate-800 flex items-center gap-2"
+              <form
+                onSubmit={handleSendStdin}
+                className="px-4 py-2.5 bg-[#0b0f17] border-t border-[#1e2638] flex items-center gap-2"
+              >
+                <span className="text-xs font-mono text-indigo-400 shrink-0">stdin (FIFO) &gt;</span>
+                <input
+                  type="text"
+                  value={stdinInput}
+                  onChange={(e) => setStdinInput(e.target.value)}
+                  placeholder="Введите строку (2FA код, ответ на input() или команду) и нажмите Enter..."
+                  className="flex-1 bg-transparent text-xs font-mono text-white focus:outline-none"
+                />
+                {stdinStatus && <span className="text-[11px] font-mono text-emerald-400">{stdinStatus}</span>}
+                <button
+                  type="submit"
+                  className="px-3 py-1 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
                 >
-                  <span className="text-xs font-mono text-indigo-400 shrink-0">stdin (FIFO) &gt;</span>
-                  <input
-                    type="text"
-                    value={stdinText}
-                    onChange={(e) => setStdinText(e.target.value)}
-                    placeholder="Введите строку для передачи в блокирующий sys.stdin.readline() / input() дочернего процесса..."
-                    className="flex-1 bg-transparent text-xs font-mono text-white focus:outline-none"
-                  />
-                  <button
-                    type="submit"
-                    disabled={stdinSending || !stdinText.trim()}
-                    className="px-3 py-1 text-xs font-medium bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded inline-flex items-center gap-1 cursor-pointer shrink-0"
-                  >
-                    <CornerDownLeft className="w-3 h-3" />
-                    Отправить в stdin
-                  </button>
-                </form>
-              )}
+                  <Send className="w-3 h-3" />
+                  Отправить
+                </button>
+              </form>
             </>
           )}
 
           {bottomConsoleTab === 'kv' && (
-            <div className="p-4 bg-[#070b14] space-y-3">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-slate-400">
-                <span>
-                  Постоянное состояние скрипта в SQLite (<code className="font-mono text-indigo-300">hub.state.get/set/delete</code>)
-                </span>
-                <form onSubmit={handleSaveKvItem} className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    placeholder="Ключ (напр. last_id)"
-                    value={newKvKey}
-                    onChange={(e) => setNewKvKey(e.target.value)}
-                    className="bg-[#111622] border border-slate-700 rounded px-2.5 py-1 text-xs font-mono text-white w-36"
-                  />
-                  <input
-                    type="text"
-                    placeholder='Значение JSON/строка (напр. 105 или {"ok":true})'
-                    value={newKvValue}
-                    onChange={(e) => setNewKvValue(e.target.value)}
-                    className="bg-[#111622] border border-slate-700 rounded px-2.5 py-1 text-xs font-mono text-white w-56"
-                  />
-                  <button
-                    type="submit"
-                    className="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-semibold cursor-pointer"
-                  >
-                    Сохранить ключ
-                  </button>
-                </form>
-              </div>
+            <div className="p-4 space-y-3 bg-[#070b14]">
+              <form onSubmit={handleSaveKv} className="flex flex-wrap items-center gap-2">
+                <input
+                  type="text"
+                  value={newKvKey}
+                  onChange={(e) => setNewKvKey(e.target.value)}
+                  placeholder="Ключ (например: last_id или cursor)"
+                  className="bg-[#111622] border border-[#1e2638] rounded-lg px-3 py-1.5 text-xs font-mono text-white flex-1 min-w-[180px]"
+                />
+                <input
+                  type="text"
+                  value={newKvVal}
+                  onChange={(e) => setNewKvVal(e.target.value)}
+                  placeholder="Значение (JSON или строка)"
+                  className="bg-[#111622] border border-[#1e2638] rounded-lg px-3 py-1.5 text-xs font-mono text-white flex-1 min-w-[220px]"
+                />
+                <button
+                  type="submit"
+                  className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold cursor-pointer"
+                >
+                  Сохранить в hub.state
+                </button>
+                {kvStatus && <span className="text-xs font-mono text-emerald-400">{kvStatus}</span>}
+              </form>
 
               {kvItems.length === 0 ? (
-                <div className="py-6 text-center text-xs text-slate-400 font-mono">
-                  В хранилище hub.state этого проекта пока нет ключей. Вызовите hub.state.set("cursor", 1) в коде или добавьте ключ выше.
+                <div className="text-xs text-slate-400 py-4 text-center font-mono">
+                  Хранилище hub.state для этого проекта пусто. Используйте в Python:{' '}
+                  <code className="text-indigo-300">hub.state.set(&quot;key&quot;, &quot;value&quot;)</code>
                 </div>
               ) : (
-                <div className="overflow-x-auto max-h-56 overflow-y-auto border border-slate-800 rounded-lg">
+                <div className="max-h-44 overflow-y-auto border border-[#1e2638] rounded-lg">
                   <table className="w-full text-left border-collapse text-xs font-mono">
                     <thead>
-                      <tr className="border-b border-slate-800 bg-[#111622] text-slate-400">
-                        <th className="py-2 px-3">Ключ (key)</th>
-                        <th className="py-2 px-3">Значение (JSON)</th>
-                        <th className="py-2 px-3">Обновлено</th>
-                        <th className="py-2 px-3 text-right">Действие</th>
+                      <tr className="border-b border-[#1e2638] bg-[#111622] text-slate-400">
+                        <th className="py-1.5 px-3">Ключ</th>
+                        <th className="py-1.5 px-3">Значение</th>
+                        <th className="py-1.5 px-3">Обновлено</th>
+                        <th className="py-1.5 px-3 text-right">Действие</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-slate-800/70">
+                    <tbody className="divide-y divide-[#1e2638]">
                       {kvItems.map((item) => (
-                        <tr key={item.key} className="hover:bg-slate-900/60">
-                          <td className="py-2 px-3 text-indigo-300 font-semibold">{item.key}</td>
-                          <td className="py-2 px-3 text-slate-200">{JSON.stringify(item.value)}</td>
-                          <td className="py-2 px-3 text-slate-400 tabular-nums">
-                            {new Date(item.updated_at * 1000).toLocaleTimeString('ru-RU')}
+                        <tr key={item.key} className="hover:bg-[#111622]/60">
+                          <td className="py-1.5 px-3 text-indigo-300 font-semibold">{item.key}</td>
+                          <td className="py-1.5 px-3 text-slate-200 break-all">
+                            {typeof item.value === 'string' ? item.value : JSON.stringify(item.value)}
                           </td>
-                          <td className="py-2 px-3 text-right">
+                          <td className="py-1.5 px-3 text-slate-400">{formatShortTime(item.updated_at)}</td>
+                          <td className="py-1.5 px-3 text-right">
                             <button
                               type="button"
-                              onClick={() => handleDeleteKvItem(item.key)}
-                              className="text-rose-400 hover:underline cursor-pointer"
+                              onClick={() => handleDeleteKv(item.key)}
+                              className="text-rose-400 hover:text-rose-300 cursor-pointer"
                             >
                               Удалить
                             </button>
@@ -2601,34 +2566,30 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
           )}
 
           {bottomConsoleTab === 'shell' && (
-            <div className="p-4 bg-[#070b14] space-y-3">
-              <form onSubmit={handleRunCliCommand} className="flex items-center gap-2">
-                <span className="text-xs font-mono text-emerald-400 shrink-0">
-                  {activeProj.name}/.venv $
-                </span>
+            <div className="p-4 space-y-3 bg-[#070b14]">
+              <form onSubmit={handleExecCommand} className="flex items-center gap-2">
+                <span className="text-xs font-mono text-emerald-400 shrink-0">.venv $</span>
                 <input
                   type="text"
-                  value={cliCommandInput}
-                  onChange={(e) => setCliCommandInput(e.target.value)}
-                  placeholder="Введите команду (напр. pip install -r requirements.txt, git status, ls -la)..."
-                  className="flex-1 bg-[#111622] border border-slate-700 rounded px-3 py-1.5 text-xs font-mono text-white"
+                  value={cliCommand}
+                  onChange={(e) => setCliCommand(e.target.value)}
+                  placeholder="pip install ..., python3 -m ..., git status"
+                  className="flex-1 bg-[#111622] border border-[#1e2638] rounded-lg px-3 py-1.5 text-xs font-mono text-white"
                 />
                 <button
                   type="submit"
                   disabled={cliRunning}
-                  className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs font-semibold cursor-pointer"
+                  className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold cursor-pointer disabled:opacity-50"
                 >
                   {cliRunning ? 'Выполнение...' : 'Выполнить'}
                 </button>
               </form>
-              {cliMsg && (
-                <div className="text-xs font-mono text-slate-300 bg-[#111622] p-2.5 rounded border border-slate-800">
-                  {cliMsg.text}
-                </div>
-              )}
+              <pre className="text-xs font-mono text-slate-300 max-h-40 overflow-y-auto whitespace-pre-wrap">
+                {cliOutput || 'Введите команду выше для выполнения внутри изолированного окружения проекта.'}
+              </pre>
             </div>
           )}
-        </section>
+        </div>
       </div>
     </div>
   );

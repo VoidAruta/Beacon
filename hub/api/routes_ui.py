@@ -80,7 +80,7 @@ from hub.web_auth_mgr import (
 
 router = APIRouter(prefix="/api")
 
-_EXCLUDED_DIRS = {".venv", "node_modules", "__pycache__", ".git", ".mypy_cache", ".pytest_cache"}
+_EXCLUDED_DIRS = {".venv", "node_modules", "__pycache__", ".git", ".mypy_cache", ".pytest_cache", ".home", ".tmp"}
 _PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _SAFE_GIT_URL_RE = re.compile(r"^(?:https?://|ssh://|git@)[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+$")
 
@@ -902,15 +902,16 @@ async def api_import_example_projects(request: Request) -> dict[str, Any]:
         if spec["code"]:
             (ex_dir / "main.py").write_text(spec["code"], encoding="utf-8")
 
+        workdir = PROJECTS_DIR / spec["name"]
+        if not (workdir / "main.py").exists():
+            create_project_from_template(spec["name"], spec["template"], spec["runtime"], spec["type"])
+            if spec["code"]:
+                (workdir / "main.py").write_text(spec["code"], encoding="utf-8")
+        (LOGS_DIR / spec["name"]).mkdir(parents=True, exist_ok=True)
+
         existing = query_one("SELECT id FROM projects WHERE name = ?", (spec["name"],))
         if existing:
             continue
-
-        workdir = PROJECTS_DIR / spec["name"]
-        create_project_from_template(spec["name"], spec["template"], spec["runtime"], spec["type"])
-        if spec["code"]:
-            (workdir / "main.py").write_text(spec["code"], encoding="utf-8")
-        (LOGS_DIR / spec["name"]).mkdir(parents=True, exist_ok=True)
 
         execute_sql(
             """INSERT INTO projects (
@@ -1448,7 +1449,13 @@ async def api_project_files(request: Request, project_id: int) -> dict[str, Any]
 
     workdir = Path(proj["workdir"])
     workdir.mkdir(parents=True, exist_ok=True)
-    return {"workdir": str(workdir), "tree": _build_file_tree(workdir)}
+    tree = _build_file_tree(workdir)
+    if not tree:
+        tpl = "web" if proj.get("type") == "web" else str(proj.get("runtime") or "python")
+        create_project_from_template(proj["name"], tpl, str(proj.get("runtime") or "python"), str(proj.get("type") or "service"))
+        _invalidate_dir_size_cache(workdir)
+        tree = _build_file_tree(workdir)
+    return {"workdir": str(workdir), "tree": tree}
 
 
 @router.get("/projects/{project_id}/files/content")

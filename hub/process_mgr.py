@@ -58,12 +58,33 @@ def set_on_finish_callback(cb: Callable[[dict[str, Any], int, str, str], Corouti
 
 
 def _reap_zombies() -> None:
-    """Неблокирующий сбор осиротевших дочерних зомби-процессов."""
+    """
+    Неблокирующий сбор осиротевших дочерних зомби-процессов.
+    Сначала опрашивает все Popen-объекты в ACTIVE_RUNS, чтобы os.waitpid(-1)
+    не перехватил реальный код возврата (exit_code) отслеживаемых процессов.
+    """
+    for info in list(ACTIVE_RUNS.values()):
+        popen_obj = info.get("popen")
+        if popen_obj is not None:
+            try:
+                rc = popen_obj.poll()
+                if rc is not None:
+                    info["reaped_exit_code"] = int(rc)
+            except Exception:
+                pass
+
     while True:
         try:
-            wpid, _ = os.waitpid(-1, os.WNOHANG)
+            wpid, wstatus = os.waitpid(-1, os.WNOHANG)
             if wpid <= 0:
                 break
+            try:
+                code = os.waitstatus_to_exitcode(wstatus)
+            except Exception:
+                code = 0
+            for info in list(ACTIVE_RUNS.values()):
+                if info.get("pid") == wpid and info.get("reaped_exit_code") is None:
+                    info["reaped_exit_code"] = int(code)
         except (ChildProcessError, OSError):
             break
 
@@ -947,10 +968,12 @@ async def watch_processes_loop() -> None:
                     continue
 
                 # 1. Проверка завершения процесса
-                exit_code: Optional[int] = None
+                exit_code: Optional[int] = info.get("reaped_exit_code")
                 still_alive = False
 
-                if popen_obj is not None:
+                if exit_code is not None:
+                    still_alive = False
+                elif popen_obj is not None:
                     rc = popen_obj.poll()
                     if rc is None:
                         still_alive = True

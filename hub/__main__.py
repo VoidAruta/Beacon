@@ -64,7 +64,11 @@ async def security_and_auth_middleware(request: Request, call_next: Callable[[Re
 
     # 4. Проверка сессии и CSRF для защищённых маршрутов /api/*
     if path.startswith("/api/"):
-        token = request.cookies.get("hub_session") or request.headers.get("x-hub-session", "")
+        token = (
+            request.cookies.get("hub_session")
+            or request.headers.get("x-hub-session", "")
+            or request.query_params.get("session_token", "")
+        )
         session = verify_session_token(token)
         if not session:
             return JSONResponse({"detail": "Требуется авторизация"}, status_code=401)

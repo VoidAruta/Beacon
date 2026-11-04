@@ -183,41 +183,64 @@ export function App() {
   useEffect(() => {
     const initAuth = async () => {
       try {
+        const storedSession = sessionStorage.getItem('hub_session_token') || '';
+        const storedCsrf = sessionStorage.getItem('hub_csrf_token') || '';
+        const hasCookie = typeof document !== 'undefined' && document.cookie.includes('csrf_token=');
+
         for (let attempt = 0; attempt < 6; attempt++) {
-          const res = await safeFetch('/api/auth/me', {
-            headers: { Accept: 'application/json' },
-            credentials: 'same-origin',
-          });
-          const data = await res.json();
-          if (data && !data.__html_fallback) {
-            if (res.ok && data.authenticated) {
-              setAuthenticated(true);
-              setCsrfToken(data.csrf_token || '');
-              setSessionToken(data.session_token || '');
-              setMustChangePassword(false);
-              await loadAllData(data.csrf_token, data.session_token);
-              break;
-            }
-            // Если сессии ещё нет, пробуем штатный вход с дефолтным паролем 'admin' для удобства тестирования
-            const loginRes = await safeFetch('/api/auth/login', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-              body: JSON.stringify({ password: 'admin' }),
+          if (storedSession || hasCookie) {
+            const hdrs: Record<string, string> = { Accept: 'application/json' };
+            if (storedSession) hdrs['X-Hub-Session'] = storedSession;
+            if (storedCsrf) hdrs['X-CSRF-Token'] = storedCsrf;
+
+            const res = await safeFetch('/api/auth/me', {
+              headers: hdrs,
               credentials: 'same-origin',
             });
-            if (loginRes.ok) {
-              const loginData = await loginRes.json();
-              if (loginData && loginData.authenticated) {
+            const data = await res.json();
+            if (data && !data.__html_fallback) {
+              if (res.ok && data.authenticated) {
+                const cToken = data.csrf_token || storedCsrf;
+                const sToken = data.session_token || storedSession;
                 setAuthenticated(true);
-                setCsrfToken(loginData.csrf_token || '');
-                setSessionToken(loginData.session_token || '');
+                setCsrfToken(cToken);
+                setSessionToken(sToken);
+                sessionStorage.setItem('hub_session_token', sToken);
+                sessionStorage.setItem('hub_csrf_token', cToken);
                 setMustChangePassword(false);
-                await loadAllData(loginData.csrf_token, loginData.session_token);
+                await loadAllData(cToken, sToken);
+                break;
               }
+            } else {
+              await new Promise((r) => setTimeout(r, 600));
+              continue;
             }
-            break;
           }
-          await new Promise((r) => setTimeout(r, 600));
+
+          // Штатный вход с дефолтным паролем 'admin' для предпросмотра и тестирования
+          const loginRes = await safeFetch('/api/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ password: 'admin' }),
+            credentials: 'same-origin',
+          });
+          const loginData = await loginRes.json();
+          if (loginData && loginData.__html_fallback) {
+            await new Promise((r) => setTimeout(r, 600));
+            continue;
+          }
+          if (loginRes.ok && loginData && loginData.authenticated) {
+            const cToken = loginData.csrf_token || '';
+            const sToken = loginData.session_token || '';
+            setAuthenticated(true);
+            setCsrfToken(cToken);
+            setSessionToken(sToken);
+            sessionStorage.setItem('hub_session_token', sToken);
+            sessionStorage.setItem('hub_csrf_token', cToken);
+            setMustChangePassword(false);
+            await loadAllData(cToken, sToken);
+          }
+          break;
         }
       } catch (e) {
         console.error(e);
@@ -247,11 +270,15 @@ export function App() {
     if (res.ok) {
       const data = await res.json();
       if (data && data.authenticated) {
+        const cToken = data.csrf_token || '';
+        const sToken = data.session_token || '';
         setAuthenticated(true);
-        setCsrfToken(data.csrf_token || '');
-        setSessionToken(data.session_token || '');
+        setCsrfToken(cToken);
+        setSessionToken(sToken);
+        sessionStorage.setItem('hub_session_token', sToken);
+        sessionStorage.setItem('hub_csrf_token', cToken);
         setMustChangePassword(Boolean(data.must_change_password));
-        await loadAllData(data.csrf_token, data.session_token);
+        await loadAllData(cToken, sToken);
       } else {
         setLoginError(data?.detail || 'Ошибка авторизации');
       }
@@ -280,6 +307,8 @@ export function App() {
 
   const handleLogout = async () => {
     await apiFetch('/api/auth/logout', { method: 'POST' });
+    sessionStorage.removeItem('hub_session_token');
+    sessionStorage.removeItem('hub_csrf_token');
     setAuthenticated(false);
     setCsrfToken('');
     setSessionToken('');
@@ -878,6 +907,7 @@ export function App() {
                 initialSubTab={workspaceSubTab}
                 onSelectProject={setSelectedProject}
                 onOpenCreateModal={() => setCreateModalOpen(true)}
+                onImportExamples={handleImportExamples}
                 onStartProject={handleStartProject}
                 onStopProject={handleStopProject}
                 onRestartProject={handleRestartProject}
