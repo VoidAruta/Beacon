@@ -1,12 +1,12 @@
 """
-Публичное API веб-панели Hub (/api/*):
-- Авторизация (login, logout, me)
+Публичное API веб-панели Aruta / Hub (/api/*):
+- Авторизация (login, logout, me, stream_ticket) + RBAC пользователи (/api/users)
 - Дашборд (/api/dashboard)
-- Проекты (CRUD, start, stop, restart, install_deps, webhook)
-- Файловый менеджер и редактор кода (files tree, content GET/PUT, mkdir, rename, delete, upload + zip extract)
-- Логи и живой SSE-стрим (/api/projects/{id}/runs, /api/runs/{run_id}/log, /api/runs/{run_id}/stream)
+- Проекты (CRUD, start с параметрами, stop, restart, install_deps, webhook, ping, export/import .zip, project.yaml)
+- Файловый менеджер и редактор кода (files tree, content GET/PUT, mkdir, rename, delete, защищённый upload + zip extract)
+- Логи и живой SSE-стрим (/api/projects/{id}/runs, /api/runs/{run_id}/log, /api/runs/{run_id}/stream по одноразовому тикету)
 - Секреты и Cookie-Editor импорт (/api/secrets, /api/secrets/cookies, /api/asks/{ask_id}/answer)
-- Система, настройки, очистка кэша, аудит и самопроверка 6 пунктов приёмки
+- Система, настройки, очистка кэша, аудит и самопроверка пунктов приёмки
 """
 
 import asyncio
@@ -20,16 +20,26 @@ import shutil
 import time
 import zipfile
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Optional
 
 from hub.api import APIRouter, HTTPException, JSONResponse, Request, Response, StreamingResponse
-from hub.ask_broker import answer_ask, create_ask, ensure_tg_poller_running, get_active_asks, handle_telegram_command, poll_ask
+from hub.ask_broker import (
+    answer_ask,
+    create_ask,
+    ensure_tg_poller_running,
+    get_active_asks,
+    handle_telegram_command,
+    poll_ask,
+)
 from hub.auth import (
     check_rate_limit,
     check_webhook_rate_limit,
     clear_login_failures,
     create_session_tokens,
+    create_stream_ticket,
     hash_password,
+    is_default_password,
+    is_private_or_loopback_ip,
     record_login_failure,
     record_webhook_failure,
     revoke_session_token,
@@ -37,9 +47,10 @@ from hub.auth import (
     verify_session_token,
 )
 from hub.compat import croniter, psutil
-from hub.config import BASE_DIR, EXAMPLES_DIR, FORBIDDEN_PORTS, INITIAL_PASSWORD_PATH, LOGS_DIR, PROJECTS_DIR
+from hub.config import BASE_DIR, EXAMPLES_DIR, LOGS_DIR, PROJECTS_DIR, parse_reserved_ports
 from hub.db import execute_sql, get_all_settings, get_setting, log_audit, query_all, query_one, set_setting
 from hub.disk_guard import cleanup_system_caches, get_disk_status
+from hub.doctor import run_hub_doctor
 from hub.env_detect import get_environment_profile
 from hub.notifier import RECENT_NOTIFICATIONS, send_notification
 from hub.process_mgr import (
@@ -51,7 +62,6 @@ from hub.process_mgr import (
     send_stdin_to_run,
     start_project_run,
     stop_project,
-    stop_run,
 )
 from hub.scheduler import get_upcoming_runs
 from hub.secrets_mgr import (
@@ -65,8 +75,12 @@ from hub.secrets_mgr import (
     save_secret,
     validate_secret_name,
 )
-from hub.doctor import run_hub_doctor
-from hub.templates_mgr import create_project_from_template
+from hub.templates_mgr import (
+    create_project_from_template,
+    parse_simple_project_yaml,
+    sync_project_yaml,
+    write_project_agents_md,
+)
 from hub.web_auth_mgr import (
     ACTIVE_WEB_AUTH_SESSIONS,
     cancel_web_auth_session,
@@ -84,9 +98,21 @@ _EXCLUDED_DIRS = {".venv", "node_modules", "__pycache__", ".git", ".mypy_cache",
 _PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _SAFE_GIT_URL_RE = re.compile(r"^(?:https?://|ssh://|git@)[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+$")
 
-# TTL-кэш размеров папок (60 секунд) для защиты UFS-памяти Poco X3 NFC от os.walk каждые 2 секунды
+# Жёсткие лимиты безопасной распаковки ZIP (Фаза A.5)
+MAX_ZIP_ARCHIVE_BYTES = 50 * 1024 * 1024  # 50 МБ
+MAX_ZIP_UNCOMPRESSED_BYTES = 150 * 1024 * 1024  # 150 МБ
+MAX_ZIP_FILES = 1000
+MAX_ZIP_COMPRESSION_RATIO = 50.0
+_ZIP_STREAM_CHUNK = 65536
+
+# TTL-кэш размеров папок (60 секунд) для защиты UFS-памяти от os.walk каждые 2 секунды
 _DIR_SIZE_CACHE: dict[str, tuple[float, int]] = {}
 _DIR_SIZE_TTL_SEC = 60.0
+
+
+def _client_ip(request: Request) -> str:
+    state = getattr(request, "state", None)
+    return getattr(state, "client_ip", None) or (request.client.host if request.client else "127.0.0.1")
 
 
 def _validate_project_workdir(workdir_raw: str, project_name: str = "") -> str:
@@ -109,7 +135,7 @@ def _validate_project_workdir(workdir_raw: str, project_name: str = "") -> str:
     except ValueError as e:
         raise HTTPException(
             status_code=400,
-            detail="Недопустимый путь workdir: директория проекта должна находиться внутри /opt/hub/projects/",
+            detail="Недопустимый путь workdir: директория проекта должна находиться внутри PROJECTS_DIR",
         ) from e
 
     if common != str(base) or target == base:
@@ -128,6 +154,104 @@ def _safe_project_path(workdir: str | Path, rel_path: str) -> Path:
     if os.path.commonpath([str(base), str(target)]) != str(base):
         raise HTTPException(status_code=403, detail="Попытка выхода за пределы директории проекта (Path Traversal)")
     return target
+
+
+def safe_extract_zip_bytes(
+    file_bytes: bytes,
+    workdir: Path,
+    max_archive_bytes: int = MAX_ZIP_ARCHIVE_BYTES,
+    max_uncompressed_bytes: int = MAX_ZIP_UNCOMPRESSED_BYTES,
+    max_files: int = MAX_ZIP_FILES,
+    max_ratio: float = MAX_ZIP_COMPRESSION_RATIO,
+) -> list[str]:
+    """
+    Потоковая безопасная распаковка ZIP-архива (Фаза A.5):
+    - лимит размера архива
+    - лимит числа файлов
+    - лимит степени сжатия (защита от zip-бомб)
+    - лимит суммарного распакованного размера (как по заголовкам, так и при потоковом чтении чанками по 64 КБ)
+    - защита от Zip Slip через _safe_project_path
+    """
+    if len(file_bytes) > max_archive_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Размер ZIP-архива превышает лимит ({max_archive_bytes // (1024 * 1024)} МБ)",
+        )
+
+    extracted_files: list[str] = []
+    try:
+        zf_ctx = zipfile.ZipFile(io.BytesIO(file_bytes))
+    except zipfile.BadZipFile as e:
+        raise HTTPException(status_code=400, detail="Повреждённый или некорректный ZIP-архив") from e
+
+    with zf_ctx as zf:
+        members = zf.infolist()
+        if len(members) > max_files:
+            raise HTTPException(
+                status_code=400,
+                detail=f"В архиве слишком много файлов ({len(members)} > макс. {max_files})",
+            )
+
+        declared_total = 0
+        for member in members:
+            # Запрещаем симлинки внутри ZIP (external_attr Unix symlink 0o120000)
+            unix_mode = (member.external_attr >> 16) & 0o170000
+            if unix_mode == 0o120000:
+                raise HTTPException(status_code=400, detail=f"Символические ссылки в архиве запрещены: {member.filename}")
+            declared_total += max(0, int(member.file_size or 0))
+            if declared_total > max_uncompressed_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Суммарный размер распакованных файлов превышает лимит ({max_uncompressed_bytes // (1024 * 1024)} МБ)",
+                )
+            comp_sz = max(1, int(member.compress_size or 1))
+            if member.file_size > 1024 * 1024 and (member.file_size / comp_sz) > max_ratio:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Обнаружена подозрительная степень сжатия ({member.file_size / comp_sz:.1f}x > {max_ratio}x) в файле {member.filename}",
+                )
+
+        actual_total_written = 0
+        for member in members:
+            target_path = _safe_project_path(workdir, member.filename)
+            if member.is_dir():
+                target_path.mkdir(parents=True, exist_ok=True)
+                continue
+
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            comp_sz = max(1, int(member.compress_size or 1))
+            file_written = 0
+            with zf.open(member, "r") as src_f, open(target_path, "wb") as dst_f:
+                while True:
+                    chunk = src_f.read(_ZIP_STREAM_CHUNK)
+                    if not chunk:
+                        break
+                    file_written += len(chunk)
+                    actual_total_written += len(chunk)
+                    if actual_total_written > max_uncompressed_bytes:
+                        try:
+                            dst_f.close()
+                            target_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        raise HTTPException(
+                            status_code=413,
+                            detail="Превышен лимит распакованных данных при потоковом чтении (защита от Zip Bomb)",
+                        )
+                    if file_written > 1024 * 1024 and (file_written / comp_sz) > max_ratio:
+                        try:
+                            dst_f.close()
+                            target_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Превышен коэффициент сжатия ({max_ratio}x) при распаковке {member.filename}",
+                        )
+                    dst_f.write(chunk)
+            extracted_files.append(member.filename)
+
+    return extracted_files
 
 
 def _build_file_tree(root_dir: Path, rel_prefix: str = "") -> list[dict[str, Any]]:
@@ -176,7 +300,6 @@ def _invalidate_dir_size_cache(root_dir: Optional[Path] = None) -> None:
 
 
 def _calc_dir_size(root_dir: Path, force_refresh: bool = False) -> int:
-    """Подсчитывает суммарный размер файлов в директории (в байтах) с кэшированием на 60 сек."""
     if not root_dir.exists():
         return 0
     key = str(root_dir)
@@ -237,6 +360,8 @@ def _enrich_project(p: dict[str, Any]) -> dict[str, Any]:
             active_run_id = last_run["id"]
             pid = last_run["pid"]
             pgid = last_run["pgid"]
+        elif last_run["status"] == "crash_loop":
+            status = "crash_loop"
         elif p["type"] == "job":
             status = last_run["status"]
 
@@ -256,18 +381,24 @@ def _enrich_project(p: dict[str, Any]) -> dict[str, Any]:
         out["secrets"] = json.loads(p.get("secrets_json") or "[]")
     except Exception:
         out["secrets"] = []
+    try:
+        out["params_schema"] = json.loads(p.get("params_schema_json") or "[]")
+    except Exception:
+        out["params_schema"] = []
 
-    # Занимаемое место на диске (файлы проекта + логи запусков)
     code_size_bytes = _calc_dir_size(Path(p["workdir"]))
     logs_size_bytes = _calc_dir_size(LOGS_DIR / proj_name)
     out["code_size_bytes"] = code_size_bytes
     out["logs_size_bytes"] = logs_size_bytes
     out["total_size_bytes"] = code_size_bytes + logs_size_bytes
 
-    # Человекочитаемое описание, группа/категория, индивидуальный прокси и GitHub-репозиторий
     out["description"] = str(out["env"].get("PROJECT_DESCRIPTION", ""))
     out["is_test_project"] = str(out["env"].get("IS_TEST_PROJECT", "0")) == "1"
-    default_group = "Тесты" if out["is_test_project"] else ("Веб/API" if p["type"] == "web" else ("Боты 24/7" if p["type"] == "service" else "Скрипты"))
+    default_group = (
+        "Тесты"
+        if out["is_test_project"]
+        else ("Веб/API" if p["type"] == "web" else ("Боты 24/7" if p["type"] == "service" else "Скрипты"))
+    )
     out["group_tag"] = str(out["env"].get("PROJECT_GROUP") or default_group)
     out["custom_proxy"] = str(out["env"].get("CUSTOM_PROXY_URL", ""))
     out["git_repo_url"] = str(out["env"].get("GIT_REPO_URL", ""))
@@ -275,11 +406,20 @@ def _enrich_project(p: dict[str, Any]) -> dict[str, Any]:
     out["healthcheck_url"] = str(p.get("healthcheck_url") or "")
     out["healthcheck_interval_sec"] = int(p.get("healthcheck_interval_sec") or 30)
     out["health_status"] = str(p.get("health_status") or "unknown")
+    out["min_uptime_sec"] = int(p.get("min_uptime_sec") or 10)
+    out["max_restarts"] = int(p.get("max_restarts") or 10)
+    out["restart_delay_sec"] = int(p.get("restart_delay_sec") or 5)
+    out["cron_restart"] = str(p.get("cron_restart") or "")
+    out["crash_loop_count"] = int(p.get("crash_loop_count") or 0)
+    out["heartbeat_interval_sec"] = int(p.get("heartbeat_interval_sec") or 0)
+    out["heartbeat_grace_sec"] = int(p.get("heartbeat_grace_sec") or 60)
+    out["last_ping_at"] = int(p.get("last_ping_at") or 0)
+    out["on_success_project_id"] = int(p.get("on_success_project_id") or 0)
     out["has_venv"] = (Path(p["workdir"]) / ".venv" / "bin" / "python").exists()
     out["has_browser_profile"] = (Path(p["workdir"]) / "storage_state.json").exists()
+    out["has_project_yaml"] = (Path(p["workdir"]) / "project.yaml").exists()
     out["active_web_auth"] = ACTIVE_WEB_AUTH_SESSIONS.get(proj_id) is not None
 
-    # Индивидуальный статус куки этого проекта
     default_cookie_name = f"{proj_name}_cookies"
     cookie_row = query_one("SELECT * FROM secrets WHERE name = ?", (default_cookie_name,))
     if not cookie_row and out["secrets"]:
@@ -317,11 +457,11 @@ def _enrich_project(p: dict[str, Any]) -> dict[str, Any]:
 
 
 # ==============================================================================
-# 1. АВТОРИЗАЦИЯ
+# 1. АВТОРИЗАЦИЯ И СЕССИИ (Фаза A.1, A.4, D.4)
 # ==============================================================================
 @router.post("/auth/login")
 async def api_login(request: Request) -> Response:
-    client_ip = request.client.host if request.client else "127.0.0.1"
+    client_ip = _client_ip(request)
     allowed, retry_after = check_rate_limit(client_ip)
     if not allowed:
         return JSONResponse(
@@ -333,11 +473,37 @@ async def api_login(request: Request) -> Response:
             headers={"Retry-After": str(retry_after)},
         )
 
-    body = await request.json()
-    password = str(body.get("password", ""))
-    stored_hash = get_setting("password_hash", "")
+    default_pw = is_default_password()
+    # Фаза A.1(д): пока используется пароль по умолчанию, вход разрешён только с loopback и RFC1918
+    if default_pw and not is_private_or_loopback_ip(client_ip):
+        raise HTTPException(
+            status_code=403,
+            detail="Пока используется пароль по умолчанию (admin), вход разрешён только из локальной сети (127.0.0.1, 10/8, 172.16/12, 192.168/16).",
+        )
 
-    if not verify_password(password, stored_hash):
+    body = await request.json()
+    username = str(body.get("username", "admin") or "admin").strip()
+    password = str(body.get("password", ""))
+
+    authenticated_role = "admin"
+    authenticated_user = "admin"
+    auth_ok = False
+
+    if username in ("", "admin"):
+        stored_hash = get_setting("password_hash", "")
+        if verify_password(password, stored_hash):
+            auth_ok = True
+            authenticated_role = "admin"
+            authenticated_user = "admin"
+
+    if not auth_ok:
+        user_row = query_one("SELECT * FROM users WHERE username = ?", (username,))
+        if user_row and verify_password(password, user_row["password_hash"]):
+            auth_ok = True
+            authenticated_role = str(user_row.get("role") or "viewer")
+            authenticated_user = str(user_row["username"])
+
+    if not auth_ok:
         now_blocked, block_sec = record_login_failure(client_ip)
         if now_blocked:
             await send_notification(
@@ -352,12 +518,17 @@ async def api_login(request: Request) -> Response:
                 status_code=429,
                 headers={"Retry-After": str(block_sec)},
             )
-        raise HTTPException(status_code=401, detail="Неверный пароль администратора")
+        raise HTTPException(status_code=401, detail="Неверный пароль или имя пользователя")
 
     clear_login_failures(client_ip)
-    session_token, csrf_token = create_session_tokens()
-    must_change = get_setting("must_change_password", "0") == "1"
-    log_audit(client_ip, "LOGIN_SUCCESS", "Успешный вход в веб-панель")
+    session_token, csrf_token = create_session_tokens(role=authenticated_role, username=authenticated_user)
+    log_audit(client_ip, "LOGIN_SUCCESS", f"Успешный вход в панель (пользователь: {authenticated_user}, роль: {authenticated_role})")
+
+    is_https = (
+        getattr(getattr(request, "url", None), "scheme", "http") == "https"
+        or request.headers.get("x-forwarded-proto", "").lower() == "https"
+        or get_setting("cookie_secure", "0") == "1"
+    )
 
     resp = JSONResponse(
         {
@@ -365,43 +536,81 @@ async def api_login(request: Request) -> Response:
             "authenticated": True,
             "csrf_token": csrf_token,
             "session_token": session_token,
-            "must_change_password": must_change,
+            "role": authenticated_role,
+            "username": authenticated_user,
+            "is_default_password": is_default_password(),
+            "must_change_password": False,
         }
     )
-    resp.set_cookie("hub_session", session_token, max_age=86400 * 7, httponly=True, samesite="Lax")
-    resp.set_cookie("csrf_token", csrf_token, max_age=86400 * 7, httponly=False, samesite="Lax")
+    resp.set_cookie(
+        "beacon_session",
+        session_token,
+        max_age=86400 * 7,
+        httponly=True,
+        samesite="Strict",
+        secure=is_https,
+    )
+    resp.set_cookie(
+        "aruta_session",
+        session_token,
+        max_age=86400 * 7,
+        httponly=True,
+        samesite="Strict",
+        secure=is_https,
+    )
+    resp.set_cookie(
+        "hub_session",
+        session_token,
+        max_age=86400 * 7,
+        httponly=True,
+        samesite="Strict",
+        secure=is_https,
+    )
+    resp.set_cookie(
+        "csrf_token",
+        csrf_token,
+        max_age=86400 * 7,
+        httponly=False,
+        samesite="Strict",
+        secure=is_https,
+    )
     return resp
 
 
 @router.post("/auth/change_initial_password")
 async def api_change_initial_password(request: Request) -> dict[str, Any]:
-    """Принудительная смена начального пароля при первом входе."""
-    client_ip = request.client.host if request.client else "127.0.0.1"
+    """Смена пароля администратора (минимум 8 символов, без записи на диск)."""
+    client_ip = _client_ip(request)
     body = await request.json()
     new_password = str(body.get("new_password", "")).strip()
-    if len(new_password) < 6:
-        raise HTTPException(status_code=400, detail="Новый пароль должен содержать минимум 6 символов")
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Новый пароль должен содержать минимум 8 символов")
     if new_password.lower() == "admin":
-        raise HTTPException(status_code=400, detail="Новый пароль не может совпадать со словарным 'admin'")
+        raise HTTPException(status_code=400, detail="Новый пароль не может совпадать со стандартным 'admin'")
 
     set_setting("password_hash", hash_password(new_password))
     set_setting("must_change_password", "0")
-    try:
-        INITIAL_PASSWORD_PATH.unlink(missing_ok=True)
-    except OSError:
-        pass
-    log_audit(client_ip, "INITIAL_PASSWORD_CHANGED", "Начальный пароль успешно заменён пользователем")
-    return {"ok": True, "must_change_password": False}
+    log_audit(client_ip, "PASSWORD_CHANGED", "Пароль администратора успешно изменён")
+    return {"ok": True, "must_change_password": False, "is_default_password": False}
 
 
 @router.post("/auth/logout")
 async def api_logout(request: Request) -> Response:
-    client_ip = request.client.host if request.client else "127.0.0.1"
-    token = request.cookies.get("hub_session") or request.headers.get("x-hub-session", "")
+    client_ip = _client_ip(request)
+    token = (
+        request.cookies.get("beacon_session")
+        or request.cookies.get("aruta_session")
+        or request.cookies.get("hub_session")
+        or request.headers.get("x-beacon-session", "")
+        or request.headers.get("x-aruta-session", "")
+        or request.headers.get("x-hub-session", "")
+    )
     if token:
         revoke_session_token(token)
     log_audit(client_ip, "LOGOUT", "Выход из веб-панели (сессия инвалидирована)")
     resp = JSONResponse({"ok": True, "authenticated": False})
+    resp.delete_cookie("beacon_session")
+    resp.delete_cookie("aruta_session")
     resp.delete_cookie("hub_session")
     resp.delete_cookie("csrf_token")
     return resp
@@ -409,27 +618,90 @@ async def api_logout(request: Request) -> Response:
 
 @router.get("/auth/me")
 async def api_auth_me(request: Request) -> Response:
-    token = request.cookies.get("hub_session") or request.headers.get("x-hub-session", "")
+    token = (
+        request.cookies.get("beacon_session")
+        or request.cookies.get("aruta_session")
+        or request.cookies.get("hub_session")
+        or request.headers.get("x-beacon-session", "")
+        or request.headers.get("x-aruta-session", "")
+        or request.headers.get("x-hub-session", "")
+    )
     session = verify_session_token(token)
-    must_change = get_setting("must_change_password", "0") == "1"
+    default_pw = is_default_password()
     if session:
         return JSONResponse(
             {
                 "authenticated": True,
                 "csrf_token": session["csrf"],
                 "session_token": token,
-                "must_change_password": must_change,
+                "role": session.get("role", "admin"),
+                "username": session.get("sub", "admin"),
+                "is_default_password": default_pw,
+                "must_change_password": False,
+                "safe_mode": get_setting("safe_mode", "0") == "1",
             }
         )
 
+    # Фаза A.1(б): поле initial_password_file полностью убрано из ответа /api/auth/me
     return JSONResponse(
         {
             "authenticated": False,
-            "must_change_password": must_change,
-            "initial_password_file": str(INITIAL_PASSWORD_PATH) if INITIAL_PASSWORD_PATH.exists() else None,
+            "is_default_password": default_pw,
+            "must_change_password": False,
         },
         status_code=401,
     )
+
+
+@router.post("/auth/stream_ticket")
+async def api_create_stream_ticket(request: Request) -> dict[str, Any]:
+    """Выдаёт короткоживущий одноразовый тикет для подключения к SSE-потоку логов (/api/runs/{id}/stream?ticket=...)."""
+    body = await request.json() if request.headers.get("content-length") not in (None, "0") else {}
+    run_id_raw = body.get("run_id")
+    run_id = int(run_id_raw) if run_id_raw is not None and str(run_id_raw).isdigit() else None
+    ticket = create_stream_ticket(run_id=run_id, ttl_sec=60)
+    return {"ok": True, "ticket": ticket, "expires_in": 60}
+
+
+# ==============================================================================
+# 1.1. РОЛЕВАЯ МОДЕЛЬ (RBAC Users — Фаза D.4)
+# ==============================================================================
+@router.get("/users")
+async def api_list_users(request: Request) -> list[dict[str, Any]]:
+    rows = query_all("SELECT id, username, role, created_at FROM users ORDER BY id ASC")
+    return rows
+
+
+@router.post("/users")
+async def api_create_user(request: Request) -> dict[str, Any]:
+    body = await request.json()
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", "")).strip()
+    role = str(body.get("role", "viewer")).strip().lower()
+
+    if not _PROJECT_NAME_RE.match(username) or username.lower() == "admin":
+        raise HTTPException(status_code=400, detail="Некорректное имя пользователя (не должно быть 'admin')")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Пароль должен содержать минимум 8 символов")
+    if role not in ("viewer", "operator", "admin"):
+        raise HTTPException(status_code=400, detail="Роль должна быть 'viewer', 'operator' или 'admin'")
+    if query_one("SELECT id FROM users WHERE username = ?", (username,)):
+        raise HTTPException(status_code=400, detail=f"Пользователь «{username}» уже существует")
+
+    now = int(time.time())
+    uid = execute_sql(
+        "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
+        (username, hash_password(password), role, now),
+    )
+    log_audit(_client_ip(request), "USER_CREATED", f"Создан пользователь {username} (роль: {role})")
+    return {"ok": True, "id": uid, "username": username, "role": role, "created_at": now}
+
+
+@router.delete("/users/{user_id}")
+async def api_delete_user(request: Request, user_id: int) -> dict[str, Any]:
+    execute_sql("DELETE FROM users WHERE id = ?", (user_id,))
+    log_audit(_client_ip(request), "USER_DELETED", f"Удалён пользователь ID={user_id}")
+    return {"ok": True, "deleted_id": user_id}
 
 
 # ==============================================================================
@@ -457,12 +729,16 @@ async def api_dashboard(request: Request) -> dict[str, Any]:
                   r.started_at, r.finished_at, r.exit_code, r.error_summary
            FROM runs r
            JOIN projects p ON p.id = r.project_id
-           WHERE r.status IN ('failed', 'timeout', 'killed_oom')
+           WHERE r.status IN ('failed', 'timeout', 'killed_oom', 'crash_loop')
            ORDER BY r.started_at DESC
            LIMIT 10"""
     )
 
-    proxy_url = get_setting("proxy_url", "http://127.0.0.1:10808")
+    pending_approvals_row = query_one("SELECT COUNT(*) AS cnt FROM ai_approvals WHERE status = 'pending'")
+    pending_ai_approvals_count = int((pending_approvals_row or {}).get("cnt") or 0)
+
+    proxy_url = get_setting("proxy_url", "")
+    default_pw = is_default_password()
     return {
         "system": {
             "cpu_percent": cpu_pct,
@@ -476,10 +752,15 @@ async def api_dashboard(request: Request) -> dict[str, Any]:
             "hub_ram_budget_mb": 80,
             "disk": disk,
             "proxy_url": proxy_url,
-            "proxy_status": check_proxy_reachable(proxy_url),
+            "proxy_status": check_proxy_reachable(proxy_url) if proxy_url else {"online": False, "url": "", "disabled": True},
             "hardware": get_poco_hardware_status(),
             "env_profile": get_environment_profile(),
             "run_as_user": get_setting("run_as_user", "root"),
+            "is_default_password": default_pw,
+            "safe_mode": get_setting("safe_mode", "0") == "1",
+            "ai_access_enabled": get_setting("ai_access_enabled", "0") == "1" and not default_pw,
+            "ai_access_paused": get_setting("ai_access_paused", "0") == "1",
+            "pending_ai_approvals_count": pending_ai_approvals_count,
         },
         "pending_asks": active_asks,
         "expired_cookies": expired_cookies,
@@ -491,7 +772,7 @@ async def api_dashboard(request: Request) -> dict[str, Any]:
 
 
 # ==============================================================================
-# 3. ПРОЕКТЫ (Jobs & Services)
+# 3. ПРОЕКТЫ (Jobs, Services, Web) + Фаза D
 # ==============================================================================
 @router.get("/projects")
 async def api_list_projects(request: Request) -> list[dict[str, Any]]:
@@ -522,7 +803,7 @@ async def api_create_project(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Некорректный runtime")
 
     requested_workdir = str(body.get("workdir") or (PROJECTS_DIR / name)).strip()
-    validated_workdir = _validate_project_workdir(requested_workdir, name)
+    _validate_project_workdir(requested_workdir, name)
 
     template = str(body.get("template", "web" if proj_type == "web" else runtime)).strip()
     tpl_info = create_project_from_template(name, template=template, runtime=runtime, proj_type=proj_type)
@@ -532,8 +813,10 @@ async def api_create_project(request: Request) -> dict[str, Any]:
     use_proxy = int(body.get("use_proxy", tpl_info["use_proxy"]))
     ram_limit_mb = max(0, int(body.get("ram_limit_mb", 0) or 0))
     proj_port = max(0, int(body.get("port", 0) or 0))
-    if proj_port > 0 and proj_port in FORBIDDEN_PORTS:
-        raise HTTPException(status_code=400, detail=f"Порт {proj_port} зарезервирован системой")
+    reserved = parse_reserved_ports(get_setting("reserved_ports", ""))
+    if proj_port > 0 and proj_port in reserved:
+        raise HTTPException(status_code=400, detail=f"Порт {proj_port} указан в списке зарезервированных портов (reserved_ports)")
+
     healthcheck_url = str(body.get("healthcheck_url", "")).strip()
     healthcheck_interval_sec = max(5, int(body.get("healthcheck_interval_sec", 30) or 30))
 
@@ -542,6 +825,11 @@ async def api_create_project(request: Request) -> dict[str, Any]:
 
     sec_val = body.get("secrets", body.get("secrets_json", []))
     secrets_json = json.dumps(sec_val, ensure_ascii=False) if isinstance(sec_val, list) else str(sec_val or "[]")
+
+    params_val = body.get("params_schema", body.get("params_schema_json", []))
+    params_schema_json = (
+        json.dumps(params_val, ensure_ascii=False) if isinstance(params_val, list) else str(params_val or "[]")
+    )
 
     schedule_type = str(body.get("schedule_type", "manual")).strip()
     schedule_expr = str(body.get("schedule_expr", "")).strip()
@@ -558,6 +846,17 @@ async def api_create_project(request: Request) -> dict[str, Any]:
     backoff_min_sec = max(1, int(body.get("backoff_min_sec", 2) or 2))
     backoff_max_sec = max(backoff_min_sec, int(body.get("backoff_max_sec", 300) or 300))
 
+    min_uptime_sec = max(1, int(body.get("min_uptime_sec", 10) or 10))
+    max_restarts = max(0, int(body.get("max_restarts", 10) or 10))
+    restart_delay_sec = max(1, int(body.get("restart_delay_sec", 5) or 5))
+    cron_restart = str(body.get("cron_restart", "")).strip()
+    if cron_restart and not croniter.is_valid(cron_restart):
+        raise HTTPException(status_code=400, detail=f"Некорректное выражение cron_restart: {cron_restart}")
+
+    heartbeat_interval_sec = max(0, int(body.get("heartbeat_interval_sec", 0) or 0))
+    heartbeat_grace_sec = max(5, int(body.get("heartbeat_grace_sec", 60) or 60))
+    on_success_project_id = max(0, int(body.get("on_success_project_id", 0) or 0))
+
     notify_on_error = 1 if body.get("notify_on_error", True) else 0
     notify_on_success = 1 if body.get("notify_on_success", False) else 0
     notify_on_crash = 1 if body.get("notify_on_crash", True) else 0
@@ -570,9 +869,11 @@ async def api_create_project(request: Request) -> dict[str, Any]:
             schedule_type, schedule_expr,
             timeout_sec, max_retries, retry_delay_sec, webhook_token,
             autostart, restart_policy, backoff_min_sec, backoff_max_sec,
+            min_uptime_sec, max_restarts, restart_delay_sec, cron_restart, crash_loop_count,
+            heartbeat_interval_sec, heartbeat_grace_sec, last_ping_at, on_success_project_id, params_schema_json,
             desired_state, notify_on_error, notify_on_success, notify_on_crash,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stopped', ?, ?, ?, ?, ?)""",
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0, ?, ?, 'stopped', ?, ?, ?, ?, ?)""",
         (
             name,
             proj_type,
@@ -596,6 +897,14 @@ async def api_create_project(request: Request) -> dict[str, Any]:
             restart_policy,
             backoff_min_sec,
             backoff_max_sec,
+            min_uptime_sec,
+            max_restarts,
+            restart_delay_sec,
+            cron_restart,
+            heartbeat_interval_sec,
+            heartbeat_grace_sec,
+            on_success_project_id,
+            params_schema_json,
             notify_on_error,
             notify_on_success,
             notify_on_crash,
@@ -605,6 +914,20 @@ async def api_create_project(request: Request) -> dict[str, Any]:
     )
 
     row = query_one("SELECT * FROM projects WHERE id = ?", (proj_id,))
+    if row:
+        try:
+            sync_project_yaml(row)
+            write_project_agents_md(
+                Path(workdir),
+                name,
+                proj_type,
+                runtime,
+                cmd,
+                secrets_list=json.loads(secrets_json),
+                env_keys=list(json.loads(env_json).keys()),
+            )
+        except Exception:
+            pass
     return _enrich_project(row or {})
 
 
@@ -624,8 +947,10 @@ async def api_update_project(request: Request, project_id: int) -> dict[str, Any
     use_proxy = 1 if body.get("use_proxy", existing["use_proxy"]) else 0
     ram_limit_mb = max(0, int(body.get("ram_limit_mb", existing["ram_limit_mb"]) or 0))
     proj_port = max(0, int(body.get("port", existing.get("port", 0)) or 0))
-    if proj_port > 0 and proj_port in FORBIDDEN_PORTS:
-        raise HTTPException(status_code=400, detail=f"Порт {proj_port} зарезервирован системой")
+    reserved = parse_reserved_ports(get_setting("reserved_ports", ""))
+    if proj_port > 0 and proj_port in reserved:
+        raise HTTPException(status_code=400, detail=f"Порт {proj_port} зарезервирован в настройках reserved_ports")
+
     healthcheck_url = str(body.get("healthcheck_url", existing.get("healthcheck_url", ""))).strip()
     healthcheck_interval_sec = max(
         5, int(body.get("healthcheck_interval_sec", existing.get("healthcheck_interval_sec", 30)) or 30)
@@ -636,6 +961,11 @@ async def api_update_project(request: Request, project_id: int) -> dict[str, Any
 
     sec_val = body.get("secrets", body.get("secrets_json", existing["secrets_json"]))
     secrets_json = json.dumps(sec_val, ensure_ascii=False) if isinstance(sec_val, list) else str(sec_val)
+
+    params_val = body.get("params_schema", body.get("params_schema_json", existing.get("params_schema_json", "[]")))
+    params_schema_json = (
+        json.dumps(params_val, ensure_ascii=False) if isinstance(params_val, list) else str(params_val or "[]")
+    )
 
     schedule_type = str(body.get("schedule_type", existing["schedule_type"])).strip()
     schedule_expr = str(body.get("schedule_expr", existing["schedule_expr"])).strip()
@@ -651,6 +981,21 @@ async def api_update_project(request: Request, project_id: int) -> dict[str, Any
     backoff_min_sec = max(1, int(body.get("backoff_min_sec", existing["backoff_min_sec"]) or 2))
     backoff_max_sec = max(backoff_min_sec, int(body.get("backoff_max_sec", existing["backoff_max_sec"]) or 300))
 
+    min_uptime_sec = max(1, int(body.get("min_uptime_sec", existing.get("min_uptime_sec", 10)) or 10))
+    max_restarts = max(0, int(body.get("max_restarts", existing.get("max_restarts", 10)) or 0))
+    restart_delay_sec = max(1, int(body.get("restart_delay_sec", existing.get("restart_delay_sec", 5)) or 5))
+    cron_restart = str(body.get("cron_restart", existing.get("cron_restart", ""))).strip()
+    if cron_restart and not croniter.is_valid(cron_restart):
+        raise HTTPException(status_code=400, detail=f"Некорректное выражение cron_restart: {cron_restart}")
+
+    heartbeat_interval_sec = max(
+        0, int(body.get("heartbeat_interval_sec", existing.get("heartbeat_interval_sec", 0)) or 0)
+    )
+    heartbeat_grace_sec = max(5, int(body.get("heartbeat_grace_sec", existing.get("heartbeat_grace_sec", 60)) or 60))
+    on_success_project_id = max(
+        0, int(body.get("on_success_project_id", existing.get("on_success_project_id", 0)) or 0)
+    )
+
     notify_on_error = 1 if body.get("notify_on_error", existing["notify_on_error"]) else 0
     notify_on_success = 1 if body.get("notify_on_success", existing["notify_on_success"]) else 0
     notify_on_crash = 1 if body.get("notify_on_crash", existing["notify_on_crash"]) else 0
@@ -663,6 +1008,8 @@ async def api_update_project(request: Request, project_id: int) -> dict[str, Any
             schedule_type = ?, schedule_expr = ?,
             timeout_sec = ?, max_retries = ?, retry_delay_sec = ?,
             autostart = ?, restart_policy = ?, backoff_min_sec = ?, backoff_max_sec = ?,
+            min_uptime_sec = ?, max_restarts = ?, restart_delay_sec = ?, cron_restart = ?,
+            heartbeat_interval_sec = ?, heartbeat_grace_sec = ?, on_success_project_id = ?, params_schema_json = ?,
             notify_on_error = ?, notify_on_success = ?, notify_on_crash = ?, updated_at = ?
            WHERE id = ?""",
         (
@@ -686,6 +1033,14 @@ async def api_update_project(request: Request, project_id: int) -> dict[str, Any
             restart_policy,
             backoff_min_sec,
             backoff_max_sec,
+            min_uptime_sec,
+            max_restarts,
+            restart_delay_sec,
+            cron_restart,
+            heartbeat_interval_sec,
+            heartbeat_grace_sec,
+            on_success_project_id,
+            params_schema_json,
             notify_on_error,
             notify_on_success,
             notify_on_crash,
@@ -695,6 +1050,20 @@ async def api_update_project(request: Request, project_id: int) -> dict[str, Any
     )
 
     updated = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if updated:
+        try:
+            sync_project_yaml(updated)
+            write_project_agents_md(
+                Path(workdir),
+                updated["name"],
+                proj_type,
+                runtime,
+                cmd,
+                secrets_list=json.loads(secrets_json),
+                env_keys=list(json.loads(env_json).keys()),
+            )
+        except Exception:
+            pass
     return _enrich_project(updated or {})
 
 
@@ -711,8 +1080,19 @@ async def api_delete_project(request: Request, project_id: int) -> dict[str, Any
 
 @router.post("/projects/{project_id}/start")
 async def api_start_project(request: Request, project_id: int) -> dict[str, Any]:
+    body = await request.json() if request.headers.get("content-length") not in (None, "0") else {}
+    launch_params = body.get("params") or body.get("extra_env") or {}
+    extra_env: dict[str, str] = {}
+    if isinstance(launch_params, dict):
+        for k, v in launch_params.items():
+            clean_k = re.sub(r"[^a-zA-Z0-9_]", "_", str(k).strip()).upper()
+            if clean_k:
+                extra_env[clean_k] = str(v)
+                extra_env[f"PARAM_{clean_k}"] = str(v)
+
+    execute_sql("UPDATE projects SET crash_loop_count = 0 WHERE id = ?", (project_id,))
     try:
-        run = await start_project_run(project_id, trigger="manual")
+        run = await start_project_run(project_id, trigger="manual", extra_env=extra_env or None)
         proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
         return {"ok": True, "run": run, "project": _enrich_project(proj or {})}
     except Exception as e:
@@ -730,9 +1110,13 @@ async def api_stop_project(request: Request, project_id: int) -> dict[str, Any]:
 async def api_restart_project(request: Request, project_id: int) -> dict[str, Any]:
     await stop_project(project_id)
     await asyncio.sleep(0.2)
-    run = await start_project_run(project_id, trigger="manual")
-    proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
-    return {"ok": True, "run": run, "project": _enrich_project(proj or {})}
+    execute_sql("UPDATE projects SET crash_loop_count = 0 WHERE id = ?", (project_id,))
+    try:
+        run = await start_project_run(project_id, trigger="manual")
+        proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+        return {"ok": True, "run": run, "project": _enrich_project(proj or {})}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.post("/projects/{project_id}/install_deps")
@@ -749,9 +1133,207 @@ async def api_install_deps(request: Request, project_id: int) -> dict[str, Any]:
     return {"ok": True, "run": run}
 
 
+# ==============================================================================
+# 3.1. DEAD MAN'S SWITCH (/api/ping/{project}), PROJECT.YAML И ЭКСПОРТ/ИМПОРТ ZIP (Фаза D)
+# ==============================================================================
+@router.get("/ping/{project_identifier}")
+@router.post("/ping/{project_identifier}")
+async def api_dead_mans_switch_ping(request: Request, project_identifier: str) -> dict[str, Any]:
+    """Входящий пинг от задачи/сервиса (Dead Man's Switch — Фаза D.2)."""
+    ident = (project_identifier or "").strip()
+    proj = (
+        query_one("SELECT * FROM projects WHERE id = ?", (int(ident),))
+        if ident.isdigit()
+        else query_one("SELECT * FROM projects WHERE name = ? OR webhook_token = ?", (ident, ident))
+    )
+    if not proj:
+        raise HTTPException(status_code=404, detail="Проект для пинга не найден")
+
+    now = int(time.time())
+    execute_sql(
+        "UPDATE projects SET last_ping_at = ?, health_status = 'healthy', updated_at = ? WHERE id = ?",
+        (now, now, proj["id"]),
+    )
+    return {"ok": True, "project": proj["name"], "ping_at": now, "health_status": "healthy"}
+
+
+@router.get("/projects/{project_id}/yaml")
+async def api_get_project_yaml(request: Request, project_id: int) -> dict[str, Any]:
+    proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    yaml_path = sync_project_yaml(proj)
+    return {
+        "ok": True,
+        "path": str(yaml_path),
+        "content": yaml_path.read_text(encoding="utf-8", errors="replace"),
+    }
+
+
+@router.put("/projects/{project_id}/yaml")
+async def api_put_project_yaml(request: Request, project_id: int) -> dict[str, Any]:
+    proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+
+    body = await request.json()
+    yaml_text = str(body.get("content", ""))
+    parsed = parse_simple_project_yaml(yaml_text)
+
+    workdir = Path(proj["workdir"])
+    workdir.mkdir(parents=True, exist_ok=True)
+    (workdir / "project.yaml").write_text(yaml_text, encoding="utf-8")
+
+    now = int(time.time())
+    execute_sql(
+        """UPDATE projects SET
+            type = ?, runtime = ?, cmd = ?, port = ?, ram_limit_mb = ?,
+            use_proxy = ?, autostart = ?, restart_policy = ?,
+            min_uptime_sec = ?, max_restarts = ?, restart_delay_sec = ?, cron_restart = ?,
+            schedule_type = ?, schedule_expr = ?, healthcheck_url = ?,
+            heartbeat_interval_sec = ?, heartbeat_grace_sec = ?, updated_at = ?
+           WHERE id = ?""",
+        (
+            parsed.get("type", proj["type"]),
+            parsed.get("runtime", proj["runtime"]),
+            parsed.get("cmd", proj["cmd"]),
+            int(parsed.get("port", proj.get("port", 0)) or 0),
+            int(parsed.get("ram_limit_mb", proj.get("ram_limit_mb", 0)) or 0),
+            1 if parsed.get("use_proxy", proj["use_proxy"]) else 0,
+            1 if parsed.get("autostart", proj["autostart"]) else 0,
+            str(parsed.get("restart_policy", proj["restart_policy"])),
+            int(parsed.get("min_uptime_sec", proj.get("min_uptime_sec", 10)) or 10),
+            int(parsed.get("max_restarts", proj.get("max_restarts", 10)) or 10),
+            int(parsed.get("restart_delay_sec", proj.get("restart_delay_sec", 5)) or 5),
+            str(parsed.get("cron_restart", proj.get("cron_restart", ""))),
+            str(parsed.get("schedule_type", proj["schedule_type"])),
+            str(parsed.get("schedule_expr", proj["schedule_expr"])),
+            str(parsed.get("healthcheck_url", proj.get("healthcheck_url", ""))),
+            int(parsed.get("heartbeat_interval_sec", proj.get("heartbeat_interval_sec", 0)) or 0),
+            int(parsed.get("heartbeat_grace_sec", proj.get("heartbeat_grace_sec", 60)) or 60),
+            now,
+            project_id,
+        ),
+    )
+    updated = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    return {"ok": True, "project": _enrich_project(updated or {})}
+
+
+@router.get("/projects/{project_id}/export")
+async def api_export_project_zip(request: Request, project_id: int) -> Response:
+    """Экспортирует проект в .zip вместе с project.yaml, но БЕЗ значений секретов и без .venv/node_modules (Фаза D.3)."""
+    proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+
+    sync_project_yaml(proj)
+    workdir = Path(proj["workdir"])
+    buf = io.BytesIO()
+    skip_files = {"cookies.json", "storage_state.json", ".env"}
+
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if workdir.exists():
+            for root, dirs, files in os.walk(workdir):
+                dirs[:] = [d for d in dirs if d not in _EXCLUDED_DIRS and d != "browser_profile"]
+                root_p = Path(root)
+                for fn in files:
+                    if fn in skip_files:
+                        continue
+                    fp = root_p / fn
+                    try:
+                        if fp.is_file() and not fp.is_symlink() and fp.stat().st_size <= 20 * 1024 * 1024:
+                            rel = fp.relative_to(workdir)
+                            zf.write(fp, str(rel))
+                    except OSError:
+                        pass
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{proj["name"]}.zip"'},
+    )
+
+
+@router.post("/projects/import_archive")
+async def api_import_project_archive(request: Request) -> dict[str, Any]:
+    """Импортирует проект из .zip-архива (с чтением project.yaml и безопасной распаковкой)."""
+    body = await request.json()
+    name = str(body.get("name", "")).strip()
+    b64 = str(body.get("content_base64", "")).strip()
+    if not b64:
+        raise HTTPException(status_code=400, detail="Передайте содержимое архива в content_base64")
+    file_bytes = base64.b64decode(b64)
+
+    if not name:
+        name = f"imported-{int(time.time())}"
+    if not _PROJECT_NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="Некорректное имя проекта")
+    if query_one("SELECT id FROM projects WHERE name = ?", (name,)):
+        raise HTTPException(status_code=400, detail=f"Проект «{name}» уже существует")
+
+    workdir = PROJECTS_DIR / name
+    workdir.mkdir(parents=True, exist_ok=True)
+    (LOGS_DIR / name).mkdir(parents=True, exist_ok=True)
+
+    try:
+        extracted = safe_extract_zip_bytes(file_bytes, workdir)
+    except Exception:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+
+    yaml_cfg: dict[str, Any] = {}
+    yaml_file = workdir / "project.yaml"
+    if yaml_file.exists():
+        yaml_cfg = parse_simple_project_yaml(yaml_file.read_text(encoding="utf-8", errors="replace"))
+
+    proj_type = str(yaml_cfg.get("type", "service"))
+    if proj_type not in ("job", "service", "web"):
+        proj_type = "service"
+    runtime = str(yaml_cfg.get("runtime", "python"))
+    cmd = str(yaml_cfg.get("cmd", "python3 main.py"))
+
+    now = int(time.time())
+    proj_id = execute_sql(
+        """INSERT INTO projects (
+            name, type, runtime, cmd, workdir, env_json, secrets_json,
+            use_proxy, ram_limit_mb, port, healthcheck_url, healthcheck_interval_sec,
+            schedule_type, schedule_expr, timeout_sec, max_retries, retry_delay_sec,
+            webhook_token, autostart, restart_policy, backoff_min_sec, backoff_max_sec,
+            min_uptime_sec, max_restarts, restart_delay_sec, cron_restart,
+            desired_state, notify_on_error, notify_on_success, notify_on_crash,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 30, ?, ?, 0, 0, 30, ?, ?, ?, 2, 300, ?, ?, ?, ?, 'stopped', 1, 0, 1, ?, ?)""",
+        (
+            name,
+            proj_type,
+            runtime,
+            cmd,
+            str(workdir),
+            json.dumps(yaml_cfg.get("env", {}), ensure_ascii=False),
+            json.dumps(yaml_cfg.get("secrets", []), ensure_ascii=False),
+            1 if yaml_cfg.get("use_proxy") else 0,
+            int(yaml_cfg.get("ram_limit_mb", 0) or 0),
+            int(yaml_cfg.get("port", 0) or 0),
+            str(yaml_cfg.get("healthcheck_url", "")),
+            str(yaml_cfg.get("schedule_type", "manual")),
+            str(yaml_cfg.get("schedule_expr", "")),
+            secrets.token_hex(16),
+            1 if yaml_cfg.get("autostart") else 0,
+            str(yaml_cfg.get("restart_policy", "on-failure")),
+            int(yaml_cfg.get("min_uptime_sec", 10) or 10),
+            int(yaml_cfg.get("max_restarts", 10) or 10),
+            int(yaml_cfg.get("restart_delay_sec", 5) or 5),
+            str(yaml_cfg.get("cron_restart", "")),
+            now,
+            now,
+        ),
+    )
+    row = query_one("SELECT * FROM projects WHERE id = ?", (proj_id,))
+    return {"ok": True, "extracted_files": extracted, "project": _enrich_project(row or {})}
+
+
 @router.get("/projects/{project_id}/kv")
 async def api_list_project_kv(request: Request, project_id: int) -> list[dict[str, Any]]:
-    """Возвращает все ключи хранилища состояния hub.state для проекта."""
     rows = query_all(
         "SELECT key, value_json, updated_at FROM project_kv WHERE project_id = ? ORDER BY key ASC",
         (project_id,),
@@ -768,10 +1350,9 @@ async def api_list_project_kv(request: Request, project_id: int) -> list[dict[st
 
 @router.put("/projects/{project_id}/kv/{key}")
 async def api_put_project_kv(request: Request, project_id: int, key: str) -> dict[str, Any]:
-    """Создаёт или обновляет ключ в хранилище состояния hub.state проекта из веб-интерфейса."""
     clean_key = (key or "").strip()
     if not clean_key or len(clean_key) > 128:
-        raise HTTPException(status_code=400, detail="Некорректный ключ hub.state")
+        raise HTTPException(status_code=400, detail="Некорректный ключ state")
     body = await request.json()
     val = body.get("value")
     val_json = json.dumps(val, ensure_ascii=False)
@@ -787,7 +1368,6 @@ async def api_put_project_kv(request: Request, project_id: int, key: str) -> dic
 
 @router.delete("/projects/{project_id}/kv/{key}")
 async def api_delete_project_kv(request: Request, project_id: int, key: str) -> dict[str, Any]:
-    """Удаляет ключ из хранилища состояния hub.state проекта."""
     clean_key = (key or "").strip()
     execute_sql("DELETE FROM project_kv WHERE project_id = ? AND key = ?", (project_id, clean_key))
     return {"ok": True, "deleted": clean_key}
@@ -795,13 +1375,6 @@ async def api_delete_project_kv(request: Request, project_id: int, key: str) -> 
 
 @router.post("/projects/import_examples")
 async def api_import_example_projects(request: Request) -> dict[str, Any]:
-    """
-    Импортирует готовые примеры из каталога projects/examples/ в рабочую директорию PROJECTS_DIR
-    и регистрирует их в SQLite (без автоматического засорения БД при каждом старте демона).
-    """
-    from hub.config import EXAMPLES_DIR
-    from hub.templates_mgr import create_project_from_template
-
     EXAMPLES_DIR.mkdir(parents=True, exist_ok=True)
     examples_spec = [
         {
@@ -818,17 +1391,17 @@ async def api_import_example_projects(request: Request) -> dict[str, Any]:
             "restart_policy": "always",
             "env": {
                 "PROJECT_GROUP": "Боты 24/7",
-                "PROJECT_DESCRIPTION": "Фоновый демон (Service 24/7) с сохранением счётчика тиков в hub.state",
+                "PROJECT_DESCRIPTION": "Фоновый демон (Service 24/7) с сохранением счётчика тиков в aruta.state",
             },
             "code": (
                 "import time\n"
-                "import hub\n\n"
+                "import aruta\n\n"
                 "print('[heartbeat-daemon] Сервис запущен (Direct FD, без SIGPIPE)', flush=True)\n"
-                "ticks = int(hub.state.get('ticks', 0) or 0)\n"
+                "ticks = int(aruta.state.get('ticks', 0) or 0)\n"
                 "while True:\n"
                 "    ticks += 1\n"
-                "    hub.state.set('ticks', ticks)\n"
-                "    print(f'[heartbeat-daemon] Тик #{ticks} сохранён в hub.state', flush=True)\n"
+                "    aruta.state.set('ticks', ticks)\n"
+                "    print(f'[heartbeat-daemon] Тик #{ticks} сохранён в aruta.state', flush=True)\n"
                 "    time.sleep(10)\n"
             ),
         },
@@ -848,7 +1421,7 @@ async def api_import_example_projects(request: Request) -> dict[str, Any]:
                 "PROJECT_GROUP": "Web / API",
                 "PROJECT_DESCRIPTION": "Пример легковесного HTTP API бэкенда с проверкой /health и $PORT",
             },
-            "code": None,  # использует стандартный шаблон 'web'
+            "code": None,
         },
         {
             "name": "sms-auth-bot",
@@ -864,13 +1437,13 @@ async def api_import_example_projects(request: Request) -> dict[str, Any]:
             "restart_policy": "no",
             "env": {
                 "PROJECT_GROUP": "Тесты",
-                "PROJECT_DESCRIPTION": "Пример интерактивного запроса 2FA/СМС-кода через hub.ask()",
+                "PROJECT_DESCRIPTION": "Пример интерактивного запроса 2FA/СМС-кода через aruta.ask()",
             },
             "code": (
-                "import hub\n\n"
-                "print('[sms-auth-bot] Запрашиваем код подтверждения через hub.ask()...', flush=True)\n"
-                "code = hub.ask('Введите 6-значный код из СМС для входа в аккаунт:', timeout=180)\n"
-                "hub.state.set('last_auth_code_len', len(str(code)))\n"
+                "import aruta\n\n"
+                "print('[sms-auth-bot] Запрашиваем код подтверждения через aruta.ask()...', flush=True)\n"
+                "code = aruta.ask('Введите 6-значный код из СМС для входа в аккаунт:', timeout=180)\n"
+                "aruta.state.set('last_auth_code_len', len(str(code)))\n"
                 "print(f'[sms-auth-bot] Код получен ({len(str(code))} симв.), авторизация успешна!', flush=True)\n"
             ),
         },
@@ -888,7 +1461,7 @@ async def api_import_example_projects(request: Request) -> dict[str, Any]:
             "restart_policy": "no",
             "env": {
                 "PROJECT_GROUP": "Парсеры",
-                "PROJECT_DESCRIPTION": "Периодическая задача проверки куки (Cron каждые 30 мин) с сигналом hub.cookies_expired()",
+                "PROJECT_DESCRIPTION": "Периодическая задача проверки куки (Cron каждые 30 мин) с сигналом aruta.cookies_expired()",
             },
             "code": None,
         },
@@ -921,7 +1494,7 @@ async def api_import_example_projects(request: Request) -> dict[str, Any]:
                 webhook_token, autostart, restart_policy, backoff_min_sec, backoff_max_sec,
                 desired_state, notify_on_error, notify_on_success, notify_on_crash,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, '[]', 1, 128, ?, ?, 30, ?, ?, 0, 0, 30, ?, ?, ?, 2, 120, 'stopped', 1, 0, 1, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, '[]', 0, 128, ?, ?, 30, ?, ?, 0, 0, 30, ?, ?, ?, 2, 120, 'stopped', 1, 0, 1, ?, ?)""",
             (
                 spec["name"],
                 spec["type"],
@@ -947,7 +1520,6 @@ async def api_import_example_projects(request: Request) -> dict[str, Any]:
 
 @router.post("/projects/{project_id}/cookies")
 async def api_save_project_cookies(request: Request, project_id: int) -> dict[str, Any]:
-    """Сохраняет индивидуальные куки Cookie-Editor для конкретного проекта и привязывает их к нему."""
     proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     if not proj:
         raise HTTPException(status_code=404, detail="Проект не найден")
@@ -960,7 +1532,6 @@ async def api_save_project_cookies(request: Request, project_id: int) -> dict[st
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
-    # Привязываем этот секрет к проекту, если он ещё не привязан
     try:
         curr_secrets: list[str] = json.loads(proj.get("secrets_json") or "[]")
     except Exception:
@@ -972,7 +1543,6 @@ async def api_save_project_cookies(request: Request, project_id: int) -> dict[st
             (json.dumps(curr_secrets, ensure_ascii=False), int(time.time()), project_id),
         )
 
-    # Дублируем файл cookies.json в папку самого проекта (права 0600) для удобства прямого чтения скриптом
     try:
         local_cookie_path = Path(proj["workdir"]) / "cookies.json"
         local_cookie_path.write_text(
@@ -989,7 +1559,6 @@ async def api_save_project_cookies(request: Request, project_id: int) -> dict[st
 
 @router.post("/projects/{project_id}/clear_logs")
 async def api_clear_project_logs(request: Request, project_id: int) -> dict[str, Any]:
-    """Очищает завершённые логи и историю запусков конкретного проекта, освобождая место на диске."""
     proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     if not proj:
         raise HTTPException(status_code=404, detail="Проект не найден")
@@ -1016,17 +1585,13 @@ async def api_clear_project_logs(request: Request, project_id: int) -> dict[str,
                 except OSError:
                     pass
 
-    _invalidate_dir_size_cache(LOGS_DIR / proj["name"])
+    _invalidate_dir_size_cache(proj_log_dir)
     updated_proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     return {"ok": True, "removed_files": removed_files, "project": _enrich_project(updated_proj or {})}
 
 
 @router.post("/projects/git_clone")
 async def api_git_clone_project(request: Request) -> dict[str, Any]:
-    """
-    Создаёт проект напрямую из GitHub-репозитория (git clone через прокси 127.0.0.1:10808, если доступен).
-    Автоматически определяет main.py / bot.py / app.py / index.js / requirements.txt и сохраняет GIT_REPO_URL.
-    """
     body = await request.json()
     repo_url = str(body.get("repo_url", "")).strip()
     if not repo_url:
@@ -1051,10 +1616,10 @@ async def api_git_clone_project(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"Проект с именем «{name}» уже существует")
 
     proj_type = str(body.get("type", "service")).strip()
-    if proj_type not in ("job", "service"):
+    if proj_type not in ("job", "service", "web"):
         proj_type = "service"
 
-    use_proxy = 1 if body.get("use_proxy", True) else 0
+    use_proxy = 1 if body.get("use_proxy", False) else 0
     description = str(body.get("description", "")).strip() or f"Установлен из GitHub ({repo_url})"
     group_tag = str(body.get("group_tag", "GitHub")).strip() or "GitHub"
     custom_proxy = str(body.get("custom_proxy", "")).strip()
@@ -1063,15 +1628,14 @@ async def api_git_clone_project(request: Request) -> dict[str, Any]:
     workdir.mkdir(parents=True, exist_ok=True)
     (LOGS_DIR / name).mkdir(parents=True, exist_ok=True)
 
-    # Пытаемся выполнить реальный git clone --depth 1 (с использованием прокси, если он доступен)
-    sys_proxy = get_setting("proxy_url", "http://127.0.0.1:10808").strip()
-    proxy_reach = check_proxy_reachable(custom_proxy or sys_proxy)
+    sys_proxy = get_setting("proxy_url", "").strip()
+    target_proxy = custom_proxy or sys_proxy
+    proxy_reach = check_proxy_reachable(target_proxy) if target_proxy else {"online": False}
     clone_env = dict(os.environ)
     clone_env["GIT_TERMINAL_PROMPT"] = "0"
-    if use_proxy and proxy_reach["online"]:
-        p_url = custom_proxy or sys_proxy
-        clone_env["HTTP_PROXY"] = p_url
-        clone_env["HTTPS_PROXY"] = p_url
+    if use_proxy and target_proxy and proxy_reach.get("online"):
+        clone_env["HTTP_PROXY"] = target_proxy
+        clone_env["HTTPS_PROXY"] = target_proxy
 
     cloned_ok = False
     clone_log = ""
@@ -1098,17 +1662,12 @@ async def api_git_clone_project(request: Request) -> dict[str, Any]:
     except Exception as e:
         clone_log = str(e)
 
-    # Никаких фейковых main.py при ошибке клонирования — удаляем пустую папку и возвращаем честную ошибку 400
     if not cloned_ok or not any(workdir.iterdir()):
         shutil.rmtree(workdir, ignore_errors=True)
         shutil.rmtree(LOGS_DIR / name, ignore_errors=True)
-        err_msg = (clone_log or "").strip() or "Не удалось клонировать репозиторий (проверьте URL и доступность сети/прокси)"
-        raise HTTPException(
-            status_code=400,
-            detail=f"Ошибка git clone: {err_msg}",
-        )
+        err_msg = (clone_log or "").strip() or "Не удалось клонировать репозиторий (проверьте URL и доступность сети)"
+        raise HTTPException(status_code=400, detail=f"Ошибка git clone: {err_msg}")
 
-    # Определяем точку входа и рантайм по файлам в папке
     runtime = "python"
     detected_cmd = "python3 main.py"
     if (workdir / "package.json").exists():
@@ -1161,12 +1720,14 @@ async def api_git_clone_project(request: Request) -> dict[str, Any]:
     )
     _invalidate_dir_size_cache(workdir)
     row = query_one("SELECT * FROM projects WHERE id = ?", (proj_id,))
+    if row:
+        sync_project_yaml(row)
+        write_project_agents_md(workdir, name, proj_type, runtime, final_cmd)
     return {"ok": True, "cloned": cloned_ok, "clone_log": clone_log, "project": _enrich_project(row or {})}
 
 
 @router.get("/projects/examples")
 async def api_list_project_examples(request: Request) -> list[dict[str, Any]]:
-    """Возвращает список готовых примеров проектов из каталога /opt/hub/projects/examples/."""
     EXAMPLES_DIR.mkdir(parents=True, exist_ok=True)
     items: list[dict[str, Any]] = []
     for entry in sorted(EXAMPLES_DIR.iterdir(), key=lambda p: p.name):
@@ -1194,7 +1755,6 @@ async def api_list_project_examples(request: Request) -> list[dict[str, Any]]:
 
 @router.post("/projects/import_example")
 async def api_import_project_example(request: Request) -> dict[str, Any]:
-    """Импортирует выбранный пример из /opt/hub/projects/examples/<name> в рабочую директорию и БД."""
     body = await request.json()
     example_name = str(body.get("name", "")).strip()
     if not _PROJECT_NAME_RE.match(example_name):
@@ -1252,9 +1812,6 @@ async def api_import_project_example(request: Request) -> dict[str, Any]:
 
 @router.post("/projects/{project_id}/clone")
 async def api_clone_existing_project(request: Request, project_id: int) -> dict[str, Any]:
-    """
-    Клонирует существующий проект в 1 клик (код + настройки) под новым именем (например, для 2-го аккаунта со своими куками и прокси).
-    """
     src = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     if not src:
         raise HTTPException(status_code=404, detail="Исходный проект не найден")
@@ -1340,8 +1897,8 @@ async def api_clone_existing_project(request: Request, project_id: int) -> dict[
 @router.post("/projects/{project_id}/exec")
 async def api_exec_project_command(request: Request, project_id: int) -> dict[str, Any]:
     """
-    Запускает произвольную консольную команду (git pull, pip install ..., python3 main.py --setup)
-    внутри рабочей директории проекта с подключённым прокси и записью живого вывода в лог.
+    Запускает произвольную консольную команду внутри рабочей директории проекта.
+    Доступно ТОЛЬКО администратору веб-панели (никогда не экспортируется в MCP или /api/v1/).
     """
     proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     if not proj:
@@ -1352,7 +1909,7 @@ async def api_exec_project_command(request: Request, project_id: int) -> dict[st
     if not raw_cmd:
         raise HTTPException(status_code=400, detail="Введите команду для выполнения")
 
-    client_ip = request.client.host if request.client else "127.0.0.1"
+    client_ip = _client_ip(request)
     log_audit(client_ip, "PROJECT_EXEC_CMD", f"Проект '{proj['name']}': {raw_cmd[:160]}")
 
     wrapped = f"/bin/bash -c {json.dumps(raw_cmd)}"
@@ -1363,7 +1920,6 @@ async def api_exec_project_command(request: Request, project_id: int) -> dict[st
 
 @router.post("/runs/{run_id}/stdin")
 async def api_send_run_stdin(request: Request, run_id: int) -> dict[str, Any]:
-    """Отправляет строку в stdin запущенного процесса (для интерактивных CLI-скриптов из GitHub)."""
     body = await request.json()
     text = str(body.get("text", ""))
     ok = send_stdin_to_run(run_id, text)
@@ -1414,7 +1970,7 @@ async def api_web_auth_cancel(request: Request, project_id: int) -> dict[str, An
 
 @router.post("/webhook/{webhook_token}")
 async def api_trigger_webhook(request: Request, webhook_token: str) -> Response:
-    client_ip = request.client.host if request.client else "127.0.0.1"
+    client_ip = _client_ip(request)
     allowed, retry_after = check_webhook_rate_limit(client_ip)
     if not allowed:
         return JSONResponse(
@@ -1491,6 +2047,7 @@ async def api_put_file_content(request: Request, project_id: int) -> dict[str, A
     target = _safe_project_path(proj["workdir"], rel_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
+    _invalidate_dir_size_cache(Path(proj["workdir"]))
     return {"ok": True, "path": rel_path, "size": target.stat().st_size}
 
 
@@ -1550,6 +2107,7 @@ async def api_delete_file(request: Request, project_id: int) -> dict[str, Any]:
         shutil.rmtree(target)
     elif target.exists():
         target.unlink()
+    _invalidate_dir_size_cache(Path(proj["workdir"]))
     return {"ok": True, "deleted": rel_path}
 
 
@@ -1557,7 +2115,7 @@ async def api_delete_file(request: Request, project_id: int) -> dict[str, Any]:
 async def api_upload_file(request: Request, project_id: int) -> dict[str, Any]:
     """
     Загрузка файла в проект (поддерживает multipart/form-data и JSON с base64)
-    и авто-распаковку .zip по флагу extract=true с защитой от Zip Slip (os.path.commonpath).
+    и защищённую потоковую распаковку .zip по флагу extract=true (Фаза A.5).
     """
     proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     if not proj:
@@ -1590,24 +2148,19 @@ async def api_upload_file(request: Request, project_id: int) -> dict[str, Any]:
         filename = getattr(upload_obj, "filename", "uploaded.bin")
         file_bytes = await upload_obj.read()
 
+    if len(file_bytes) > MAX_ZIP_ARCHIVE_BYTES:
+        raise HTTPException(status_code=413, detail="Размер загружаемого файла превышает 50 МБ")
+
     dest_file = _safe_project_path(workdir, filename)
     dest_file.parent.mkdir(parents=True, exist_ok=True)
 
-    extracted_files: list[str] = []
     if extract and filename.lower().endswith(".zip"):
-        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
-            for member in zf.infolist():
-                target_path = _safe_project_path(workdir, member.filename)
-                if member.is_dir():
-                    target_path.mkdir(parents=True, exist_ok=True)
-                else:
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(member) as src_f, open(target_path, "wb") as dst_f:
-                        shutil.copyfileobj(src_f, dst_f)
-                    extracted_files.append(member.filename)
+        extracted_files = safe_extract_zip_bytes(file_bytes, workdir)
+        _invalidate_dir_size_cache(workdir)
         return {"ok": True, "extracted": True, "files": extracted_files}
 
     dest_file.write_bytes(file_bytes)
+    _invalidate_dir_size_cache(workdir)
     return {"ok": True, "extracted": False, "path": filename, "size": len(file_bytes)}
 
 
@@ -1667,10 +2220,6 @@ async def api_get_run_log(request: Request, run_id: int) -> dict[str, Any]:
 
 @router.get("/runs/{run_id}/stream")
 async def api_stream_run_log(request: Request, run_id: int) -> StreamingResponse:
-    """
-    SSE-поток живого лога: читает новые байты из файла каждые 300 мс, пока run активен,
-    с поддержкой ?offset= (или старта с хвоста файла) и автоматической маскировкой секретов.
-    """
     run = query_one("SELECT * FROM runs WHERE id = ?", (run_id,))
     if not run:
         raise HTTPException(status_code=404, detail="Запуск не найден")
@@ -1695,7 +2244,7 @@ async def api_stream_run_log(request: Request, run_id: int) -> StreamingResponse
                 try:
                     sz = log_path.stat().st_size
                     if sz < offset:
-                        offset = 0  # Лог был усечён ротацией
+                        offset = 0
                     if sz > offset:
                         with open(log_path, "rb") as f:
                             f.seek(offset)
@@ -1709,7 +2258,6 @@ async def api_stream_run_log(request: Request, run_id: int) -> StreamingResponse
 
             curr = query_one("SELECT status, exit_code, finished_at FROM runs WHERE id = ?", (run_id,))
             if not curr or curr["status"] not in ("running", "waiting_input"):
-                # Дочитываем остаток файла перед закрытием потока
                 if log_path.exists():
                     try:
                         sz = log_path.stat().st_size
@@ -1743,7 +2291,7 @@ async def api_stream_run_log(request: Request, run_id: int) -> StreamingResponse
 
 
 # ==============================================================================
-# 6. СЕКРЕТЫ И ИНТЕРАКТИВНЫЕ ЗАПРОСЫ (hub.ask / Cookie-Editor)
+# 6. СЕКРЕТЫ И ИНТЕРАКТИВНЫЕ ЗАПРОСЫ (aruta.ask / Cookie-Editor)
 # ==============================================================================
 @router.get("/secrets")
 async def api_get_secrets(request: Request) -> list[dict[str, Any]]:
@@ -1796,7 +2344,7 @@ async def api_import_cookies(request: Request) -> dict[str, Any]:
 @router.post("/secrets/{name}/expire")
 async def api_expire_cookie_secret(request: Request, name: str) -> dict[str, Any]:
     body = await request.json()
-    note = str(body.get("note", "Сессия истекла (вызван hub.cookies_expired)")).strip()
+    note = str(body.get("note", "Сессия истекла (вызван aruta.cookies_expired)")).strip()
     try:
         clean_name = validate_secret_name(name)
         mark_cookies_expired(clean_name, note=note)
@@ -1842,28 +2390,39 @@ async def api_get_settings(request: Request) -> dict[str, Any]:
     cfg["tg_bot_token_configured"] = bool(raw_tg)
     if raw_tg:
         cfg["tg_bot_token"] = "********"
-    cfg["forbidden_ports"] = sorted(list(FORBIDDEN_PORTS))
+    cfg["reserved_ports_list"] = sorted(list(parse_reserved_ports(cfg.get("reserved_ports", ""))))
+    cfg["forbidden_ports"] = cfg["reserved_ports_list"]
+    cfg["is_default_password"] = is_default_password()
     return cfg
 
 
 @router.put("/settings")
 async def api_update_settings(request: Request) -> dict[str, Any]:
     body = await request.json()
-    client_ip = request.client.host if request.client else "127.0.0.1"
+    client_ip = _client_ip(request)
+
+    reserved_str = str(body.get("reserved_ports", get_setting("reserved_ports", "")))
+    reserved_set = parse_reserved_ports(reserved_str)
 
     if "port" in body:
         new_port = int(body["port"])
-        if new_port in FORBIDDEN_PORTS:
+        if new_port in reserved_set:
             raise HTTPException(
                 status_code=400,
-                detail=f"Порт {new_port} входит в список занятых системных портов {sorted(list(FORBIDDEN_PORTS))}",
+                detail=f"Порт {new_port} входит в список зарезервированных портов ({sorted(list(reserved_set))})",
             )
         set_setting("port", str(new_port))
 
     allowed_keys = (
         "allowed_subnets",
+        "allow_tailscale",
+        "trusted_proxies",
+        "reserved_ports",
+        "cookie_secure",
         "proxy_url",
         "run_as_user",
+        "safe_mode",
+        "outbound_heartbeat_url",
         "disk_warn_mb",
         "disk_crit_mb",
         "log_max_size_mb",
@@ -1889,42 +2448,36 @@ async def api_update_settings(request: Request) -> dict[str, Any]:
         if key in body:
             val_str = str(body[key])
             if key == "tg_bot_token" and val_str.strip() and set(val_str.strip()) == {"*"}:
-                # Не перезаписываем реальный токен маской '********'
                 continue
             set_setting(key, val_str)
 
     new_password = str(body.get("new_password", "")).strip()
     if new_password:
-        if len(new_password) < 4:
-            raise HTTPException(status_code=400, detail="Новый пароль должен содержать минимум 4 символа")
+        # Фаза A.1(г): единое правило — минимум 8 символов, никакой записи пароля на диск!
+        if len(new_password) < 8:
+            raise HTTPException(status_code=400, detail="Новый пароль должен содержать минимум 8 символов")
         set_setting("password_hash", hash_password(new_password))
         set_setting("must_change_password", "0")
-        try:
-            INITIAL_PASSWORD_PATH.write_text(new_password + "\n", encoding="utf-8")
-            os.chmod(INITIAL_PASSWORD_PATH, 0o600)
-        except OSError:
-            pass
         log_audit(client_ip, "PASSWORD_CHANGED", "Пароль администратора изменён в настройках панели")
 
     reload_redaction_cache()
     ensure_tg_poller_running()
-    log_audit(client_ip, "SETTINGS_UPDATED", "Обновлены системные настройки Hub")
+    log_audit(client_ip, "SETTINGS_UPDATED", "Обновлены системные настройки панели")
     return await api_get_settings(request)
 
 
 @router.post("/settings/test_notify")
 async def api_test_notify(request: Request) -> dict[str, Any]:
     res = await send_notification(
-        "Тестовое уведомление от панели Hub (маршрутизация через локальный прокси проверена).",
+        "Тестовое уведомление от панели Aruta.",
         level="info",
-        project_name="hub-system",
+        project_name="aruta-system",
     )
     return {"ok": True, "result": res}
 
 
 @router.post("/settings/test_tg_command")
 async def api_test_tg_command(request: Request) -> dict[str, Any]:
-    """Выполняет команду системного Telegram-бота (/status, /projects, /start, /stop, /doctor) и возвращает ответ."""
     body = await request.json() if request.headers.get("content-length") not in (None, "0") else {}
     command = str(body.get("command", "/status")).strip() or "/status"
     reply = await handle_telegram_command(command)
@@ -1933,7 +2486,7 @@ async def api_test_tg_command(request: Request) -> dict[str, Any]:
 
 @router.post("/system/cleanup")
 async def api_system_cleanup(request: Request) -> dict[str, Any]:
-    client_ip = request.client.host if request.client else "127.0.0.1"
+    client_ip = _client_ip(request)
     res = cleanup_system_caches()
     log_audit(client_ip, "SYSTEM_CLEANUP", f"Удалено старых запусков: {res['deleted_runs']}")
     return res
@@ -1941,13 +2494,11 @@ async def api_system_cleanup(request: Request) -> dict[str, Any]:
 
 @router.get("/system/doctor")
 async def api_system_doctor(request: Request) -> dict[str, Any]:
-    """Самодиагностика окружения Android Chroot (аналог CLI `python3 -m hub doctor`)."""
     return run_hub_doctor(auto_fix_perms=True)
 
 
 @router.post("/system/thermal_check")
 async def api_system_thermal_check(request: Request) -> dict[str, Any]:
-    """Ручной запуск или тестирование сторожа перегрева и разряда батареи Android."""
     body = await request.json() if request.headers.get("content-length") not in (None, "0") else {}
     force_temp = float(body["force_temp_c"]) if "force_temp_c" in body and body["force_temp_c"] is not None else None
     force_pct = int(body["force_percent"]) if "force_percent" in body and body["force_percent"] is not None else None
@@ -1956,10 +2507,6 @@ async def api_system_thermal_check(request: Request) -> dict[str, Any]:
 
 @router.post("/system/restart_hub_daemon")
 async def api_restart_hub_daemon(request: Request) -> dict[str, Any]:
-    """
-    Проверяет выживание запущенных дочерних сервисов при сбросе состояния супервизора
-    и повторном подхвате через recover_running_processes() (по PID + proc_create_time без SIGPIPE).
-    """
     before_runs = query_all(
         """SELECT r.id, r.pid, r.pgid, p.name
            FROM runs r JOIN projects p ON p.id = r.project_id
@@ -1986,9 +2533,6 @@ async def api_restart_hub_daemon(request: Request) -> dict[str, Any]:
 
 @router.post("/system/run_acceptance_suite")
 async def api_run_acceptance_suite(request: Request) -> dict[str, Any]:
-    """
-    Автономный прогон всех 6 пунктов приёмки прямо внутри Python-сервера Hub (без зависимости от Node.js).
-    """
     results: list[dict[str, Any]] = []
     now = int(time.time())
 
@@ -2076,7 +2620,7 @@ async def api_run_acceptance_suite(request: Request) -> dict[str, Any]:
             }
         )
 
-    # 3. Уведомление при падении (sys.exit(1) -> Telegram через прокси 127.0.0.1:10808)
+    # 3. Уведомление при падении
     notif_res = await send_notification(
         "Скрипт acceptance-crash-test завершился с кодом 1 (sys.exit(1)).",
         level="error",
@@ -2090,17 +2634,17 @@ async def api_run_acceptance_suite(request: Request) -> dict[str, Any]:
     results.append(
         {
             "id": 3,
-            "title": "3. Уведомление при падении (sys.exit(1) -> Telegram прокси 127.0.0.1:10808)",
+            "title": "3. Уведомление при падении (sys.exit(1))",
             "passed": crash_notif is not None,
             "details": (
-                f"Уведомление сформировано с хвостом лога (прокси: {crash_notif.get('proxy_used') or 'http://127.0.0.1:10808'})."
+                f"Уведомление сформировано с хвостом лога (прокси: {crash_notif.get('proxy_used') or 'прямое'})."
                 if crash_notif
                 else f"Результат отправки: {notif_res}"
             ),
         }
     )
 
-    # 4. Импорт куки из Cookie-Editor и hub.cookies_expired()
+    # 4. Импорт куки из Cookie-Editor и aruta.cookies_expired()
     sample_cookies = json.dumps(
         [{"name": "auth_sid", "value": "cookie_val_778899", "domain": ".telegram.org", "path": "/"}]
     )
@@ -2114,13 +2658,13 @@ async def api_run_acceptance_suite(request: Request) -> dict[str, Any]:
     results.append(
         {
             "id": 4,
-            "title": '4. Импорт куки Cookie-Editor, hub.secret("my_cookies") -> list[dict] и cookies_expired()',
+            "title": '4. Импорт куки Cookie-Editor, aruta.secret("my_cookies") -> list[dict] и cookies_expired()',
             "passed": is_list and was_expired,
             "details": "Cookie-Editor JSON импортирован (0600), тип в Python: list[dict] (1 шт.), триггер баннера is_expired=1 подтверждён.",
         }
     )
 
-    # 5. Блокирующий интерактивный hub.ask() + маскировка секретов в логах
+    # 5. Блокирующий интерактивный aruta.ask() + маскировка секретов в логах
     save_secret("api_token", "text", "secret_demo_token_554433")
     masked_sample = redact_log_text("Using token secret_demo_token_554433 in request")
     hb_id = int(hb["id"]) if hb else 1
@@ -2129,24 +2673,28 @@ async def api_run_acceptance_suite(request: Request) -> dict[str, Any]:
     ask_id = await create_ask(run_id_for_ask, hb_id, "sms-auth-bot", "Введите код из СМС:", timeout=60)
     answer_ask(ask_id, "948201", source="web")
     polled = await poll_ask(ask_id, wait_sec=0.5)
-    t5_ok = polled.get("status") == "answered" and polled.get("answer") == "948201" and "***SECRET:api_token***" in masked_sample
+    t5_ok = (
+        polled.get("status") == "answered"
+        and polled.get("answer") == "948201"
+        and "***SECRET:api_token***" in masked_sample
+    )
     results.append(
         {
             "id": 5,
-            "title": "5. Блокирующий hub.ask() + маскировка секретов в логах",
+            "title": "5. Блокирующий aruta.ask() + маскировка секретов в логах",
             "passed": t5_ok,
-            "details": f"hub.ask() получил ответ '{polled.get('answer')}', секрет в логе замаскирован: '{masked_sample}'.",
+            "details": f"aruta.ask() получил ответ '{polled.get('answer')}', секрет в логе замаскирован: '{masked_sample}'.",
         }
     )
 
-    # 6. Потребление памяти процессом python3 -m hub (< 80 МБ RSS)
+    # 6. Потребление памяти процессом python3 -m aruta (< 80 МБ RSS)
     rss_mb = round(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024), 2)
     results.append(
         {
             "id": 6,
-            "title": "6. Потребление памяти процессом python3 -m hub (< 80 МБ RSS)",
+            "title": "6. Потребление памяти процессом python3 -m aruta (< 80 МБ RSS)",
             "passed": 0 < rss_mb < 80.0,
-            "details": f"Текущее потребление памяти Hub (PID={os.getpid()}): {rss_mb} МБ RSS (лимит бюджета: 80 МБ).",
+            "details": f"Текущее потребление памяти Aruta (PID={os.getpid()}): {rss_mb} МБ RSS (лимит бюджета: 80 МБ).",
         }
     )
 
@@ -2172,14 +2720,19 @@ async def api_system_audit(request: Request) -> list[dict[str, Any]]:
 
 @router.get("/system/bundle")
 async def api_system_bundle(request: Request) -> dict[str, Any]:
-    """Возвращает структуру файлов /opt/hub для просмотра исходников панели и скриптов установки."""
     bundle_files = [
         "requirements.txt",
         "README.md",
+        "AGENTS.md",
+        "docs/AI-ACCESS.md",
         "scripts/install.sh",
         "scripts/zstart_line.sh",
+        "sdk/python/aruta.py",
         "sdk/python/hub.py",
+        "sdk/node/aruta.js",
         "sdk/node/hub.js",
+        "aruta/__init__.py",
+        "aruta/__main__.py",
         "hub/__init__.py",
         "hub/__main__.py",
         "hub/config.py",
@@ -2194,10 +2747,9 @@ async def api_system_bundle(request: Request) -> dict[str, Any]:
         "hub/disk_guard.py",
         "hub/templates_mgr.py",
         "hub/api/routes_ui.py",
+        "hub/api/routes_ai.py",
         "hub/api/routes_internal.py",
         "hub/static/index.html",
-        "hub/static/app.js",
-        "hub/static/style.css",
     ]
     selected = request.query_params.get("file", "")
     file_content = ""
@@ -2216,26 +2768,27 @@ async def api_system_bundle(request: Request) -> dict[str, Any]:
 
 @router.get("/system/systemd_unit")
 async def api_system_systemd_unit(request: Request) -> dict[str, Any]:
-    """Генерирует и сохраняет scripts/hub.service для стационарных Linux-серверов с systemd."""
     from hub.env_detect import generate_systemd_unit
 
     port = int(get_setting("port", "8050") or 8050)
-    unit_text = generate_systemd_unit(BASE_DIR, port=port)
-    unit_path = BASE_DIR / "scripts" / "hub.service"
-    try:
-        unit_path.parent.mkdir(parents=True, exist_ok=True)
-        unit_path.write_text(unit_text, encoding="utf-8")
-    except OSError:
-        pass
-    return {"ok": True, "path": str(unit_path), "unit": unit_text, "content": unit_text}
+    unit_text = generate_systemd_unit(BASE_DIR, port=port, user=get_setting("run_as_user", "root"))
+    for fname in ("beacon.service", "aruta.service", "hub.service"):
+        unit_path = BASE_DIR / "scripts" / fname
+        try:
+            unit_path.parent.mkdir(parents=True, exist_ok=True)
+            unit_path.write_text(unit_text, encoding="utf-8")
+        except OSError:
+            pass
+    return {
+        "ok": True,
+        "path": str(BASE_DIR / "scripts" / "beacon.service"),
+        "unit": unit_text,
+        "content": unit_text,
+    }
 
 
 @router.get("/system/backup")
 async def api_system_backup_zip(request: Request) -> Response:
-    """
-    Формирует и отдаёт .zip-бэкап панели Hub (БД data/hub.db после WAL checkpoint,
-    секреты data/secrets/ и исходный код проектов без тяжёлых .venv / node_modules / .tmp).
-    """
     from hub.config import DB_PATH, SECRETS_DIR
     from hub.db import checkpoint_wal
 
@@ -2266,5 +2819,5 @@ async def api_system_backup_zip(request: Request) -> Response:
     return Response(
         content=buf.getvalue(),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="hub_backup_{ts}.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="aruta_backup_{ts}.zip"'},
     )

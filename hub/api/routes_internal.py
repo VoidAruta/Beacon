@@ -34,14 +34,24 @@ def _authenticate_sdk_request(request: Request) -> dict[str, Any]:
     1. Заголовок X-Hub-Token (уникальный токен активного запуска run_token в статусе running/waiting_input);
     2. Заголовок X-Hub-Internal-Token (токен экземпляра Hub из data/internal.token), если он передан.
     """
-    token = (request.headers.get("x-hub-token") or "").strip()
-    internal_hdr = (request.headers.get("x-hub-internal-token") or "").strip()
+    token = (
+        request.headers.get("x-beacon-token")
+        or request.headers.get("x-aruta-token")
+        or request.headers.get("x-hub-token")
+        or ""
+    ).strip()
+    internal_hdr = (
+        request.headers.get("x-beacon-internal-token")
+        or request.headers.get("x-aruta-internal-token")
+        or request.headers.get("x-hub-internal-token")
+        or ""
+    ).strip()
 
     if internal_hdr and not verify_internal_token(internal_hdr):
-        raise HTTPException(status_code=403, detail="Недействительный X-Hub-Internal-Token")
+        raise HTTPException(status_code=403, detail="Недействительный X-Beacon-Internal-Token / X-Hub-Internal-Token")
 
     if not token:
-        raise HTTPException(status_code=401, detail="Отсутствует заголовок X-Hub-Token")
+        raise HTTPException(status_code=401, detail="Отсутствует заголовок X-Beacon-Token / X-Hub-Token")
 
     row = query_one(
         """SELECT r.id AS run_id, r.project_id, r.status,

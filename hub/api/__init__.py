@@ -1,20 +1,25 @@
 """
-Адаптер веб-фреймворка для Hub:
+Адаптер веб-фреймворка для Aruta (Hub):
 Использует штатный FastAPI + Starlette при их наличии в окружении (.venv),
-либо предоставляет 100% совместимый легковесный асинхронный HTTP/SSE сервер на стандартной библиотеке Python 3.
+либо предоставляет 100% совместимый легковесный асинхронный HTTP/SSE сервер на стандартной библиотеке Python 3
+с жёсткими лимитами тела запроса (50 МБ -> 413), числа multipart-частей и числа одновременных соединений.
 """
 
 import asyncio
-import email.parser
 import inspect
 import json
 import mimetypes
 import os
 import re
+import secrets
 import traceback
 import urllib.parse
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Optional
+
+MAX_REQUEST_BODY_BYTES = 50 * 1024 * 1024  # 50 МБ
+MAX_MULTIPART_PARTS = 64
+MAX_CONCURRENT_CONNECTIONS = 128
 
 try:
     from fastapi import APIRouter, FastAPI, HTTPException, Request, Response  # type: ignore
@@ -45,10 +50,11 @@ except ImportError:
             body: bytes,
             client_host: str = "127.0.0.1",
             path_params: Optional[dict[str, str]] = None,
+            scheme: str = "http",
         ):
             self.method = method.upper()
             self.path = path
-            self.url = type("URL", (), {"path": path, "query": query_string})()
+            self.url = type("URL", (), {"path": path, "query": query_string, "scheme": scheme})()
             self.headers = {k.lower(): v for k, v in headers.items()}
             self._raw_headers = headers
             self._body = body
@@ -99,6 +105,11 @@ except ImportError:
         result: dict[str, Any] = {}
         delim = f"--{boundary}".encode("utf-8")
         parts = body.split(delim)
+        if len(parts) > MAX_MULTIPART_PARTS + 2:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Превышен лимит частей multipart/form-data (макс. {MAX_MULTIPART_PARTS})",
+            )
         for part in parts[1:]:
             if part.startswith(b"--") or not part.strip():
                 continue
@@ -156,13 +167,16 @@ except ImportError:
             max_age: Optional[int] = None,
             path: str = "/",
             httponly: bool = False,
-            samesite: str = "Lax",
+            samesite: str = "Strict",
+            secure: bool = False,
         ) -> None:
             parts = [f"{key}={value}", f"Path={path}"]
             if max_age is not None:
                 parts.append(f"Max-Age={int(max_age)}")
             if httponly:
                 parts.append("HttpOnly")
+            if secure:
+                parts.append("Secure")
             if samesite:
                 parts.append(f"SameSite={samesite}")
             self._cookies.append("; ".join(parts))
@@ -248,11 +262,14 @@ except ImportError:
         def put(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
             return lambda f: self._add_route("PUT", path, f)
 
+        def patch(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            return lambda f: self._add_route("PATCH", path, f)
+
         def delete(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
             return lambda f: self._add_route("DELETE", path, f)
 
     class FastAPI(APIRouter):
-        def __init__(self, title: str = "Hub", version: str = "1.0.0", **kwargs: Any):
+        def __init__(self, title: str = "Aruta", version: str = "2.2.0", **kwargs: Any):
             super().__init__(prefix="")
             self.title = title
             self.version = version
@@ -280,6 +297,10 @@ except ImportError:
 
 async def run_fallback_http_server(app: Any, host: str = "0.0.0.0", port: int = 8050) -> None:
     """Асинхронный HTTP/1.1 + SSE сервер для работы без внешнего пакета uvicorn."""
+    from hub.auth import resolve_client_ip
+
+    conn_sem = asyncio.Semaphore(MAX_CONCURRENT_CONNECTIONS)
+
     for handler in getattr(app, "startup_handlers", []):
         res = handler()
         if inspect.isawaitable(res):
@@ -317,9 +338,14 @@ async def run_fallback_http_server(app: Any, host: str = "0.0.0.0", port: int = 
                     return JSONResponse(out)
                 except HTTPException as he:
                     return JSONResponse({"detail": he.detail, "error": he.detail}, status_code=he.status_code)
-                except Exception as exc:
+                except Exception:
+                    err_id = secrets.token_hex(4)
+                    print(f"[Aruta Error {err_id}] Необработанное исключение при вызове {req.path}:", flush=True)
                     traceback.print_exc()
-                    return JSONResponse({"detail": str(exc), "error": str(exc)}, status_code=500)
+                    return JSONResponse(
+                        {"detail": f"Внутренняя ошибка сервера (код: {err_id})", "error_id": err_id},
+                        status_code=500,
+                    )
         return JSONResponse({"detail": f"Not Found: {req.path}"}, status_code=404)
 
     async def _handle_request_with_middlewares(req: Request) -> Any:
@@ -334,96 +360,170 @@ async def run_fallback_http_server(app: Any, host: str = "0.0.0.0", port: int = 
             return await call_chain(0, req)
         except HTTPException as he:
             return JSONResponse({"detail": he.detail, "error": he.detail}, status_code=he.status_code)
-        except Exception as exc:
-            return JSONResponse({"detail": str(exc), "error": str(exc)}, status_code=500)
+        except Exception:
+            err_id = secrets.token_hex(4)
+            traceback.print_exc()
+            return JSONResponse(
+                {"detail": f"Внутренняя ошибка сервера (код: {err_id})", "error_id": err_id},
+                status_code=500,
+            )
 
     async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            header_data = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=15.0)
-        except Exception:
-            writer.close()
-            return
-
-        header_text = header_data.decode("utf-8", errors="replace")
-        lines = header_text.split("\r\n")
-        if not lines or not lines[0]:
-            writer.close()
-            return
-
-        req_line_parts = lines[0].split(" ")
-        if len(req_line_parts) < 2:
-            writer.close()
-            return
-        method = req_line_parts[0]
-        raw_target = req_line_parts[1]
-        if "?" in raw_target:
-            path, query_string = raw_target.split("?", 1)
-        else:
-            path, query_string = raw_target, ""
-
-        headers: dict[str, str] = {}
-        for line in lines[1:]:
-            if ":" in line:
-                k, v = line.split(":", 1)
-                headers[k.strip()] = v.strip()
-
-        content_length = int(headers.get("Content-Length", headers.get("content-length", "0")) or 0)
-        body = b""
-        if content_length > 0:
+        if conn_sem.locked():
             try:
-                body = await asyncio.wait_for(reader.readexactly(content_length), timeout=30.0)
+                writer.write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                await writer.drain()
             except Exception:
-                body = await reader.read(content_length)
+                pass
+            finally:
+                writer.close()
+            return
 
-        peer = writer.get_extra_info("peername")
-        client_host = peer[0] if isinstance(peer, tuple) and peer else "127.0.0.1"
-        fwd_for = headers.get("X-Forwarded-For", headers.get("x-forwarded-for", ""))
-        if fwd_for and client_host in ("127.0.0.1", "::1"):
-            client_host = fwd_for.split(",")[0].strip()
+        async with conn_sem:
+            try:
+                header_data = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=15.0)
+            except Exception:
+                writer.close()
+                return
 
-        req = Request(
-            method=method,
-            path=path,
-            query_string=query_string,
-            headers=headers,
-            body=body,
-            client_host=client_host,
-        )
+            header_text = header_data.decode("utf-8", errors="replace")
+            lines = header_text.split("\r\n")
+            if not lines or not lines[0]:
+                writer.close()
+                return
 
-        resp = await _handle_request_with_middlewares(req)
+            req_line_parts = lines[0].split(" ")
+            if len(req_line_parts) < 2:
+                writer.close()
+                return
+            method = req_line_parts[0]
+            raw_target = req_line_parts[1]
+            if "?" in raw_target:
+                path, query_string = raw_target.split("?", 1)
+            else:
+                path, query_string = raw_target, ""
 
-        status_phrases = {
-            200: "OK",
-            201: "Created",
-            204: "No Content",
-            400: "Bad Request",
-            401: "Unauthorized",
-            403: "Forbidden",
-            404: "Not Found",
-            429: "Too Many Requests",
-            500: "Internal Server Error",
-        }
+            headers: dict[str, str] = {}
+            for line in lines[1:]:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    headers[k.strip()] = v.strip()
 
-        if isinstance(resp, StreamingResponse):
+            try:
+                content_length = int(headers.get("Content-Length", headers.get("content-length", "0")) or 0)
+            except ValueError:
+                content_length = 0
+
+            # Лимит тела запроса (50 МБ -> 413) ДО чтения тела, проверки подсетей и входа
+            if content_length > MAX_REQUEST_BODY_BYTES:
+                err_body = json.dumps(
+                    {
+                        "detail": f"Превышен максимальный размер тела запроса ({MAX_REQUEST_BODY_BYTES // (1024 * 1024)} МБ)",
+                        "max_bytes": MAX_REQUEST_BODY_BYTES,
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                hdrs = (
+                    "HTTP/1.1 413 Payload Too Large\r\n"
+                    "Content-Type: application/json; charset=utf-8\r\n"
+                    f"Content-Length: {len(err_body)}\r\n"
+                    "X-Frame-Options: DENY\r\n"
+                    "X-Content-Type-Options: nosniff\r\n"
+                    "Referrer-Policy: no-referrer\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("utf-8")
+                try:
+                    writer.write(hdrs + err_body)
+                    await writer.drain()
+                except Exception:
+                    pass
+                finally:
+                    writer.close()
+                return
+
+            body = b""
+            if content_length > 0:
+                try:
+                    body = await asyncio.wait_for(reader.readexactly(content_length), timeout=30.0)
+                except Exception:
+                    body = await reader.read(content_length)
+
+            peer = writer.get_extra_info("peername")
+            direct_host = peer[0] if isinstance(peer, tuple) and peer else "127.0.0.1"
+            fwd_for = headers.get("X-Forwarded-For", headers.get("x-forwarded-for", ""))
+            client_host = resolve_client_ip(direct_host, fwd_for)
+
+            req = Request(
+                method=method,
+                path=path,
+                query_string=query_string,
+                headers=headers,
+                body=body,
+                client_host=client_host,
+            )
+
+            resp = await _handle_request_with_middlewares(req)
+
+            status_phrases = {
+                200: "OK",
+                201: "Created",
+                202: "Accepted",
+                204: "No Content",
+                400: "Bad Request",
+                401: "Unauthorized",
+                403: "Forbidden",
+                404: "Not Found",
+                413: "Payload Too Large",
+                429: "Too Many Requests",
+                500: "Internal Server Error",
+                503: "Service Unavailable",
+            }
+
+            if isinstance(resp, StreamingResponse):
+                phrase = status_phrases.get(resp.status_code, "OK")
+                hdr_lines = [
+                    f"HTTP/1.1 {resp.status_code} {phrase}",
+                    f"Content-Type: {resp.media_type}",
+                    "Cache-Control: no-cache",
+                    "Connection: keep-alive",
+                    "X-Accel-Buffering: no",
+                ]
+                for hk, hv in resp.headers.items():
+                    hdr_lines.append(f"{hk}: {hv}")
+                for ck in resp._cookies:
+                    hdr_lines.append(f"Set-Cookie: {ck}")
+                writer.write(("\r\n".join(hdr_lines) + "\r\n\r\n").encode("utf-8"))
+                await writer.drain()
+                try:
+                    async for chunk in resp.content:
+                        data_bytes = chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+                        writer.write(data_bytes)
+                        await writer.drain()
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+                return
+
             phrase = status_phrases.get(resp.status_code, "OK")
+            body_bytes = resp.body
             hdr_lines = [
                 f"HTTP/1.1 {resp.status_code} {phrase}",
                 f"Content-Type: {resp.media_type}",
-                "Cache-Control: no-cache",
-                "Connection: keep-alive",
-                "X-Accel-Buffering: no",
+                f"Content-Length: {len(body_bytes)}",
+                "Connection: close",
             ]
             for hk, hv in resp.headers.items():
                 hdr_lines.append(f"{hk}: {hv}")
             for ck in resp._cookies:
                 hdr_lines.append(f"Set-Cookie: {ck}")
-            writer.write(("\r\n".join(hdr_lines) + "\r\n\r\n").encode("utf-8"))
-            await writer.drain()
+
             try:
-                async for chunk in resp.content:
-                    data_bytes = chunk.encode("utf-8") if isinstance(chunk, str) else chunk
-                    writer.write(data_bytes)
-                    await writer.drain()
+                writer.write(("\r\n".join(hdr_lines) + "\r\n\r\n").encode("utf-8") + body_bytes)
+                await writer.drain()
             except Exception:
                 pass
             finally:
@@ -431,33 +531,8 @@ async def run_fallback_http_server(app: Any, host: str = "0.0.0.0", port: int = 
                     writer.close()
                 except Exception:
                     pass
-            return
-
-        phrase = status_phrases.get(resp.status_code, "OK")
-        body_bytes = resp.body
-        hdr_lines = [
-            f"HTTP/1.1 {resp.status_code} {phrase}",
-            f"Content-Type: {resp.media_type}",
-            f"Content-Length: {len(body_bytes)}",
-            "Connection: close",
-        ]
-        for hk, hv in resp.headers.items():
-            hdr_lines.append(f"{hk}: {hv}")
-        for ck in resp._cookies:
-            hdr_lines.append(f"Set-Cookie: {ck}")
-
-        try:
-            writer.write(("\r\n".join(hdr_lines) + "\r\n\r\n").encode("utf-8") + body_bytes)
-            await writer.drain()
-        except Exception:
-            pass
-        finally:
-            try:
-                writer.close()
-            except Exception:
-                pass
 
     server = await asyncio.start_server(_handle_client, host=host, port=port)
-    print(f"[Hub] Сервер запущен на http://{host}:{port} (PID={os.getpid()})", flush=True)
+    print(f"[Aruta] Сервер запущен на http://{host}:{port} (PID={os.getpid()})", flush=True)
     async with server:
         await server.serve_forever()

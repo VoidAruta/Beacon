@@ -1,9 +1,11 @@
 """
 Безопасность и контроль доступа:
-- Фильтр подсетей (CIDR из настройки allowed_subnets)
-- Аутентификация по паролю (hashlib.scrypt, n=16384, r=8, p=1)
-- Сессии в HttpOnly cookie (HMAC-SHA256) + CSRF токен (X-CSRF-Token)
-- Защита от перебора (Rate Limit: >5 неудачных попыток за 10 мин -> блок на 15 мин + audit_log + TG)
+- Фильтр подсетей (CIDR из настройки allowed_subnets + опция Tailscale 100.64.0.0/10)
+- Ограничение входа при дефолтном пароле 'admin' строго loopback и RFC1918 (10/8, 172.16/12, 192.168/16)
+- Безопасный разбор X-Forwarded-For (только от trusted_proxies, выбор ПРАВОГО недоверенного IP)
+- Аутентификация по паролю (hashlib.scrypt, n=16384, r=8, p=1) и RBAC-роли (viewer, operator, admin)
+- Сессии в HttpOnly cookie (SameSite=Strict) + одноразовые короткоживущие тикеты для SSE (/api/auth/stream_ticket)
+- Токены доступа ИИ (SHA-256 хеш, scopes, IP-фильтр, rate limit, kill-switch)
 """
 
 import hashlib
@@ -16,48 +18,57 @@ import time
 import urllib.parse
 from typing import Any, Optional
 
-from hub.config import INTERNAL_TOKEN_PATH, ensure_directories
+from hub.config import INTERNAL_TOKEN_PATH, ensure_directories, get_env_var
 from hub.db import execute_sql, get_setting, log_audit, query_one, set_setting
 
-# Секретный ключ подписи сессий (генерируется или берётся из настроек)
 _SESSION_SECRET: Optional[bytes] = None
-# Внутренний токен авторизации локального шлюза /internal/* (хранится в data/internal.token с правами 0600)
 _INTERNAL_TOKEN: Optional[str] = None
-# Отозванные сессии в памяти: sid -> exp
 _REVOKED_SESSIONS: dict[str, int] = {}
 
-# В памяти: ip -> список таймстампов неудачных попыток входа
 _FAILED_LOGINS: dict[str, list[float]] = {}
-# В памяти: ip -> время окончания блокировки входа (unix timestamp)
 _BLOCKED_IPS: dict[str, float] = {}
 
-# В памяти: защита вебхуков от перебора и флуда
 _WEBHOOK_HITS: dict[str, list[float]] = {}
 _WEBHOOK_FAILS: dict[str, list[float]] = {}
 _WEBHOOK_BLOCKED_IPS: dict[str, float] = {}
 
-RATE_LIMIT_WINDOW_SEC = 300   # 5 минут окно наблюдения
-RATE_LIMIT_MAX_FAILS = 5      # 5 неудачных попыток входа
-RATE_LIMIT_BLOCK_SEC = 900    # 15 минут блокировки
+# Одноразовые короткоживущие тикеты для SSE-стримов: ticket -> {"exp": float, "run_id": Optional[int]}
+_STREAM_TICKETS: dict[str, dict[str, Any]] = {}
 
-WEBHOOK_WINDOW_SEC = 60       # 1 минута окно для частоты запросов вебхука
-WEBHOOK_MAX_HITS = 30         # макс 30 вызовов в минуту с одного IP
-WEBHOOK_MAX_FAILS = 10        # макс 10 ошибок 404 по токену вебхука
-WEBHOOK_BLOCK_SEC = 600       # 10 минут блокировки при брутфорсе вебхуков
+# Rate-limit для ИИ-токенов: token_id -> list[float]
+_AI_TOKEN_HITS: dict[int, list[float]] = {}
+
+RATE_LIMIT_WINDOW_SEC = 300
+RATE_LIMIT_MAX_FAILS = 5
+RATE_LIMIT_BLOCK_SEC = 900
+
+WEBHOOK_WINDOW_SEC = 60
+WEBHOOK_MAX_HITS = 30
+WEBHOOK_MAX_FAILS = 10
+WEBHOOK_BLOCK_SEC = 600
+
+_PRIVATE_AND_LOOPBACK_NETS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
 
 
 def get_internal_token() -> str:
     """
     Возвращает криптостойкий токен для локального шлюза /internal/*.
-    Хранится в data/internal.token (права 0600), чтобы выжившие дочерние сервисы
-    сохраняли доступ к SDK после перезапуска самого процесса Hub.
+    Хранится в data/internal.token (права 0600).
     """
     global _INTERNAL_TOKEN
     if _INTERNAL_TOKEN:
         return _INTERNAL_TOKEN
 
     ensure_directories()
-    env_tok = os.environ.get("HUB_INTERNAL_TOKEN", "").strip()
+    env_tok = get_env_var("ARUTA_INTERNAL_TOKEN", "HUB_INTERNAL_TOKEN", "")
     if env_tok and len(env_tok) >= 16:
         _INTERNAL_TOKEN = env_tok
         return _INTERNAL_TOKEN
@@ -83,7 +94,7 @@ def get_internal_token() -> str:
 
 
 def verify_internal_token(candidate: str) -> bool:
-    """Проверяет заголовок X-Hub-Internal-Token за константное время."""
+    """Проверяет заголовок X-Aruta-Internal-Token / X-Hub-Internal-Token за константное время."""
     if not candidate:
         return False
     expected = get_internal_token()
@@ -125,8 +136,137 @@ def verify_password(password: str, stored_hash: str) -> bool:
         return False
 
 
-def create_session_tokens(ttl_sec: int = 86400 * 7) -> tuple[str, str]:
-    """Создаёт подписанный токен сессии (hub_session) и привязанный csrf_token."""
+def is_default_password() -> bool:
+    """Возвращает True, если текущий пароль администратора равен дефолтному 'admin'."""
+    stored_hash = get_setting("password_hash", "")
+    if not stored_hash:
+        return True
+    return verify_password("admin", stored_hash)
+
+
+def _normalize_ip(raw_ip: str) -> str:
+    clean = (raw_ip or "").strip()
+    if clean.startswith("::ffff:"):
+        clean = clean[7:]
+    if clean == "localhost":
+        return "127.0.0.1"
+    return clean
+
+
+def is_private_or_loopback_ip(ip_str: str) -> bool:
+    """
+    Проверяет, принадлежит ли IP к loopback (127.0.0.0/8, ::1) или частным подсетям RFC1918
+    (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16). CGNAT (100.64.0.0/10) сюда НЕ входит!
+    """
+    clean = _normalize_ip(ip_str)
+    if not clean:
+        return False
+    try:
+        ip_obj = ipaddress.ip_address(clean)
+    except ValueError:
+        return False
+    return any(ip_obj in net for net in _PRIVATE_AND_LOOPBACK_NETS)
+
+
+def _ip_in_cidr_csv(ip_str: str, cidr_csv: str) -> bool:
+    clean = _normalize_ip(ip_str)
+    if not clean or not cidr_csv or not cidr_csv.strip():
+        return False
+    try:
+        ip_obj = ipaddress.ip_address(clean)
+    except ValueError:
+        return False
+    for item in cidr_csv.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item == "*":
+            return True
+        try:
+            net = ipaddress.ip_network(item, strict=False)
+            if ip_obj in net:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def resolve_client_ip(direct_ip: str, x_forwarded_for: str = "", trusted_proxies_override: Optional[str] = None) -> str:
+    """
+    Безопасное определение IP клиента с защитой от спуфинга X-Forwarded-For:
+    1. X-Forwarded-For учитывается ТОЛЬКО если непосредственный адрес соединения (direct_ip)
+       входит в список доверенных прокси (trusted_proxies). По умолчанию trusted_proxies пуст.
+    2. Из цепочки X-Forwarded-For выбирается ПРАВЫЙ (последний не доверенный) элемент, а не левый.
+    """
+    peer_ip = _normalize_ip(direct_ip or "127.0.0.1")
+    trusted_csv = (
+        trusted_proxies_override
+        if trusted_proxies_override is not None
+        else get_setting("trusted_proxies", "")
+    ).strip()
+
+    if not trusted_csv or not x_forwarded_for or not _ip_in_cidr_csv(peer_ip, trusted_csv):
+        return peer_ip
+
+    hops = [_normalize_ip(part) for part in x_forwarded_for.split(",") if part.strip()]
+    if not hops:
+        return peer_ip
+
+    # Идём справа налево и берём первый IP, который не является доверенным прокси (и валиден)
+    for candidate in reversed(hops):
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if not _ip_in_cidr_csv(candidate, trusted_csv):
+            return candidate
+
+    # Если все элементы в XFF входят в trusted_proxies — возвращаем самый левый валидный из них
+    for candidate in hops:
+        try:
+            ipaddress.ip_address(candidate)
+            return candidate
+        except ValueError:
+            continue
+    return peer_ip
+
+
+def is_ip_allowed(client_ip: str) -> bool:
+    """
+    Проверяет client_ip по списку CIDR из настройки allowed_subnets.
+    Если используется пароль по умолчанию 'admin', вход и доступ разрешены ТОЛЬКО
+    с loopback и частных диапазонов RFC1918 (10/8, 172.16/12, 192.168/16).
+    """
+    if not client_ip:
+        return True
+    clean_ip = _normalize_ip(client_ip)
+    if clean_ip in ("127.0.0.1", "::1"):
+        return True
+
+    # Пока пароль по умолчанию 'admin', жёстко разрешаем только loopback и RFC1918
+    if is_default_password():
+        if not is_private_or_loopback_ip(clean_ip):
+            return False
+
+    subnets_str = get_setting(
+        "allowed_subnets",
+        "127.0.0.0/8,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,::1/128",
+    )
+    if get_setting("allow_tailscale", "0") == "1" and not is_default_password():
+        subnets_str = f"{subnets_str},100.64.0.0/10"
+
+    if ("*" in subnets_str or "0.0.0.0/0" in subnets_str) and not is_default_password():
+        return True
+
+    return _ip_in_cidr_csv(clean_ip, subnets_str)
+
+
+def create_session_tokens(
+    ttl_sec: int = 86400 * 7,
+    role: str = "admin",
+    username: str = "admin",
+) -> tuple[str, str]:
+    """Создаёт подписанный токен сессии и привязанный csrf_token."""
     csrf_token = secrets.token_hex(24)
     sid = secrets.token_hex(12)
     now = int(time.time())
@@ -135,6 +275,8 @@ def create_session_tokens(ttl_sec: int = 86400 * 7) -> tuple[str, str]:
         "iat": now,
         "exp": now + ttl_sec,
         "csrf": csrf_token,
+        "role": role,
+        "user": username,
     }
     payload_b64 = urllib.parse.quote(json.dumps(payload, separators=(",", ":")))
     sig = hmac.new(_get_session_secret(), payload_b64.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -185,54 +327,97 @@ def verify_session_token(token: str) -> Optional[dict[str, Any]]:
                 return None
         except Exception:
             pass
+        if "role" not in payload:
+            payload["role"] = "admin"
         return payload
     except Exception:
         return None
 
 
-def is_ip_allowed(client_ip: str) -> bool:
-    """
-    Проверяет client_ip по списку CIDR из настройки allowed_subnets.
-    Локальные адреса (127.0.0.1, ::1, ::ffff:127.0.0.1) всегда разрешены.
-    """
-    if not client_ip:
-        return True
-    clean_ip = client_ip.strip()
-    if clean_ip.startswith("::ffff:"):
-        clean_ip = clean_ip[7:]
-    if clean_ip in ("127.0.0.1", "::1", "localhost"):
-        return True
+def create_stream_ticket(run_id: Optional[int] = None, ttl_sec: int = 30) -> str:
+    """Создаёт короткоживущий одноразовый тикет для подключения к SSE-потоку логов."""
+    now = time.time()
+    # Очистка протухших тикетов
+    for k, v in list(_STREAM_TICKETS.items()):
+        if v["exp"] < now:
+            _STREAM_TICKETS.pop(k, None)
+    ticket = secrets.token_urlsafe(24)
+    _STREAM_TICKETS[ticket] = {"exp": now + ttl_sec, "run_id": run_id}
+    return ticket
 
-    subnets_str = get_setting(
-        "allowed_subnets",
-        "127.0.0.0/8,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,100.64.0.0/10",
-    )
-    if "*" in subnets_str or "0.0.0.0/0" in subnets_str:
-        return True
 
-    try:
-        ip_obj = ipaddress.ip_address(clean_ip)
-    except ValueError:
+def consume_stream_ticket(ticket: str, run_id: Optional[int] = None) -> bool:
+    """Одноразово погашает SSE-тикет и возвращает True, если он действителен."""
+    if not ticket:
         return False
+    entry = _STREAM_TICKETS.pop(ticket, None)
+    if not entry:
+        return False
+    if entry["exp"] < time.time():
+        return False
+    if entry.get("run_id") is not None and run_id is not None and int(entry["run_id"]) != int(run_id):
+        return False
+    return True
 
-    for cidr in subnets_str.split(","):
-        cidr = cidr.strip()
-        if not cidr:
-            continue
-        try:
-            net = ipaddress.ip_network(cidr, strict=False)
-            if ip_obj in net:
-                return True
-        except ValueError:
-            continue
-    return False
+
+def hash_ai_token(raw_token: str) -> str:
+    """Вычисляет SHA-256 хеш токена ИИ (сам токен в БД никогда не хранится)."""
+    return hashlib.sha256(raw_token.strip().encode("utf-8")).hexdigest()
+
+
+def verify_ai_token(raw_token: str, client_ip: str = "127.0.0.1") -> tuple[Optional[dict[str, Any]], str]:
+    """
+    Проверяет Bearer-токен ИИ-доступа:
+    - Проверяет, что пароль панели НЕ равен дефолтному 'admin'.
+    - Проверяет, что ИИ-доступ включён (ai_access_enabled == '1') и не поставлен на паузу (ai_access_paused == '0').
+    - Проверяет SHA-256 хеш в таблице ai_tokens, срок действия, статус отзыва, фильтр IP и rate-limit.
+    """
+    if is_default_password():
+        return None, "Доступ ИИ заблокирован, пока используется пароль по умолчанию 'admin'"
+    if get_setting("ai_access_enabled", "0") != "1":
+        return None, "Доступ для ИИ выключен в настройках панели"
+    if get_setting("ai_access_paused", "0") == "1":
+        return None, "Доступ для ИИ временно приостановлен переключателем «Пауза ИИ»"
+
+    if not raw_token or len(raw_token.strip()) < 16:
+        return None, "Недействительный токен авторизации"
+
+    thash = hash_ai_token(raw_token)
+    row = query_one("SELECT * FROM ai_tokens WHERE token_hash = ?", (thash,))
+    if not row:
+        return None, "Токен ИИ не найден"
+    if int(row.get("revoked") or 0) == 1:
+        return None, "Токен ИИ отозван"
+
+    now = int(time.time())
+    exp = int(row.get("expires_at") or 0)
+    if exp > 0 and exp < now:
+        return None, "Срок действия токена ИИ истёк"
+
+    allowed_ips = str(row.get("allowed_ips") or "").strip()
+    if allowed_ips and not _ip_in_cidr_csv(client_ip, allowed_ips):
+        return None, f"IP {client_ip} не разрешён для данного токена ИИ"
+
+    # Rate limit
+    token_id = int(row["id"])
+    limit_per_min = max(1, int(row.get("rate_limit_per_min") or 60))
+    now_f = time.time()
+    hits = [t for t in _AI_TOKEN_HITS.get(token_id, []) if now_f - t <= 60.0]
+    if len(hits) >= limit_per_min:
+        return None, f"Превышен лимит запросов для токена ({limit_per_min}/мин)"
+    hits.append(now_f)
+    _AI_TOKEN_HITS[token_id] = hits
+
+    execute_sql("UPDATE ai_tokens SET last_used_at = ? WHERE id = ?", (now, token_id))
+    try:
+        scopes = json.loads(row.get("scopes_json") or '["read"]')
+    except Exception:
+        scopes = ["read"]
+    row["scopes"] = scopes if isinstance(scopes, list) else ["read"]
+    return row, ""
 
 
 def check_rate_limit(client_ip: str) -> tuple[bool, int]:
-    """
-    Возвращает (allowed, retry_after_sec).
-    Если IP заблокирован после 5 неудачных попыток за 5 минут — возвращает (False, remaining_sec).
-    """
     now = time.time()
     unblock_at = _BLOCKED_IPS.get(client_ip, 0.0)
     if unblock_at > now:
@@ -243,11 +428,6 @@ def check_rate_limit(client_ip: str) -> tuple[bool, int]:
 
 
 def record_login_failure(client_ip: str) -> tuple[bool, int]:
-    """
-    Регистрирует неудачную попытку входа.
-    При достижении 5 попыток за 5 минут блокирует IP на 15 минут, пишет в audit_log.
-    Возвращает (is_now_blocked, block_seconds).
-    """
     now = time.time()
     attempts = [t for t in _FAILED_LOGINS.get(client_ip, []) if now - t <= RATE_LIMIT_WINDOW_SEC]
     attempts.append(now)
@@ -273,7 +453,6 @@ def clear_login_failures(client_ip: str) -> None:
 
 
 def check_webhook_rate_limit(client_ip: str) -> tuple[bool, int]:
-    """Проверяет лимит частоты вызовов /api/webhook/{token} с одного IP."""
     now = time.time()
     unblock_at = _WEBHOOK_BLOCKED_IPS.get(client_ip, 0.0)
     if unblock_at > now:
@@ -290,7 +469,6 @@ def check_webhook_rate_limit(client_ip: str) -> tuple[bool, int]:
 
 
 def record_webhook_failure(client_ip: str) -> tuple[bool, int]:
-    """Регистрирует ошибку неверного webhook_token и блокирует IP при переборе."""
     now = time.time()
     fails = [t for t in _WEBHOOK_FAILS.get(client_ip, []) if now - t <= RATE_LIMIT_WINDOW_SEC]
     fails.append(now)
@@ -301,4 +479,3 @@ def record_webhook_failure(client_ip: str) -> tuple[bool, int]:
         log_audit(client_ip, "WEBHOOK_BRUTEFORCE_BLOCK", f"IP заблокирован на 10 минут после {len(fails)} ошибок вебхука")
         return True, WEBHOOK_BLOCK_SEC
     return False, 0
-

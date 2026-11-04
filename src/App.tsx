@@ -10,38 +10,48 @@ import {
   Lock,
   FlaskConical,
   Search,
+  Bot,
+  AlertTriangle,
+  PauseCircle,
+  PlayCircle,
+  ShieldAlert,
 } from 'lucide-react';
-import { DashboardData, ProjectItem, SecretItem } from './types/hub';
+import { DashboardData, ProjectItem, SecretItem, WorkspaceSubTab } from './types/hub';
 import { GlobalAlertBanners } from './components/GlobalAlertBanners';
 import { DashboardView } from './components/DashboardView';
-import { ProjectsWorkspace, WorkspaceSubTab } from './components/ProjectsWorkspace';
+import { ProjectsWorkspace } from './components/ProjectsWorkspace';
 import { SecretsView } from './components/SecretsView';
 import { SettingsAndAcceptanceView } from './components/SettingsAndAcceptanceView';
+import { AiAccessView } from './components/AiAccessView';
 import { CreateProjectModal } from './components/CreateProjectModal';
 import { CommandPaletteModal } from './components/CommandPaletteModal';
 
-type NavTab = 'dashboard' | 'projects' | 'secrets' | 'settings' | 'acceptance';
+type NavTab = 'dashboard' | 'projects' | 'secrets' | 'ai_access' | 'settings' | 'acceptance';
 
 const TAB_META: Record<NavTab, { title: string; subtitle: string }> = {
   dashboard: {
     title: 'Обзор и Проекты',
-    subtitle: 'Мониторинг ресурсов, постоянные программы 24/7, скрипты по расписанию и занимаемое место на диске',
+    subtitle: 'Мониторинг ресурсов, постоянные программы 24/7, веб-сервисы и периодические задачи',
   },
   projects: {
     title: 'Проекты, Код и Расписание',
-    subtitle: 'Редактор файлов, индивидуальные куки и Telegram-токен скрипта, конструктор расписания и живые логи',
+    subtitle: 'Редактор файлов, project.yaml, индивидуальные куки, защита от crash-loop и живые логи',
   },
   secrets: {
     title: 'Куки проектов и Секреты',
-    subtitle: 'Импорт куки Cookie-Editor для конкретных скриптов и безопасное хранение API-ключей (права 0600)',
+    subtitle: 'Импорт куки Cookie-Editor для скриптов и безопасное хранение API-ключей (права 0600)',
+  },
+  ai_access: {
+    title: 'Доступ ИИ (MCP и /api/v1/)',
+    subtitle: 'Подключение Claude Code / Cursor / OpenCode, токены с правами, очередь подтверждений с diff и Kill-Switch',
   },
   settings: {
-    title: 'Настройки Панели и Системный Telegram',
-    subtitle: 'Настройка главного Telegram-бота для уведомлений и управления панелью, прокси 127.0.0.1:10808 и очистка диска',
+    title: 'Настройки Панели, Безопасность и Пользователи',
+    subtitle: 'Смена пароля администратора, фильтр подсетей и Tailscale, роли RBAC, Telegram-бот и бэкап',
   },
   acceptance: {
-    title: 'Тестовый полигон и Приёмка',
-    subtitle: 'Готовые тестовые проекты для проверки всех функций, автопрогон 6 тестов ТЗ и исходники /opt/hub',
+    title: 'Тестовый полигон и Aruta Doctor',
+    subtitle: 'Автономный прогон 6 проверок супервизора, диагностика среды и просмотр исходников',
   },
 };
 
@@ -50,7 +60,6 @@ async function safeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
   const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.pathname : input.url;
   const contentType = (res.headers.get('content-type') || '').toLowerCase();
 
-  // Если прокси-сервер во время перезапуска контейнера вернул HTML-заглушку вместо JSON для /api/*
   if (urlStr.startsWith('/api/') && contentType.includes('text/html')) {
     try {
       Object.defineProperty(res, 'ok', { value: false, configurable: true });
@@ -101,10 +110,13 @@ export function App() {
   const [authChecking, setAuthChecking] = useState<boolean>(true);
   const [csrfToken, setCsrfToken] = useState<string>('');
   const [sessionToken, setSessionToken] = useState<string>('');
-  const [mustChangePassword, setMustChangePassword] = useState<boolean>(false);
-  const [initPwInput, setInitPwInput] = useState<string>('');
-  const [initPwStatus, setInitPwStatus] = useState<string>('');
+  const [userRole, setUserRole] = useState<string>('admin');
+  const [username, setUsername] = useState<string>('admin');
+  const [isDefaultPassword, setIsDefaultPassword] = useState<boolean>(false);
+  const [quickPwInput, setQuickPwInput] = useState<string>('');
+  const [quickPwMsg, setQuickPwMsg] = useState<string>('');
 
+  const [loginUsername, setLoginUsername] = useState<string>('admin');
   const [loginPassword, setLoginPassword] = useState<string>('admin');
   const [loginError, setLoginError] = useState<string>('');
 
@@ -128,7 +140,10 @@ export function App() {
         headers.set('Content-Type', 'application/json; charset=utf-8');
       }
       if (csrfToken) headers.set('X-CSRF-Token', csrfToken);
-      if (sessionToken) headers.set('X-Hub-Session', sessionToken);
+      if (sessionToken) {
+        headers.set('X-Aruta-Session', sessionToken);
+        headers.set('X-Hub-Session', sessionToken);
+      }
       return safeFetch(path, {
         ...options,
         headers,
@@ -143,7 +158,10 @@ export function App() {
       try {
         const hdrs: Record<string, string> = { Accept: 'application/json' };
         if (overrideCsrf || csrfToken) hdrs['X-CSRF-Token'] = overrideCsrf || csrfToken;
-        if (overrideSession || sessionToken) hdrs['X-Hub-Session'] = overrideSession || sessionToken;
+        if (overrideSession || sessionToken) {
+          hdrs['X-Aruta-Session'] = overrideSession || sessionToken;
+          hdrs['X-Hub-Session'] = overrideSession || sessionToken;
+        }
 
         const [dRes, pRes, sRes] = await Promise.all([
           safeFetch('/api/dashboard', { headers: hdrs }),
@@ -155,6 +173,9 @@ export function App() {
           const dData = await dRes.json();
           if (dData && typeof dData === 'object' && 'system' in dData) {
             setDashboard(dData as DashboardData);
+            if (typeof dData.system?.is_default_password === 'boolean') {
+              setIsDefaultPassword(dData.system.is_default_password);
+            }
           }
         }
         if (pRes.ok) {
@@ -174,7 +195,7 @@ export function App() {
           }
         }
       } catch {
-        // Игнорируем кратковременные обрывы сети во время перезапуска демона
+        // ignore transient network errors
       }
     },
     [csrfToken, sessionToken]
@@ -183,14 +204,17 @@ export function App() {
   useEffect(() => {
     const initAuth = async () => {
       try {
-        const storedSession = sessionStorage.getItem('hub_session_token') || '';
-        const storedCsrf = sessionStorage.getItem('hub_csrf_token') || '';
+        const storedSession = sessionStorage.getItem('aruta_session_token') || sessionStorage.getItem('hub_session_token') || '';
+        const storedCsrf = sessionStorage.getItem('aruta_csrf_token') || sessionStorage.getItem('hub_csrf_token') || '';
         const hasCookie = typeof document !== 'undefined' && document.cookie.includes('csrf_token=');
 
         for (let attempt = 0; attempt < 6; attempt++) {
           if (storedSession || hasCookie) {
             const hdrs: Record<string, string> = { Accept: 'application/json' };
-            if (storedSession) hdrs['X-Hub-Session'] = storedSession;
+            if (storedSession) {
+              hdrs['X-Aruta-Session'] = storedSession;
+              hdrs['X-Hub-Session'] = storedSession;
+            }
             if (storedCsrf) hdrs['X-CSRF-Token'] = storedCsrf;
 
             const res = await safeFetch('/api/auth/me', {
@@ -205,9 +229,11 @@ export function App() {
                 setAuthenticated(true);
                 setCsrfToken(cToken);
                 setSessionToken(sToken);
-                sessionStorage.setItem('hub_session_token', sToken);
-                sessionStorage.setItem('hub_csrf_token', cToken);
-                setMustChangePassword(false);
+                setUserRole(data.role || 'admin');
+                setUsername(data.username || 'admin');
+                setIsDefaultPassword(Boolean(data.is_default_password));
+                sessionStorage.setItem('aruta_session_token', sToken);
+                sessionStorage.setItem('aruta_csrf_token', cToken);
                 await loadAllData(cToken, sToken);
                 break;
               }
@@ -217,11 +243,11 @@ export function App() {
             }
           }
 
-          // Штатный вход с дефолтным паролем 'admin' для предпросмотра и тестирования
+          // Вход с дефолтным паролем 'admin' (если ещё не изменён владельцем)
           const loginRes = await safeFetch('/api/auth/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-            body: JSON.stringify({ password: 'admin' }),
+            body: JSON.stringify({ username: 'admin', password: 'admin' }),
             credentials: 'same-origin',
           });
           const loginData = await loginRes.json();
@@ -235,9 +261,11 @@ export function App() {
             setAuthenticated(true);
             setCsrfToken(cToken);
             setSessionToken(sToken);
-            sessionStorage.setItem('hub_session_token', sToken);
-            sessionStorage.setItem('hub_csrf_token', cToken);
-            setMustChangePassword(false);
+            setUserRole(loginData.role || 'admin');
+            setUsername(loginData.username || 'admin');
+            setIsDefaultPassword(Boolean(loginData.is_default_password));
+            sessionStorage.setItem('aruta_session_token', sToken);
+            sessionStorage.setItem('aruta_csrf_token', cToken);
             await loadAllData(cToken, sToken);
           }
           break;
@@ -265,7 +293,7 @@ export function App() {
     const res = await safeFetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ password: loginPassword }),
+      body: JSON.stringify({ username: loginUsername.trim() || 'admin', password: loginPassword }),
     });
     if (res.ok) {
       const data = await res.json();
@@ -275,9 +303,11 @@ export function App() {
         setAuthenticated(true);
         setCsrfToken(cToken);
         setSessionToken(sToken);
-        sessionStorage.setItem('hub_session_token', sToken);
-        sessionStorage.setItem('hub_csrf_token', cToken);
-        setMustChangePassword(Boolean(data.must_change_password));
+        setUserRole(data.role || 'admin');
+        setUsername(data.username || 'admin');
+        setIsDefaultPassword(Boolean(data.is_default_password));
+        sessionStorage.setItem('aruta_session_token', sToken);
+        sessionStorage.setItem('aruta_csrf_token', cToken);
         await loadAllData(cToken, sToken);
       } else {
         setLoginError(data?.detail || 'Ошибка авторизации');
@@ -288,25 +318,37 @@ export function App() {
     }
   };
 
-  const handleChangeInitialPassword = async (e: React.FormEvent) => {
+  const handleQuickChangeDefaultPassword = async (e: React.FormEvent) => {
     e.preventDefault();
-    setInitPwStatus('');
+    setQuickPwMsg('');
     const res = await apiFetch('/api/auth/change_initial_password', {
       method: 'POST',
-      body: JSON.stringify({ new_password: initPwInput }),
+      body: JSON.stringify({ new_password: quickPwInput }),
     });
     if (res.ok) {
-      setMustChangePassword(false);
-      setInitPwInput('');
-      setInitPwStatus('');
+      setIsDefaultPassword(false);
+      setQuickPwInput('');
+      setQuickPwMsg('');
+      await loadAllData();
     } else {
       const err = await res.json().catch(() => ({}));
-      setInitPwStatus(err.detail || 'Не удалось сменить пароль');
+      setQuickPwMsg(err.detail || 'Не удалось сменить пароль (минимум 8 символов)');
     }
+  };
+
+  const handleToggleAiPauseHeader = async () => {
+    const currentlyPaused = Boolean(dashboard?.system?.ai_access_paused);
+    await apiFetch('/api/ai/config', {
+      method: 'PUT',
+      body: JSON.stringify({ paused: !currentlyPaused }),
+    });
+    await loadAllData();
   };
 
   const handleLogout = async () => {
     await apiFetch('/api/auth/logout', { method: 'POST' });
+    sessionStorage.removeItem('aruta_session_token');
+    sessionStorage.removeItem('aruta_csrf_token');
     sessionStorage.removeItem('hub_session_token');
     sessionStorage.removeItem('hub_csrf_token');
     setAuthenticated(false);
@@ -314,10 +356,10 @@ export function App() {
     setSessionToken('');
   };
 
-  const handleStartProject = async (id: number) => {
+  const handleStartProject = async (id: number, params?: Record<string, string>) => {
     const res = await apiFetch(`/api/projects/${id}/start`, {
       method: 'POST',
-      body: JSON.stringify({}),
+      body: JSON.stringify(params ? { params } : {}),
     });
     const data = await res.json();
     await loadAllData();
@@ -356,7 +398,8 @@ export function App() {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail || 'Ошибка клонирования GitHub-репозитория');
       }
-      const created: ProjectItem = await res.json();
+      const resData = await res.json();
+      const created: ProjectItem = resData.project || resData;
       if (initial_cookies_json) {
         await apiFetch(`/api/projects/${created.id}/cookies`, {
           method: 'POST',
@@ -383,7 +426,6 @@ export function App() {
     }
     const created: ProjectItem = await res.json();
 
-    // Если в мастере создания сразу вставили индивидуальные куки — сохраняем их для этого проекта
     if (initial_cookies_json) {
       await apiFetch(`/api/projects/${created.id}/cookies`, {
         method: 'POST',
@@ -406,7 +448,8 @@ export function App() {
       body: JSON.stringify({}),
     });
     if (res.ok) {
-      const cloned: ProjectItem = await res.json();
+      const data = await res.json();
+      const cloned: ProjectItem = data.project || data;
       await loadAllData();
       setSelectedProject(cloned);
       setWorkspaceSubTab('cookies_tg');
@@ -499,7 +542,7 @@ export function App() {
   const handleExpireCookie = async (name: string) => {
     await apiFetch(`/api/secrets/${encodeURIComponent(name)}/expire`, {
       method: 'POST',
-      body: JSON.stringify({ note: 'Вызван сигнал hub.cookies_expired()' }),
+      body: JSON.stringify({ note: 'Вызван сигнал aruta.cookies_expired()' }),
     });
     await loadAllData();
   };
@@ -565,7 +608,7 @@ export function App() {
   if (authChecking) {
     return (
       <div className="min-h-screen bg-[#0b0f17] text-slate-200 flex items-center justify-center">
-        <span className="font-mono text-sm">Инициализация Hub (:8050)...</span>
+        <span className="font-mono text-sm">Инициализация Beacon Control Panel...</span>
       </div>
     );
   }
@@ -577,20 +620,34 @@ export function App() {
           <div className="flex items-center gap-2.5 pb-4 border-b border-slate-800">
             <Lock className="w-5 h-5 text-indigo-400" />
             <div>
-              <h1 className="text-lg font-bold text-white">Hub Control Panel</h1>
-              <p className="text-xs text-slate-400">Lightweight Operations Console & Containerless PaaS</p>
+              <h1 className="text-lg font-bold text-white">Beacon Control Panel</h1>
+              <p className="text-xs text-slate-400">Lightweight Operations Console & MCP Server</p>
             </div>
           </div>
 
           <form onSubmit={handleLogin} className="mt-5 space-y-4">
             <div>
-              <label htmlFor="hub-login-password" className="block text-xs text-slate-300 mb-1">
-                Пароль администратора (по умолчанию <code className="font-mono text-indigo-300">admin</code>, меняется в разделе «Настройки»)
+              <label htmlFor="aruta-login-username" className="block text-xs text-slate-300 mb-1">
+                Имя пользователя
               </label>
               <input
-                id="hub-login-password"
+                id="aruta-login-username"
+                type="text"
+                placeholder="admin"
+                value={loginUsername}
+                onChange={(e) => setLoginUsername(e.target.value)}
+                className="w-full bg-[#0b0f17] border border-slate-700 rounded-lg px-3.5 py-2 text-sm text-white focus:outline-none focus:border-indigo-500"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="aruta-login-password" className="block text-xs text-slate-300 mb-1">
+                Пароль (по умолчанию <code className="font-mono text-indigo-300">admin</code>, меняется в разделе «Настройки»)
+              </label>
+              <input
+                id="aruta-login-password"
                 type="password"
-                placeholder="Введите пароль администратора..."
+                placeholder="Введите пароль..."
                 value={loginPassword}
                 onChange={(e) => setLoginPassword(e.target.value)}
                 className="w-full bg-[#0b0f17] border border-slate-700 rounded-lg px-3.5 py-2 text-sm text-white focus:outline-none focus:border-indigo-500"
@@ -616,47 +673,74 @@ export function App() {
   }
 
   const currentMeta = TAB_META[activeTab];
-  const envLabel = dashboard?.env_profile?.env_label || 'Linux / Containerless PaaS';
+  const envLabel = dashboard?.system?.env_profile?.env_label || 'Linux / Containerless PaaS';
+  const pendingAiApprovalsCount = dashboard?.system?.pending_ai_approvals_count || 0;
 
   return (
     <div className="min-h-screen bg-[#0b0f17] text-slate-100 flex flex-col pb-16 lg:pb-0">
-      {/* Баннер смены начального пароля (если включён) */}
-      {mustChangePassword && (
-        <div className="bg-amber-950/90 border-b border-amber-500/40 px-4 py-2.5">
+      {/* Постоянный жёлтый баннер при использовании пароля по умолчанию 'admin' (Фаза A.1(в)) */}
+      {isDefaultPassword && (
+        <div
+          role="region"
+          aria-label="Предупреждение о пароле по умолчанию"
+          className="bg-amber-950/90 border-b border-amber-500/50 px-4 py-2.5"
+        >
           <form
-            onSubmit={handleChangeInitialPassword}
+            onSubmit={handleQuickChangeDefaultPassword}
             className="max-w-[1440px] mx-auto flex flex-wrap items-center justify-between gap-3"
           >
-            <div className="flex items-center gap-2 text-xs text-amber-200">
-              <Lock className="w-4 h-4 text-amber-400 shrink-0" />
+            <div className="flex items-center gap-2.5 text-xs text-amber-100">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
               <span>
-                <strong>Безопасность (первый вход):</strong> задайте постоянный пароль администратора (от 6 символов):
+                <strong className="text-amber-300">Внимание: используется стандартный пароль «admin»!</strong> Вход
+                ограничен локальной сетью (RFC1918/loopback), а доступ для ИИ (MCP) заблокирован. Задайте новый пароль
+                (мин. 8 символов):
               </span>
             </div>
             <div className="flex items-center gap-2">
               <input
                 type="password"
-                value={initPwInput}
-                onChange={(e) => setInitPwInput(e.target.value)}
-                placeholder="Новый пароль (мин. 6 симв.)"
-                className="bg-slate-900/90 border border-amber-500/40 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-400 focus:outline-none focus:border-amber-400"
+                value={quickPwInput}
+                onChange={(e) => setQuickPwInput(e.target.value)}
+                placeholder="Новый пароль (от 8 симв.)"
+                className="bg-slate-950/90 border border-amber-500/50 rounded-lg px-3 py-1 text-xs text-white placeholder-slate-400 focus:outline-none focus:border-amber-400"
               />
               <button
                 type="submit"
-                className="px-3 py-1.5 text-xs font-semibold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg transition-colors cursor-pointer"
+                className="px-3 py-1 text-xs font-semibold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg transition-colors cursor-pointer"
               >
-                Сохранить пароль
+                Сменить пароль
               </button>
               <button
                 type="button"
-                onClick={() => setMustChangePassword(false)}
-                className="px-2 py-1.5 text-xs text-amber-300/80 hover:text-white cursor-pointer"
+                onClick={() => setActiveTab('settings')}
+                className="px-2.5 py-1 text-xs text-amber-300 hover:text-white underline cursor-pointer"
               >
-                Позже
+                В Настройки
               </button>
             </div>
-            {initPwStatus && <div className="w-full text-xs text-rose-300 font-medium">{initPwStatus}</div>}
+            {quickPwMsg && <div className="w-full text-xs text-rose-300 font-medium">{quickPwMsg}</div>}
           </form>
+        </div>
+      )}
+
+      {/* Баннер безопасного режима (--safe-mode) */}
+      {dashboard?.system?.safe_mode && (
+        <div className="bg-indigo-950/90 border-b border-indigo-500/40 px-4 py-2 text-xs text-indigo-200 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <ShieldAlert className="w-4 h-4 text-indigo-400" />
+            <span>
+              <strong>Безопасный режим (Safe Mode) активен:</strong> автоматический запуск сервисов и фоновых задач по
+              расписанию временно отключён.
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setActiveTab('settings')}
+            className="text-indigo-300 hover:text-white underline cursor-pointer"
+          >
+            Отключить в Настройках
+          </button>
         </div>
       )}
 
@@ -669,7 +753,7 @@ export function App() {
       />
 
       <div className="flex-1 flex">
-        {/* Боковая панель Operations Console */}
+        {/* Боковая панель Aruta Operations Console */}
         <aside
           aria-label="Основная навигация"
           className="hidden lg:flex w-68 shrink-0 bg-[#111622] border-r border-slate-800/90 flex-col justify-between p-4"
@@ -677,12 +761,12 @@ export function App() {
           <div className="space-y-5">
             <div className="px-2 pt-1 flex items-center justify-between border-b border-slate-800/80 pb-3.5">
               <div className="min-w-0">
-                <div className="text-base font-bold tracking-tight text-white">Hub Control Panel</div>
+                <div className="text-base font-bold tracking-tight text-white">Beacon Control Panel</div>
                 <div className="text-[11px] text-slate-400 truncate" title={envLabel}>
                   {envLabel}
                 </div>
               </div>
-              <span className="text-xs font-mono text-slate-400 tabular-nums shrink-0">:8050</span>
+              <span className="text-xs font-mono text-indigo-300 tabular-nums shrink-0">v2.2</span>
             </div>
 
             {/* Кнопка быстрого вызова командной палитры Ctrl+K */}
@@ -740,7 +824,7 @@ export function App() {
                       activeTab === 'projects' ? 'text-indigo-100' : 'text-slate-400'
                     }`}
                   >
-                    Код, .venv/uv, живые логи, stdin
+                    Код, project.yaml, живые логи, stdin
                   </div>
                 </div>
               </button>
@@ -769,6 +853,35 @@ export function App() {
 
               <button
                 type="button"
+                onClick={() => setActiveTab('ai_access')}
+                className={`w-full flex items-start justify-between gap-2 px-3 py-2.5 rounded-xl text-left transition-colors cursor-pointer ${
+                  activeTab === 'ai_access'
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
+                }`}
+              >
+                <div className="flex items-start gap-3">
+                  <Bot className="w-4 h-4 mt-0.5 shrink-0" />
+                  <div>
+                    <div className="text-xs font-semibold">Доступ ИИ (MCP)</div>
+                    <div
+                      className={`text-[11px] leading-snug mt-0.5 ${
+                        activeTab === 'ai_access' ? 'text-indigo-100' : 'text-slate-400'
+                      }`}
+                    >
+                      Токены, diff-одобрение, Kill-Switch
+                    </div>
+                  </div>
+                </div>
+                {pendingAiApprovalsCount > 0 && (
+                  <span className="px-1.5 py-0.5 text-[10px] font-mono font-bold bg-amber-500 text-slate-950 rounded-full">
+                    {pendingAiApprovalsCount}
+                  </span>
+                )}
+              </button>
+
+              <button
+                type="button"
                 onClick={() => setActiveTab('settings')}
                 className={`w-full flex items-start gap-3 px-3 py-2.5 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'settings'
@@ -778,13 +891,13 @@ export function App() {
               >
                 <Settings className="w-4 h-4 mt-0.5 shrink-0" />
                 <div>
-                  <div className="text-xs font-semibold">Настройки, Пароль и Бэкап</div>
+                  <div className="text-xs font-semibold">Настройки, Пароль и RBAC</div>
                   <div
                     className={`text-[11px] leading-snug mt-0.5 ${
                       activeTab === 'settings' ? 'text-indigo-100' : 'text-slate-400'
                     }`}
                   >
-                    Смена пароля, ТГ-бот, прокси, диск
+                    Смена пароля, Tailscale, роли, бэкап
                   </div>
                 </div>
               </button>
@@ -800,7 +913,7 @@ export function App() {
               >
                 <FlaskConical className="w-4 h-4 mt-0.5 shrink-0" />
                 <div>
-                  <div className="text-xs font-semibold">Приёмка и Hub Doctor</div>
+                  <div className="text-xs font-semibold">Приёмка и Doctor</div>
                   <div
                     className={`text-[11px] leading-snug mt-0.5 ${
                       activeTab === 'acceptance' ? 'text-indigo-100' : 'text-slate-400'
@@ -814,8 +927,11 @@ export function App() {
           </div>
 
           <div className="pt-4 border-t border-slate-800 space-y-2">
-            <div className="px-2 text-[11px] font-mono text-slate-400 truncate">
-              {dashboard?.env_profile?.arch || 'linux'} · {dashboard?.env_profile?.has_uv ? 'uv+venv' : 'venv'}
+            <div className="px-2 flex items-center justify-between text-[11px] font-mono text-slate-400">
+              <span className="truncate">
+                {username} ({userRole})
+              </span>
+              <span>{dashboard?.system?.env_profile?.arch || 'linux'}</span>
             </div>
             <button
               type="button"
@@ -836,7 +952,7 @@ export function App() {
               <p className="text-xs text-slate-400 truncate hidden sm:block">{currentMeta.subtitle}</p>
             </div>
 
-            <div className="flex items-center gap-3 shrink-0">
+            <div className="flex items-center gap-2.5 shrink-0">
               {dashboard?.system && (
                 <div className="hidden md:flex items-center gap-2 text-xs font-mono text-slate-300 tabular-nums">
                   {dashboard.system.hardware?.available && dashboard.system.hardware.battery_percent !== null && (
@@ -847,13 +963,37 @@ export function App() {
                       </span>
                     </>
                   )}
-                  <span>Hub {dashboard.system.hub_rss_mb} МБ</span>
+                  <span>Aruta {dashboard.system.hub_rss_mb} МБ</span>
                   <span className="text-slate-600" aria-hidden="true">
                     ·
                   </span>
                   <span>Диск {dashboard.system.disk.free_mb} МБ</span>
                 </div>
               )}
+
+              {/* Кнопка экстренной блокировки ИИ (Пауза ИИ) в шапке (Фаза B.6) */}
+              <button
+                type="button"
+                onClick={handleToggleAiPauseHeader}
+                className={`px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition-colors inline-flex items-center gap-1.5 cursor-pointer ${
+                  dashboard?.system?.ai_access_paused
+                    ? 'bg-amber-950/80 text-amber-300 border-amber-500/50 hover:bg-amber-900'
+                    : 'bg-[#111622] text-slate-300 hover:text-white border-slate-800'
+                }`}
+                title="Мгновенно заблокировать или возобновить все запросы ИИ (/mcp и /api/v1/)"
+              >
+                {dashboard?.system?.ai_access_paused ? (
+                  <>
+                    <PlayCircle className="w-3.5 h-3.5 text-amber-400" />
+                    <span className="hidden sm:inline">ИИ на паузе</span>
+                  </>
+                ) : (
+                  <>
+                    <PauseCircle className="w-3.5 h-3.5 text-rose-400" />
+                    <span className="hidden sm:inline">Пауза ИИ</span>
+                  </>
+                )}
+              </button>
 
               <button
                 type="button"
@@ -932,6 +1072,15 @@ export function App() {
               />
             )}
 
+            {activeTab === 'ai_access' && (
+              <AiAccessView
+                projects={projects}
+                apiFetch={apiFetch}
+                onRefreshDashboard={() => loadAllData()}
+                onOpenSettingsTab={() => setActiveTab('settings')}
+              />
+            )}
+
             {(activeTab === 'settings' || activeTab === 'acceptance') && (
               <SettingsAndAcceptanceView
                 mode={activeTab}
@@ -953,7 +1102,7 @@ export function App() {
       {/* Нижний таб-бар только на мобильных экранах (< lg) */}
       <nav
         aria-label="Мобильная навигация"
-        className="lg:hidden fixed bottom-0 inset-x-0 z-40 h-14 bg-[#111622] border-t border-slate-800 grid grid-cols-5"
+        className="lg:hidden fixed bottom-0 inset-x-0 z-40 h-14 bg-[#111622] border-t border-slate-800 grid grid-cols-6"
       >
         <button
           type="button"
@@ -987,6 +1136,16 @@ export function App() {
         </button>
         <button
           type="button"
+          onClick={() => setActiveTab('ai_access')}
+          className={`flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium ${
+            activeTab === 'ai_access' ? 'text-indigo-400' : 'text-slate-400'
+          }`}
+        >
+          <Bot className="w-4 h-4" />
+          MCP / ИИ
+        </button>
+        <button
+          type="button"
           onClick={() => setActiveTab('settings')}
           className={`flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium ${
             activeTab === 'settings' ? 'text-indigo-400' : 'text-slate-400'
@@ -1017,7 +1176,7 @@ export function App() {
         isOpen={commandPaletteOpen}
         onClose={() => setCommandPaletteOpen(false)}
         projects={projects}
-        onNavigateTab={(tab) => setActiveTab(tab)}
+        onNavigateTab={(tab) => setActiveTab(tab as NavTab)}
         onOpenProject={(p, subTab = 'editor') => {
           setSelectedProject(p);
           setWorkspaceSubTab(subTab);

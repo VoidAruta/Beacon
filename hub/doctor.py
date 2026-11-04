@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from hub.auth import get_internal_token
+from hub.auth import get_internal_token, is_default_password
 from hub.compat import psutil
 from hub.config import BASE_DIR, DATA_DIR, INTERNAL_TOKEN_PATH, SECRETS_DIR, ensure_directories
 from hub.db import checkpoint_wal, db_session, get_all_settings

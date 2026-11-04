@@ -452,11 +452,11 @@ async def start_web_auth_session(
     domain = parsed_url.hostname or "localhost"
 
     settings = get_all_settings()
-    sys_proxy = settings.get("proxy_url", "http://127.0.0.1:10808").strip()
+    sys_proxy = settings.get("proxy_url", "").strip()
 
     if proxy_mode == "custom" and custom_proxy.strip():
         active_proxy: Optional[str] = custom_proxy.strip()
-    elif proxy_mode == "none":
+    elif proxy_mode == "none" or not sys_proxy:
         active_proxy = None
     else:
         reach = check_proxy_reachable(sys_proxy)

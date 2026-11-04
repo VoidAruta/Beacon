@@ -1,4 +1,4 @@
-export const FORBIDDEN_PORTS = [22, 3000, 2053, 3199, 8040, 10808, 25325] as const;
+export const FORBIDDEN_PORTS: readonly number[] = [] as const;
 
 export interface SecretRedactionEntry {
   name: string;
@@ -128,19 +128,33 @@ export function validateCookieEditorJson(rawJson: string): {
 }
 
 /**
- * Проверяет, что порт панели не входит в список запрещённых портов среды.
+ * Проверяет, что порт находится в допустимом диапазоне 1024–65535 и не входит в настраиваемый список reserved_ports.
  */
-export function isPortAllowed(port: number): { allowed: boolean; reason?: string } {
+export function isPortAllowed(port: number, reservedPorts: readonly number[] = FORBIDDEN_PORTS): { allowed: boolean; reason?: string } {
   if (!Number.isInteger(port) || port < 1024 || port > 65535) {
     return { allowed: false, reason: 'Порт должен быть целым числом в диапазоне 1024–65535' };
   }
-  if ((FORBIDDEN_PORTS as readonly number[]).includes(port)) {
+  if (reservedPorts.includes(port)) {
     return {
       allowed: false,
-      reason: `Порт ${port} занят системными службами (запрещены: ${FORBIDDEN_PORTS.join(', ')})`,
+      reason: `Порт ${port} зарезервирован в настройках (reserved_ports: ${reservedPorts.join(', ')})`,
     };
   }
   return { allowed: true };
+}
+
+/**
+ * Единое правило проверки нового пароля (Фаза A.1(г)): минимум 8 символов и не 'admin'.
+ */
+export function validateNewPassword(password: string): { valid: boolean; error?: string } {
+  const trimmed = (password || '').trim();
+  if (trimmed.length < 8) {
+    return { valid: false, error: 'Новый пароль должен содержать минимум 8 символов' };
+  }
+  if (trimmed.toLowerCase() === 'admin') {
+    return { valid: false, error: 'Новый пароль не может совпадать со стандартным "admin"' };
+  }
+  return { valid: true };
 }
 
 /**
@@ -189,9 +203,6 @@ export function formatDurationSec(seconds: number): string {
   return `${h}ч ${remM}м`;
 }
 
-/**
- * Форматирует размер в байтах в понятную строку (Б, КБ, МБ, ГБ).
- */
 export function formatBytes(bytes: number): string {
   const b = Math.max(0, Number(bytes || 0));
   if (b < 1024) return `${b} Б`;
@@ -203,17 +214,14 @@ export function formatBytes(bytes: number): string {
   return `${gb.toFixed(2)} ГБ`;
 }
 
-/**
- * Переводит расписание (manual / interval / cron) или режим сервиса на понятный русский язык.
- */
 export function describeScheduleHuman(
-  type: 'service' | 'job',
+  type: 'service' | 'job' | 'web',
   scheduleType: 'manual' | 'cron' | 'interval',
   scheduleExpr: string,
   restartPolicy: 'no' | 'on-failure' | 'always' = 'on-failure',
   autostart: number | boolean = 0
 ): string {
-  if (type === 'service') {
+  if (type === 'service' || type === 'web') {
     const policyMap: Record<string, string> = {
       always: 'Автоперезапуск всегда',
       'on-failure': 'Перезапуск при ошибке',
@@ -263,11 +271,6 @@ export function describeScheduleHuman(
   return `По расписанию Cron: ${expr}`;
 }
 
-/**
- * Оценивает состояние батареи для Xiaomi Poco X3 NFC с Root-контроллером удержания заряда (45% — 55%).
- * Когда контроллер отключает ток на 55% и телефон плавно разряжается до 45%, это штатный цикл (без тревоги).
- * Тревога срабатывает только при падении заряда ниже alertBelowPct (по умолчанию < 40%).
- */
 export function evaluatePocoBatteryCycle(
   percent: number,
   status: string,
@@ -308,9 +311,6 @@ export function evaluatePocoBatteryCycle(
   };
 }
 
-/**
- * Проверяет ссылку на GitHub-репозиторий и извлекает рекомендуемое имя папки проекта.
- */
 export function parseGitHubRepoUrl(rawUrl: string): {
   valid: boolean;
   cleanUrl: string;
@@ -343,4 +343,3 @@ export function parseGitHubRepoUrl(rawUrl: string): {
     repo,
   };
 }
-

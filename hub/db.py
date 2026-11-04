@@ -1,5 +1,6 @@
 """
-Инициализация SQLite в режиме WAL, DDL-схема таблиц, автоматические миграции Фазы 2 и хелперы запросов.
+Инициализация SQLite в режиме WAL, DDL-схема таблиц, автоматические миграции и хелперы запросов.
+Никакие пароли никогда не записываются на диск открытым текстом.
 """
 
 import hashlib
@@ -14,8 +15,8 @@ from hub.config import (
     DB_PATH,
     DEFAULT_SETTINGS,
     EXAMPLES_DIR,
-    INITIAL_PASSWORD_PATH,
     ensure_directories,
+    get_env_var,
 )
 
 DDL_SCRIPT = """
@@ -57,12 +58,26 @@ CREATE TABLE IF NOT EXISTS projects (
     retry_delay_sec INTEGER NOT NULL DEFAULT 30,
     webhook_token TEXT UNIQUE,
 
-    -- Поля для type = 'service' / 'web'
+    -- Поля для type = 'service' / 'web' и защита от crash-loop (Фаза D)
     autostart INTEGER NOT NULL DEFAULT 0,
     restart_policy TEXT NOT NULL DEFAULT 'on-failure' CHECK(restart_policy IN ('no', 'on-failure', 'always')),
     backoff_min_sec INTEGER NOT NULL DEFAULT 2,
     backoff_max_sec INTEGER NOT NULL DEFAULT 300,
+    min_uptime_sec INTEGER NOT NULL DEFAULT 10,
+    max_restarts INTEGER NOT NULL DEFAULT 10,
+    restart_delay_sec INTEGER NOT NULL DEFAULT 2,
+    cron_restart TEXT NOT NULL DEFAULT '',
+    crash_loop_count INTEGER NOT NULL DEFAULT 0,
     desired_state TEXT NOT NULL DEFAULT 'stopped' CHECK(desired_state IN ('running', 'stopped')),
+
+    -- Dead Man's Switch / Heartbeat (Фаза D)
+    heartbeat_interval_sec INTEGER NOT NULL DEFAULT 0,
+    heartbeat_grace_sec INTEGER NOT NULL DEFAULT 60,
+    last_ping_at INTEGER NOT NULL DEFAULT 0,
+
+    -- Цепочки проектов и авто-форма параметров запуска (Фаза D)
+    on_success_project_id INTEGER DEFAULT NULL,
+    params_schema_json TEXT NOT NULL DEFAULT '[]',
 
     -- Уведомления проекта
     notify_on_error INTEGER NOT NULL DEFAULT 1,
@@ -77,8 +92,8 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    status TEXT NOT NULL CHECK(status IN ('running', 'waiting_input', 'success', 'failed', 'timeout', 'stopped', 'killed_oom')),
-    trigger TEXT NOT NULL CHECK(trigger IN ('manual', 'schedule', 'webhook', 'autostart', 'restart', 'retry', 'healthcheck')),
+    status TEXT NOT NULL CHECK(status IN ('running', 'waiting_input', 'success', 'failed', 'timeout', 'stopped', 'killed_oom', 'crash_loop')),
+    trigger TEXT NOT NULL CHECK(trigger IN ('manual', 'schedule', 'webhook', 'autostart', 'restart', 'retry', 'healthcheck', 'chain', 'cron_restart', 'ai')),
     pid INTEGER,
     pgid INTEGER,
     proc_create_time REAL,
@@ -102,7 +117,7 @@ CREATE TABLE IF NOT EXISTS secrets (
     updated_at INTEGER NOT NULL
 );
 
--- 5. Интерактивные запросы hub.ask()
+-- 5. Интерактивные запросы hub.ask() / aruta.ask()
 CREATE TABLE IF NOT EXISTS pending_asks (
     id TEXT PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -130,13 +145,69 @@ CREATE TABLE IF NOT EXISTS revoked_sessions (
     exp INTEGER NOT NULL
 );
 
--- 8. Персистентное Key-Value хранилище состояния проектов (hub.state в SDK)
+-- 8. Персистентное Key-Value хранилище состояния проектов (aruta.state / hub.state)
 CREATE TABLE IF NOT EXISTS project_kv (
     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     key TEXT NOT NULL,
     value_json TEXT NOT NULL,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (project_id, key)
+);
+
+-- 9. Токены ИИ-доступа (MCP и REST /api/v1/) — хранится ТОЛЬКО SHA-256 хеш
+CREATE TABLE IF NOT EXISTS ai_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    token_prefix TEXT NOT NULL,
+    token_hash TEXT UNIQUE NOT NULL,
+    scopes_json TEXT NOT NULL DEFAULT '["read"]',
+    allowed_ips TEXT NOT NULL DEFAULT '',
+    allowed_projects TEXT NOT NULL DEFAULT '*',
+    auto_approve_projects TEXT NOT NULL DEFAULT '',
+    rate_limit_per_min INTEGER NOT NULL DEFAULT 60,
+    expires_at INTEGER NOT NULL DEFAULT 0,
+    last_used_at INTEGER NOT NULL DEFAULT 0,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+
+-- 10. Очередь подтверждения опасных действий ИИ (Approval Queue)
+CREATE TABLE IF NOT EXISTS ai_approvals (
+    id TEXT PRIMARY KEY,
+    token_id INTEGER NOT NULL,
+    token_name TEXT NOT NULL,
+    action TEXT NOT NULL,
+    project_id INTEGER,
+    project_name TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    diff_text TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'rejected', 'executed', 'failed')),
+    result_json TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL,
+    decided_at INTEGER,
+    decided_by TEXT DEFAULT ''
+);
+
+-- 11. Журнал действий ИИ-агентов (AI Audit Log)
+CREATE TABLE IF NOT EXISTS ai_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    token_id INTEGER,
+    token_name TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    tool_or_endpoint TEXT NOT NULL,
+    args_summary TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_summary TEXT NOT NULL
+);
+
+-- 12. Пользователи и RBAC-роли (viewer, operator, admin)
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('viewer', 'operator', 'admin')),
+    created_at INTEGER NOT NULL
 );
 """
 
@@ -221,12 +292,11 @@ def log_audit(ip: str, action: str, details: str) -> None:
     )
 
 
-def _run_phase2_migrations(conn: sqlite3.Connection) -> None:
+def _run_schema_migrations(conn: sqlite3.Connection) -> None:
     """
-    Идемпотентная миграция существующей БД до схемы Фазы 2:
-    - Добавляет колонки port, healthcheck_url, healthcheck_interval_sec, health_status в projects
-    - Расширяет CHECK(type IN ('job', 'service', 'web')) для таблицы projects, если таблица была создана со старым CHECK
-    - Расширяет CHECK(trigger IN (..., 'healthcheck')) для таблицы runs
+    Идемпотентная миграция существующей БД до актуальной схемы:
+    - Добавляет недостающие колонки в projects
+    - Расширяет CHECK для таблиц projects и runs при обновлении со старых версий
     """
     cur = conn.execute("PRAGMA table_info(projects)")
     existing_cols = {row["name"] for row in cur.fetchall()}
@@ -236,78 +306,31 @@ def _run_phase2_migrations(conn: sqlite3.Connection) -> None:
         ("healthcheck_url", "ALTER TABLE projects ADD COLUMN healthcheck_url TEXT NOT NULL DEFAULT ''"),
         ("healthcheck_interval_sec", "ALTER TABLE projects ADD COLUMN healthcheck_interval_sec INTEGER NOT NULL DEFAULT 30"),
         ("health_status", "ALTER TABLE projects ADD COLUMN health_status TEXT NOT NULL DEFAULT 'unknown'"),
+        ("min_uptime_sec", "ALTER TABLE projects ADD COLUMN min_uptime_sec INTEGER NOT NULL DEFAULT 10"),
+        ("max_restarts", "ALTER TABLE projects ADD COLUMN max_restarts INTEGER NOT NULL DEFAULT 10"),
+        ("restart_delay_sec", "ALTER TABLE projects ADD COLUMN restart_delay_sec INTEGER NOT NULL DEFAULT 2"),
+        ("cron_restart", "ALTER TABLE projects ADD COLUMN cron_restart TEXT NOT NULL DEFAULT ''"),
+        ("crash_loop_count", "ALTER TABLE projects ADD COLUMN crash_loop_count INTEGER NOT NULL DEFAULT 0"),
+        ("heartbeat_interval_sec", "ALTER TABLE projects ADD COLUMN heartbeat_interval_sec INTEGER NOT NULL DEFAULT 0"),
+        ("heartbeat_grace_sec", "ALTER TABLE projects ADD COLUMN heartbeat_grace_sec INTEGER NOT NULL DEFAULT 60"),
+        ("last_ping_at", "ALTER TABLE projects ADD COLUMN last_ping_at INTEGER NOT NULL DEFAULT 0"),
+        ("on_success_project_id", "ALTER TABLE projects ADD COLUMN on_success_project_id INTEGER DEFAULT NULL"),
+        ("params_schema_json", "ALTER TABLE projects ADD COLUMN params_schema_json TEXT NOT NULL DEFAULT '[]'"),
     ]
     for col_name, stmt in alter_statements:
         if col_name not in existing_cols:
             conn.execute(stmt)
 
-    # Проверяем, поддерживает ли CHECK таблицы projects тип 'web'
-    proj_ddl_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='projects'").fetchone()
-    if proj_ddl_row and "'web'" not in str(proj_ddl_row["sql"]):
-        conn.execute("PRAGMA foreign_keys = OFF;")
-        conn.execute(
-            """CREATE TABLE projects_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                type TEXT NOT NULL CHECK(type IN ('job', 'service', 'web')),
-                runtime TEXT NOT NULL CHECK(runtime IN ('python', 'node', 'bash', 'custom')),
-                cmd TEXT NOT NULL,
-                workdir TEXT NOT NULL,
-                env_json TEXT NOT NULL DEFAULT '{}',
-                secrets_json TEXT NOT NULL DEFAULT '[]',
-                use_proxy INTEGER NOT NULL DEFAULT 0,
-                ram_limit_mb INTEGER NOT NULL DEFAULT 0,
-                port INTEGER NOT NULL DEFAULT 0,
-                healthcheck_url TEXT NOT NULL DEFAULT '',
-                healthcheck_interval_sec INTEGER NOT NULL DEFAULT 30,
-                health_status TEXT NOT NULL DEFAULT 'unknown',
-                schedule_type TEXT NOT NULL DEFAULT 'manual' CHECK(schedule_type IN ('manual', 'cron', 'interval')),
-                schedule_expr TEXT NOT NULL DEFAULT '',
-                timeout_sec INTEGER NOT NULL DEFAULT 0,
-                max_retries INTEGER NOT NULL DEFAULT 0,
-                retry_delay_sec INTEGER NOT NULL DEFAULT 30,
-                webhook_token TEXT UNIQUE,
-                autostart INTEGER NOT NULL DEFAULT 0,
-                restart_policy TEXT NOT NULL DEFAULT 'on-failure' CHECK(restart_policy IN ('no', 'on-failure', 'always')),
-                backoff_min_sec INTEGER NOT NULL DEFAULT 2,
-                backoff_max_sec INTEGER NOT NULL DEFAULT 300,
-                desired_state TEXT NOT NULL DEFAULT 'stopped' CHECK(desired_state IN ('running', 'stopped')),
-                notify_on_error INTEGER NOT NULL DEFAULT 1,
-                notify_on_success INTEGER NOT NULL DEFAULT 0,
-                notify_on_crash INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            )"""
-        )
-        conn.execute(
-            """INSERT INTO projects_new (
-                id, name, type, runtime, cmd, workdir, env_json, secrets_json,
-                use_proxy, ram_limit_mb, port, healthcheck_url, healthcheck_interval_sec, health_status,
-                schedule_type, schedule_expr, timeout_sec, max_retries, retry_delay_sec, webhook_token,
-                autostart, restart_policy, backoff_min_sec, backoff_max_sec, desired_state,
-                notify_on_error, notify_on_success, notify_on_crash, created_at, updated_at
-            ) SELECT
-                id, name, type, runtime, cmd, workdir, env_json, secrets_json,
-                use_proxy, ram_limit_mb, port, healthcheck_url, healthcheck_interval_sec, health_status,
-                schedule_type, schedule_expr, timeout_sec, max_retries, retry_delay_sec, webhook_token,
-                autostart, restart_policy, backoff_min_sec, backoff_max_sec, desired_state,
-                notify_on_error, notify_on_success, notify_on_crash, created_at, updated_at
-            FROM projects"""
-        )
-        conn.execute("DROP TABLE projects;")
-        conn.execute("ALTER TABLE projects_new RENAME TO projects;")
-        conn.execute("PRAGMA foreign_keys = ON;")
-
-    # Проверяем, поддерживает ли CHECK таблицы runs триггер 'healthcheck'
+    # Проверяем, поддерживает ли CHECK таблицы runs статус 'crash_loop' и триггеры 'chain', 'ai'
     runs_ddl_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='runs'").fetchone()
-    if runs_ddl_row and "'healthcheck'" not in str(runs_ddl_row["sql"]):
+    if runs_ddl_row and ("'crash_loop'" not in str(runs_ddl_row["sql"]) or "'ai'" not in str(runs_ddl_row["sql"])):
         conn.execute("PRAGMA foreign_keys = OFF;")
         conn.execute(
             """CREATE TABLE runs_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                status TEXT NOT NULL CHECK(status IN ('running', 'waiting_input', 'success', 'failed', 'timeout', 'stopped', 'killed_oom')),
-                trigger TEXT NOT NULL CHECK(trigger IN ('manual', 'schedule', 'webhook', 'autostart', 'restart', 'retry', 'healthcheck')),
+                status TEXT NOT NULL CHECK(status IN ('running', 'waiting_input', 'success', 'failed', 'timeout', 'stopped', 'killed_oom', 'crash_loop')),
+                trigger TEXT NOT NULL CHECK(trigger IN ('manual', 'schedule', 'webhook', 'autostart', 'restart', 'retry', 'healthcheck', 'chain', 'cron_restart', 'ai')),
                 pid INTEGER,
                 pgid INTEGER,
                 proc_create_time REAL,
@@ -337,23 +360,20 @@ def _run_phase2_migrations(conn: sqlite3.Connection) -> None:
 
 def init_db() -> None:
     """
-    Инициализирует таблицы SQLite в режиме WAL, выполняет миграции Фазы 2 и задаёт настройки по умолчанию.
-    По умолчанию пароль администратора — 'admin' (или значение HUB_ADMIN_PASSWORD),
-    а смена пароля доступна в любой момент в разделе «Настройки Панели».
+    Инициализирует таблицы SQLite в режиме WAL, выполняет миграции и задаёт настройки по умолчанию.
+    По умолчанию пароль администратора — 'admin' (без принудительной смены при входе и без записи на диск).
     """
     ensure_directories()
     EXAMPLES_DIR.mkdir(parents=True, exist_ok=True)
-    default_pw = (os.environ.get("HUB_ADMIN_PASSWORD") or os.environ.get("HUB_INIT_PASSWORD") or "admin").strip() or "admin"
-
-    try:
-        INITIAL_PASSWORD_PATH.write_text(default_pw + "\n", encoding="utf-8")
-        os.chmod(INITIAL_PASSWORD_PATH, 0o600)
-    except OSError:
-        pass
+    default_pw = (
+        get_env_var("ARUTA_ADMIN_PASSWORD", "HUB_ADMIN_PASSWORD", "")
+        or get_env_var("ARUTA_INIT_PASSWORD", "HUB_INIT_PASSWORD", "")
+        or "admin"
+    )
 
     with db_session() as conn:
         conn.executescript(DDL_SCRIPT)
-        _run_phase2_migrations(conn)
+        _run_schema_migrations(conn)
 
         for key, default_val in DEFAULT_SETTINGS.items():
             row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()

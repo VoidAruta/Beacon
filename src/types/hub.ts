@@ -19,7 +19,7 @@ export interface PocoHardwareStatus {
   battery_warn_temp_c?: number;
   battery_crit_temp_c?: number;
   thermal_auto_stop?: boolean;
-  thermal_state?: 'ok' | 'warning' | 'critical';
+  thermal_state?: 'ok' | 'warning' | 'critical' | 'unavailable';
   thermal_warning: boolean;
   is_real_sysfs: boolean;
   swap_total_mb?: number;
@@ -30,11 +30,12 @@ export interface PocoHardwareStatus {
 }
 
 export interface ProxyReachabilityStatus {
-  configured: boolean;
+  configured?: boolean;
   online: boolean;
-  host: string;
-  port: number;
-  latency_ms: number;
+  host?: string;
+  port?: number;
+  latency_ms?: number;
+  disabled?: boolean;
 }
 
 export interface SystemStatus {
@@ -69,10 +70,16 @@ export interface SystemStatus {
     is_android_chroot: boolean;
     is_container: boolean;
     has_systemd: boolean;
+    has_cgroups_v2?: boolean;
     has_battery: boolean;
     has_uv: boolean;
   };
   run_as_user: string;
+  is_default_password?: boolean;
+  safe_mode?: boolean;
+  ai_access_enabled?: boolean;
+  ai_access_paused?: boolean;
+  pending_ai_approvals_count?: number;
 }
 
 export interface WebAuthSession {
@@ -85,11 +92,11 @@ export interface WebAuthSession {
   proxy_mode: string;
   proxy_used: string;
   user_agent: string;
-  antibot_passed: boolean;
-  logged_in: boolean;
-  form_login: string;
+  antibot_passed?: boolean;
+  logged_in?: boolean;
+  form_login?: string;
   form_password?: string;
-  form_2fa: string;
+  form_2fa?: string;
   cookies: Array<{
     domain: string;
     name: string;
@@ -99,10 +106,10 @@ export interface WebAuthSession {
     secure?: boolean;
   }>;
   local_storage: Record<string, string>;
-  profile_dir: string;
+  profile_dir?: string;
   started_at: number;
   last_action: string;
-  preview_data_url: string;
+  preview_data_url?: string;
 }
 
 export interface PendingAsk {
@@ -129,8 +136,8 @@ export interface RunItem {
   id: number;
   project_id: number;
   project_name?: string;
-  status: 'running' | 'waiting_input' | 'success' | 'failed' | 'timeout' | 'stopped' | 'killed_oom';
-  trigger: 'manual' | 'schedule' | 'webhook' | 'autostart' | 'restart' | 'retry';
+  status: 'running' | 'waiting_input' | 'success' | 'failed' | 'timeout' | 'stopped' | 'killed_oom' | 'crash_loop';
+  trigger: 'manual' | 'schedule' | 'webhook' | 'autostart' | 'restart' | 'retry' | 'chain' | 'cron_restart' | 'ai';
   pid: number | null;
   pgid: number | null;
   proc_create_time?: number | null;
@@ -170,6 +177,7 @@ export interface ProjectItem {
   healthcheck_interval_sec?: number;
   health_status?: string;
   has_venv?: boolean;
+  has_project_yaml?: boolean;
   schedule_type: 'manual' | 'cron' | 'interval';
   schedule_expr: string;
   timeout_sec: number;
@@ -180,6 +188,16 @@ export interface ProjectItem {
   restart_policy: 'no' | 'on-failure' | 'always';
   backoff_min_sec: number;
   backoff_max_sec: number;
+  min_uptime_sec?: number;
+  max_restarts?: number;
+  restart_delay_sec?: number;
+  cron_restart?: string;
+  crash_loop_count?: number;
+  heartbeat_interval_sec?: number;
+  heartbeat_grace_sec?: number;
+  last_ping_at?: number;
+  on_success_project_id?: number;
+  params_schema?: Array<{ name: string; label?: string; default?: string }>;
   desired_state: 'running' | 'stopped';
   notify_on_error: number;
   notify_on_success: number;
@@ -270,3 +288,5 @@ export interface AcceptanceCheckItem {
   passed: boolean;
   details: string;
 }
+
+export type WorkspaceSubTab = 'editor' | 'cookies_tg' | 'terminal_git' | 'simple_cfg' | 'advanced_cfg';

@@ -30,9 +30,10 @@ from typing import Any, Callable, Coroutine, Optional
 
 from hub.auth import get_internal_token
 from hub.compat import psutil
-from hub.config import FORBIDDEN_PORTS, LOGS_DIR, SDK_NODE_DIR, SDK_PYTHON_DIR
+from hub.config import FORBIDDEN_PORTS, LOGS_DIR, SDK_NODE_DIR, SDK_PYTHON_DIR, parse_reserved_ports
 from hub.db import execute_sql, get_all_settings, query_all, query_one
 from hub.disk_guard import can_start_new_run
+from hub.env_detect import get_environment_profile
 from hub.notifier import send_notification
 from hub.secrets_mgr import get_secret_raw, redact_log_text
 
@@ -427,10 +428,14 @@ def _build_process_env(
     if venv_dir.exists():
         env["VIRTUAL_ENV"] = str(venv_dir)
 
-    # 3. Маркировка процессов для отлова сирот (_HUB_PROJECT_ID и _HUB_RUN_ID)
+    # 3. Маркировка процессов для отлова сирот (_BEACON_PROJECT_ID / _HUB_PROJECT_ID)
     if project.get("id") is not None:
+        env["_BEACON_PROJECT_ID"] = str(project["id"])
+        env["_ARUTA_PROJECT_ID"] = str(project["id"])
         env["_HUB_PROJECT_ID"] = str(project["id"])
     if run_id is not None:
+        env["_BEACON_RUN_ID"] = str(run_id)
+        env["_ARUTA_RUN_ID"] = str(run_id)
         env["_HUB_RUN_ID"] = str(run_id)
 
     # 4. Проброс переменной PORT для веб-бэкендов и сервисов
@@ -448,9 +453,17 @@ def _build_process_env(
         pass
 
     hub_port = settings.get("port", "8050")
-    env["HUB_API_URL"] = f"http://127.0.0.1:{hub_port}/internal"
+    internal_url = f"http://127.0.0.1:{hub_port}/internal"
+    internal_tok = get_internal_token()
+    env["BEACON_API_URL"] = internal_url
+    env["ARUTA_API_URL"] = internal_url
+    env["HUB_API_URL"] = internal_url
+    env["BEACON_RUN_TOKEN"] = run_token
+    env["ARUTA_RUN_TOKEN"] = run_token
     env["HUB_RUN_TOKEN"] = run_token
-    env["HUB_INTERNAL_TOKEN"] = get_internal_token()
+    env["BEACON_INTERNAL_TOKEN"] = internal_tok
+    env["ARUTA_INTERNAL_TOKEN"] = internal_tok
+    env["HUB_INTERNAL_TOKEN"] = internal_tok
 
     # Подключение SDK через PYTHONPATH и NODE_PATH
     existing_py = env.get("PYTHONPATH", "")
@@ -459,14 +472,15 @@ def _build_process_env(
     existing_node = env.get("NODE_PATH", "")
     env["NODE_PATH"] = f"{SDK_NODE_DIR}:{existing_node}" if existing_node else str(SDK_NODE_DIR)
 
-    # Прокси проекта: индивидуальный CUSTOM_PROXY_URL или системный 127.0.0.1:10808
+    # Прокси проекта: индивидуальный CUSTOM_PROXY_URL или системный proxy_url (по умолчанию пустой)
     custom_proxy = str(env.get("CUSTOM_PROXY_URL", "")).strip()
     if int(project.get("use_proxy", 0)) == 1:
-        proxy_url = custom_proxy if custom_proxy else settings.get("proxy_url", "http://127.0.0.1:10808").strip()
-        for pk in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
-            env[pk] = proxy_url
-        env["NO_PROXY"] = "127.0.0.1,localhost"
-        env["no_proxy"] = "127.0.0.1,localhost"
+        proxy_url = custom_proxy if custom_proxy else settings.get("proxy_url", "").strip()
+        if proxy_url:
+            for pk in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+                env[pk] = proxy_url
+            env["NO_PROXY"] = "127.0.0.1,localhost"
+            env["no_proxy"] = "127.0.0.1,localhost"
 
     # Привязанные секреты проекта: НЕ передаём сырые значения текстовых секретов в /proc/<pid>/environ!
     try:
@@ -475,6 +489,8 @@ def _build_process_env(
             for sec_name in sec_names:
                 sec = get_secret_raw(str(sec_name))
                 if sec:
+                    env[f"BEACON_SECRET_FILE_{sec['name']}"] = str(sec["file_path"])
+                    env[f"ARUTA_SECRET_FILE_{sec['name']}"] = str(sec["file_path"])
                     env[f"HUB_SECRET_FILE_{sec['name']}"] = str(sec["file_path"])
     except Exception:
         pass
@@ -487,17 +503,23 @@ def _make_preexec_fn(run_as_user: str) -> Callable[[], None]:
     Создаёт функцию preexec_fn для дочернего процесса:
     1. os.setsid() -> лидер новой группы процессов (PGID = PID).
     2. resource.setrlimit: ТОЛЬКО RLIMIT_CORE=(0,0) и RLIMIT_NOFILE=(4096,4096). (БЕЗ RLIMIT_AS!)
-    3. При run_as_user == 'hub-runner' и root: группы Android 3003 (aid_inet), 3004 (aid_net_raw) + setgid/setuid.
+    3. Сброс привилегий (run_as_user != 'root'): НЕ проваливается молча!
+       При любой ошибке поиска пользователя или setgroups/setgid/setuid пишет причину в лог (fd 2)
+       и завершает дочерний процесс с кодом 126 (os._exit(126)).
     """
+    user_clean = (run_as_user or "root").strip() or "root"
     target_uid: Optional[int] = None
     target_gid: Optional[int] = None
-    if run_as_user and run_as_user != "root" and os.geteuid() == 0:
+    lookup_error: Optional[str] = None
+    is_android = bool(get_environment_profile().get("is_android_chroot"))
+
+    if user_clean != "root":
         try:
-            pw = pwd.getpwnam(run_as_user)
+            pw = pwd.getpwnam(user_clean)
             target_uid = pw.pw_uid
             target_gid = pw.pw_gid
-        except KeyError:
-            pass
+        except KeyError as e:
+            lookup_error = f"Системный пользователь '{user_clean}' не найден в /etc/passwd: {e}"
 
     def _preexec() -> None:
         os.setsid()
@@ -512,13 +534,32 @@ def _make_preexec_fn(run_as_user: str) -> Callable[[], None]:
         except Exception:
             pass
 
-        if target_uid is not None and target_gid is not None:
+        if user_clean != "root":
+            if lookup_error is not None or target_uid is None or target_gid is None:
+                msg = f"\n[Privilege Drop Fatal Error (exit 126)]: {lookup_error or 'UID/GID не определены'}\n"
+                try:
+                    os.write(2, msg.encode("utf-8", errors="replace"))
+                except OSError:
+                    pass
+                os._exit(126)
+
             try:
-                os.setgroups([target_gid, 3003, 3004])
-                os.setgid(target_gid)
-                os.setuid(target_uid)
-            except Exception:
-                pass
+                if os.geteuid() != 0 and os.geteuid() != target_uid:
+                    raise PermissionError(
+                        f"Процесс панели запущен от UID={os.geteuid()} и не имеет прав переключиться на '{user_clean}' (UID={target_uid})"
+                    )
+                if os.geteuid() == 0:
+                    gids = [target_gid, 3003, 3004] if is_android else [target_gid]
+                    os.setgroups(gids)
+                    os.setgid(target_gid)
+                    os.setuid(target_uid)
+            except Exception as exc:
+                msg = f"\n[Privilege Drop Fatal Error (exit 126)]: Не удалось сбросить привилегии до '{user_clean}' (UID={target_uid}, GID={target_gid}): {exc}\n"
+                try:
+                    os.write(2, msg.encode("utf-8", errors="replace"))
+                except OSError:
+                    pass
+                os._exit(126)
 
     return _preexec
 
@@ -527,6 +568,7 @@ async def start_project_run(
     project_id: int,
     trigger: str = "manual",
     custom_cmd: Optional[str] = None,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     """
     Запускает проект (или команду установки зависимостей) с записью вывода напрямую в файловый дескриптор лога.
@@ -543,19 +585,24 @@ async def start_project_run(
         if info["project_id"] == project_id and custom_cmd is None:
             raise RuntimeError(f"Проект «{project['name']}» уже выполняется (run_id={r_id}, PID={info['pid']})")
 
+    settings = get_all_settings()
+    reserved_ports = parse_reserved_ports(settings.get("reserved_ports", "")) | FORBIDDEN_PORTS
+    panel_port = int(settings.get("port", "8050") or 8050)
+
     # Если у проекта задан сетевой порт (port > 0) и это штатный запуск (не install_deps):
     proj_port = int(project.get("port") or 0)
     if proj_port > 0 and custom_cmd is None:
-        if proj_port in FORBIDDEN_PORTS:
-            raise RuntimeError(f"Порт {proj_port} зарезервирован системой ({sorted(list(FORBIDDEN_PORTS))})")
+        if proj_port == panel_port or proj_port in reserved_ports:
+            raise RuntimeError(
+                f"Порт {proj_port} зарезервирован настройками панели ({sorted(list(reserved_ports | {panel_port}))})"
+            )
         if is_tcp_port_in_use(proj_port):
             # Сначала пробуем зачистить возможные осиротевшие процессы этого же проекта
             kill_orphan_processes_by_project_id(project_id)
             if is_tcp_port_in_use(proj_port):
-                raise RuntimeError(f"Порт {proj_port} уже занят другим процессом в системе")
+                raise RuntimeError(f"Порт {proj_port} уже занят другим процессом в системе (авто-подмена порта запрещена)")
 
-    settings = get_all_settings()
-    run_as_user = settings.get("run_as_user", "root").strip()
+    run_as_user = settings.get("run_as_user", "root").strip() or "root"
 
     workdir = Path(project["workdir"])
     workdir.mkdir(parents=True, exist_ok=True)
@@ -584,7 +631,24 @@ async def start_project_run(
         )
 
     cmd_args = _build_command_args(project, custom_cmd=custom_cmd)
+    env_prof = get_environment_profile()
+    ram_limit_mb = int(project.get("ram_limit_mb") or 0)
+    if (
+        env_prof.get("env_mode") == "systemd_linux"
+        and env_prof.get("has_systemd_run")
+        and env_prof.get("has_cgroups_v2")
+        and ram_limit_mb > 0
+        and custom_cmd is None
+        and os.geteuid() == 0
+    ):
+        systemd_run_bin = shutil.which("systemd-run")
+        if systemd_run_bin:
+            cmd_args = [systemd_run_bin, "--scope", "-q", f"-p=MemoryMax={ram_limit_mb}M", "--"] + cmd_args
+
     env = _build_process_env(project, run_token, settings, run_id=run_id)
+    if extra_env and isinstance(extra_env, dict):
+        for ek, ev in extra_env.items():
+            env[str(ek)] = str(ev)
 
     if run_as_user and run_as_user != "root" and os.geteuid() == 0:
         try:
@@ -595,7 +659,7 @@ async def start_project_run(
 
     log_fd = open(log_path, "ab", buffering=0)
     header_line = (
-        f"=== [Hub Run #{run_id}] Started at {time.strftime('%Y-%m-%d %H:%M:%S')} | "
+        f"=== [Aruta/Hub Run #{run_id}] Started at {time.strftime('%Y-%m-%d %H:%M:%S')} | "
         f"Trigger: {trigger} | Cmd: {' '.join(cmd_args)} ===\n"
     ).encode("utf-8")
     log_fd.write(header_line)

@@ -50,8 +50,9 @@ async def send_telegram_message(
     cfg = settings or get_all_settings()
     token = cfg.get("tg_bot_token", "").strip()
     chat_id = cfg.get("tg_chat_id", "").strip()
-    use_proxy = cfg.get("tg_use_proxy", "1") == "1"
-    proxy_url = cfg.get("proxy_url", "http://127.0.0.1:10808").strip() if use_proxy else None
+    use_proxy = cfg.get("tg_use_proxy", "0") == "1"
+    raw_proxy = cfg.get("proxy_url", "").strip()
+    proxy_url = raw_proxy if (use_proxy and raw_proxy) else None
 
     if not token or not chat_id:
         _record_notification_event(
@@ -110,7 +111,7 @@ async def send_notification(
 ) -> dict[str, Any]:
     """
     Отправляет уведомление во все активные каналы (Telegram, ntfy, Webhook)
-    с поддержкой локального HTTP-прокси 127.0.0.1:10808.
+    с опциональной поддержкой HTTP-прокси из настроек.
     """
     cfg = get_all_settings()
     prefix_map = {
@@ -120,7 +121,7 @@ async def send_notification(
         "crash": "🚨 [CRASH]",
         "oom": "💥 [OOM KILLED]",
     }
-    prefix = prefix_map.get(level, "ℹ️ [HUB]")
+    prefix = prefix_map.get(level, "ℹ️ [ARUTA]")
     proj_tag = f" Проект: {project_name}" if project_name else ""
     full_text = f"{prefix}{proj_tag}\n{text}"
     if log_tail:
@@ -129,10 +130,10 @@ async def send_notification(
             full_text += f"\n\nПоследние строки лога:\n{tail_trimmed}"
 
     results: dict[str, Any] = {"channels": [], "full_text": full_text}
-    proxy_default = cfg.get("proxy_url", "http://127.0.0.1:10808").strip()
+    proxy_default = cfg.get("proxy_url", "").strip()
 
     # 1. Telegram
-    tg_proxy = proxy_default if cfg.get("tg_use_proxy", "1") == "1" else None
+    tg_proxy = proxy_default if (cfg.get("tg_use_proxy", "0") == "1" and proxy_default) else None
     msg_id = await send_telegram_message(full_text, settings=cfg)
     results["channels"].append(
         {"channel": "telegram", "proxy": tg_proxy, "message_id": msg_id, "configured": bool(cfg.get("tg_bot_token"))}

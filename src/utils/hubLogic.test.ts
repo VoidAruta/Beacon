@@ -5,6 +5,7 @@ import {
   redactSecretsFromLog,
   validateCookieEditorJson,
   isPortAllowed,
+  validateNewPassword,
   validateScheduleConfig,
   formatDurationSec,
   formatBytes,
@@ -56,11 +57,17 @@ test('validateCookieEditorJson validates Cookie-Editor array structure', () => {
   assert.equal(badRes.valid, false);
 });
 
-test('isPortAllowed rejects forbidden system ports and allows 8050', () => {
+test('isPortAllowed checks valid port range 1024-65535 and configurable reservedPorts', () => {
   assert.equal(isPortAllowed(8050).allowed, true);
-  assert.equal(isPortAllowed(3000).allowed, false);
-  assert.equal(isPortAllowed(10808).allowed, false);
+  assert.equal(isPortAllowed(3000).allowed, true);
   assert.equal(isPortAllowed(22).allowed, false);
+  assert.equal(isPortAllowed(9000, [9000, 9001]).allowed, false);
+});
+
+test('validateNewPassword enforces min 8 characters and rejects admin', () => {
+  assert.equal(validateNewPassword('short').valid, false);
+  assert.equal(validateNewPassword('admin').valid, false);
+  assert.equal(validateNewPassword('StrongPass2026!').valid, true);
 });
 
 test('validateScheduleConfig validates cron and interval expressions', () => {
@@ -118,4 +125,3 @@ test('parseGitHubRepoUrl validates GitHub URLs and extracts clean project slug',
   const bad = parseGitHubRepoUrl('not-a-url');
   assert.equal(bad.valid, false);
 });
-

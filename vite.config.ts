@@ -11,8 +11,11 @@ export default defineConfig(() => {
         '@': path.resolve(__dirname, '.'),
       },
     },
+    build: {
+      outDir: 'hub/static',
+      emptyOutDir: true,
+    },
     server: {
-      // HMR is disabled in AI Studio to prevent WebSocket connection errors in the preview iframe.
       hmr: false,
       watch: null,
     },

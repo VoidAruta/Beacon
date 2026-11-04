@@ -59,6 +59,12 @@ function statusBadge(status: string | undefined): { label: string; cls: string }
       cls: 'bg-amber-950/70 text-amber-300 border border-amber-700/70',
     };
   }
+  if (s === 'crash_loop') {
+    return {
+      label: 'CRASH LOOP',
+      cls: 'bg-rose-950/90 text-rose-200 border border-rose-500/80 animate-pulse',
+    };
+  }
   if (s === 'failed' || s === 'crashed' || s === 'killed_oom' || s === 'timeout') {
     return {
       label: s === 'killed_oom' ? 'OOM KILL' : s === 'timeout' ? 'ТАЙМАУТ' : 'СБОЙ',
@@ -636,9 +642,24 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
 
       if (cancelled) return;
 
-      const sToken = sessionStorage.getItem('hub_session_token') || '';
+      let ticket = '';
+      try {
+        const tRes = await apiFetch('/api/auth/stream_ticket', {
+          method: 'POST',
+          body: JSON.stringify({}),
+        });
+        if (tRes.ok) {
+          const tData = await tRes.json();
+          ticket = String(tData.ticket || '');
+        }
+      } catch {
+        // fallback to polling
+      }
+
+      if (cancelled) return;
+
       const streamUrl = `/api/runs/${selectedRunId}/stream?offset=${startOffset}${
-        sToken ? `&session_token=${encodeURIComponent(sToken)}` : ''
+        ticket ? `&ticket=${encodeURIComponent(ticket)}` : ''
       }`;
       es = new EventSource(streamUrl);
       es.onmessage = (ev) => {
@@ -1267,6 +1288,29 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                   Клон
                 </button>
               )}
+
+              <button
+                type="button"
+                onClick={async () => {
+                  const res = await apiFetch(`/api/projects/${activeProj.id}/export`);
+                  if (res.ok) {
+                    const blob = await res.blob();
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `${activeProj.name}_project.zip`;
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    URL.revokeObjectURL(url);
+                  }
+                }}
+                className="px-2.5 py-2 text-xs font-medium text-slate-300 hover:text-white bg-[#0b0f17] hover:bg-slate-800 border border-[#1e2638] rounded-lg inline-flex items-center gap-1 cursor-pointer"
+                title="Экспортировать проект в .zip с project.yaml (без значений секретов)"
+              >
+                <FileText className="w-3.5 h-3.5 text-emerald-400" />
+                Экспорт .zip
+              </button>
 
               <button
                 type="button"

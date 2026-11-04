@@ -195,25 +195,25 @@ async def handle_telegram_command(raw_text: str) -> Optional[str]:
         disk = get_disk_status()
         hw = get_poco_hardware_status()
         cfg = get_all_settings()
-        proxy_st = check_proxy_reachable(cfg.get("proxy_url", "http://127.0.0.1:10808"))
+        proxy_st = check_proxy_reachable(cfg.get("proxy_url", ""))
         running_cnt = len(
             query_all("SELECT id FROM runs WHERE status IN ('running', 'waiting_input')")
         )
         return (
-            f"📊 Статус сервера Hub:\n"
-            f"• Память Hub: {hub_rss} МБ (лимит 80 МБ)\n"
+            f"📊 Статус сервера Aruta:\n"
+            f"• Память Aruta: {hub_rss} МБ (лимит 80 МБ)\n"
             f"• CPU: {cpu_pct}% | ОЗУ: {round(vm.used / 1048576)}/{round(vm.total / 1048576)} МБ ({vm.percent}%)\n"
             f"• ZRAM Swap: {hw['swap_used_mb']}/{hw['swap_total_mb']} МБ | Аптайм: {hw['uptime_human']}\n"
             f"• Батарея: {hw['battery_percent']}% ({hw['raw_status']}, {hw['battery_temp_c']}°C, {hw['voltage_mv']} мВ)\n"
             f"• Диск UFS: свободно {disk['free_mb']} МБ (WAL: {disk.get('wal_size_kb', 0)} КБ)\n"
-            f"• Прокси 10808: {'Онлайн' if proxy_st['online'] else 'Офлайн'} | Активных запусков: {running_cnt}"
+            f"• Прокси: {'Онлайн' if proxy_st['online'] else 'Выкл/Офлайн'} | Активных запусков: {running_cnt}"
         )
 
     if cmd == "/projects":
         projs = query_all("SELECT id, name, type, desired_state FROM projects ORDER BY id ASC")
         if not projs:
             return "Список проектов пуст."
-        lines = ["📦 Проекты в Hub:"]
+        lines = ["📦 Проекты в Aruta:"]
         for p in projs:
             last_r = query_one(
                 "SELECT status, pid FROM runs WHERE project_id = ? ORDER BY id DESC LIMIT 1",
@@ -221,7 +221,7 @@ async def handle_telegram_command(raw_text: str) -> Optional[str]:
             )
             st = last_r["status"] if last_r else "stopped"
             pid_str = f" (PID {last_r['pid']})" if last_r and last_r.get("pid") and st in ("running", "waiting_input") else ""
-            icon = "🟢" if st == "running" else ("🟡" if st == "waiting_input" else ("🔴" if st in ("failed", "killed_oom") else "⚪"))
+            icon = "🟢" if st == "running" else ("🟡" if st == "waiting_input" else ("🔴" if st in ("failed", "killed_oom", "crash_loop") else "⚪"))
             lines.append(f"{icon} {p['name']} [{p['type']}] — {st}{pid_str}")
         return "\n".join(lines)
 
@@ -253,7 +253,7 @@ async def handle_telegram_command(raw_text: str) -> Optional[str]:
 
         rep = run_hub_doctor(auto_fix_perms=True)
         lines = [
-            f"🩺 Hub Doctor ({rep['duration_ms']} мс): OK={rep['ok_count']} | WARN={rep['warn_count']} | ERROR={rep['error_count']}"
+            f"🩺 Aruta Doctor ({rep['duration_ms']} мс): OK={rep['ok_count']} | WARN={rep['warn_count']} | ERROR={rep['error_count']}"
         ]
         for c in rep["checks"]:
             mark = "✅" if c["status"] == "ok" else ("⚠️" if c["status"] == "warn" else "❌")
@@ -274,12 +274,6 @@ def ensure_tg_poller_running() -> None:
 
 
 async def _tg_polling_loop() -> None:
-    """
-    Фоновый пуллинг Telegram getUpdates (через прокси 127.0.0.1:10808 с long polling timeout=10).
-    Принимает как ответы Reply на интерактивные запросы hub.ask(), так и команды управления
-    (/status, /projects, /start <имя>, /stop <имя>, /doctor).
-    Если tg_bot_token не задан и нет активных запросов — засыпает без нагрузки на CPU/сеть.
-    """
     global _TG_OFFSET
     while True:
         cfg = get_all_settings()
@@ -294,8 +288,9 @@ async def _tg_polling_loop() -> None:
             await asyncio.sleep(2.0)
             continue
 
-        use_proxy = cfg.get("tg_use_proxy", "1") == "1"
-        proxy_url = cfg.get("proxy_url", "http://127.0.0.1:10808").strip() if use_proxy else None
+        use_proxy = cfg.get("tg_use_proxy", "0") == "1"
+        raw_proxy = cfg.get("proxy_url", "").strip()
+        proxy_url = raw_proxy if (use_proxy and raw_proxy) else None
         url = f"https://api.telegram.org/bot{token}/getUpdates"
 
         try:

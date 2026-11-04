@@ -1,4 +1,4 @@
-name: Hub Control Panel CI
+name: Aruta Control Panel CI
 
 on:
   push:
@@ -8,10 +8,12 @@ on:
 
 jobs:
   backend-tests:
-    name: Python Core & Supervisor Tests
-    runs-on: ubuntu-latest
+    name: Python Core, Security & Supervisor Tests (${{ matrix.runner }}, Py ${{ matrix.python-version }})
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
+        runner: ["ubuntu-latest", "ubuntu-24.04-arm"]
         python-version: ["3.11", "3.12"]
     steps:
       - name: Checkout repository
@@ -22,17 +24,21 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install lightweight runtime dependencies
+      - name: Install lightweight runtime dependencies & pip-audit
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -r requirements.txt pip-audit
 
-      - name: Run Hub Doctor & Generate systemd unit
+      - name: Audit Python dependencies (pip-audit)
         run: |
-          python3 -m hub systemd
-          python3 -m hub doctor
+          pip-audit -r requirements.txt || true
 
-      - name: Run Backend Unit & Integration Suite
+      - name: Run Aruta Doctor & Generate systemd units
+        run: |
+          python3 -m aruta systemd
+          python3 -m aruta doctor
+
+      - name: Run Backend Unit & Security Suite
         run: |
           python3 -m unittest discover -s tests -v
 
@@ -55,5 +61,5 @@ jobs:
       - name: Run Pure Logic Unit Tests (node:test)
         run: npx tsx --test src/utils/hubLogic.test.ts
 
-      - name: Build Production Bundle
+      - name: Build Production Static Bundle into hub/static
         run: npm run build

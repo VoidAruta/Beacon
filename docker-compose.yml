@@ -1,0 +1,14 @@
+services:
+  aruta:
+    build: .
+    container_name: aruta-panel
+    restart: unless-stopped
+    ports:
+      - "8050:8050"
+    environment:
+      - ARUTA_PORT=8050
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/opt/aruta/data
+      - ./logs:/opt/aruta/logs
+      - ./projects:/opt/aruta/projects

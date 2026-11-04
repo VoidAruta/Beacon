@@ -1,0 +1,30 @@
+[Unit]
+Description=Beacon / Hub Control Panel (Lightweight Operations Console & Containerless PaaS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/app/applet
+Environment="BEACON_DIR=/app/applet"
+Environment="HUB_DIR=/app/applet"
+Environment="BEACON_PORT=8050"
+Environment="HUB_PORT=8050"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/python3 -m beacon
+Restart=always
+RestartSec=3
+KillMode=process
+LimitNOFILE=4096
+
+# Systemd Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ReadWritePaths=/app/applet/data /app/applet/projects /app/applet/scripts
+
+[Install]
+WantedBy=multi-user.target

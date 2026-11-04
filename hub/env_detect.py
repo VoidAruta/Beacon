@@ -1,8 +1,9 @@
 """
-Адаптивное определение среды запуска Hub (hub/env_detect.py):
-1. Android Linux Chroot / Termux (aarch64, root, aid_inet=3003, датчики /sys/class/power_supply/battery, без systemd)
-2. Полноценный Linux-сервер / VPS / Мини-ПК / Raspberry Pi (с systemd или без него)
-3. Контейнерная среда (LXC / Docker / Cloud Run preview)
+Адаптивное определение среды запуска Aruta / Hub (hub/env_detect.py):
+Поддерживает три основных профиля:
+1. android_chroot — Android Linux Chroot / Termux (aarch64, root, aid_inet=3003, датчики батареи, без systemd)
+2. systemd_linux — Полноценный Linux-сервер / VPS / Мини-ПК / Raspberry Pi (systemd + cgroups v2)
+3. container — Контейнерная среда (Docker / LXC / Cloud Run preview, без systemd и датчиков батареи)
 """
 
 import os
@@ -16,15 +17,16 @@ from typing import Any
 def get_environment_profile() -> dict[str, Any]:
     """
     Возвращает полный профиль текущей операционной среды:
+    - env_mode: 'android_chroot' | 'systemd_linux' | 'container'
     - is_android_chroot: bool
     - is_container: bool
     - has_systemd: bool
+    - has_cgroups_v2: bool
     - has_battery: bool
     - has_uv: bool
     - uv_bin: str
     - arch: str
     - kernel: str
-    - env_mode: 'android_chroot' | 'linux_systemd' | 'linux_container' | 'linux_host'
     - env_label: человекочитаемое описание среды
     """
     arch = platform.machine() or "unknown"
@@ -35,6 +37,7 @@ def get_environment_profile() -> dict[str, Any]:
 
     has_battery = Path("/sys/class/power_supply/battery/capacity").exists()
     has_systemd = Path("/run/systemd/system").exists()
+    has_cgroups_v2 = Path("/sys/fs/cgroup/cgroup.controllers").exists()
 
     has_aid_inet = False
     try:
@@ -48,7 +51,7 @@ def get_environment_profile() -> dict[str, Any]:
         pass
 
     is_android_kernel = "android" in kernel.lower() or Path("/system/build.prop").exists()
-    is_android_chroot = bool(has_battery or is_android_kernel or has_aid_inet)
+    is_android_chroot = bool(has_battery or is_android_kernel or (has_aid_inet and not has_systemd))
 
     is_container = False
     if Path("/.dockerenv").exists() or Path("/run/.containerenv").exists():
@@ -65,19 +68,17 @@ def get_environment_profile() -> dict[str, Any]:
 
     uv_bin = shutil.which("uv") or ""
     has_uv = bool(uv_bin)
+    systemd_run_bin = shutil.which("systemd-run") or ""
 
     if is_android_chroot:
         env_mode = "android_chroot"
         env_label = f"Android Linux Chroot ({arch})"
     elif has_systemd and not is_container:
-        env_mode = "linux_systemd"
+        env_mode = "systemd_linux"
         env_label = f"Linux Systemd Server ({arch})"
-    elif is_container:
-        env_mode = "linux_container"
-        env_label = f"Linux Container ({arch})"
     else:
-        env_mode = "linux_host"
-        env_label = f"Linux Host ({arch})"
+        env_mode = "container"
+        env_label = f"Linux Container ({arch})" if is_container else f"Linux Standalone ({arch})"
 
     return {
         "env_mode": env_mode,
@@ -87,6 +88,8 @@ def get_environment_profile() -> dict[str, Any]:
         "is_android_chroot": is_android_chroot,
         "is_container": is_container,
         "has_systemd": has_systemd,
+        "has_cgroups_v2": has_cgroups_v2,
+        "has_systemd_run": bool(systemd_run_bin and has_systemd),
         "has_battery": has_battery,
         "has_aid_inet": has_aid_inet,
         "has_uv": has_uv,
@@ -97,8 +100,8 @@ def get_environment_profile() -> dict[str, Any]:
 
 def generate_systemd_unit(base_dir: Path | None = None, port: int = 8050, user: str = "root") -> str:
     """
-    Генерирует готовый unit-файл systemd (hub.service) для стационарных Linux-серверов и VPS
-    (вызывается командой `python3 -m hub systemd`).
+    Генерирует защищённый unit-файл systemd (aruta.service / hub.service) для стационарных Linux-серверов
+    с опциями hardening: NoNewPrivileges, ProtectSystem=strict, PrivateTmp, ReadWritePaths.
     """
     from hub.config import BASE_DIR
 
@@ -107,25 +110,34 @@ def generate_systemd_unit(base_dir: Path | None = None, port: int = 8050, user: 
     venv_py = resolved_base / ".venv" / "bin" / "python"
     if venv_py.exists():
         py_exec = str(venv_py)
-    base_dir = resolved_base
 
     return f"""[Unit]
-Description=Hub Control Panel (Lightweight Operations Console & Containerless PaaS)
+Description=Beacon / Hub Control Panel (Lightweight Operations Console & Containerless PaaS)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User={user}
-WorkingDirectory={base_dir}
-Environment="HUB_DIR={base_dir}"
+WorkingDirectory={resolved_base}
+Environment="BEACON_DIR={resolved_base}"
+Environment="HUB_DIR={resolved_base}"
+Environment="BEACON_PORT={port}"
 Environment="HUB_PORT={port}"
 Environment="PYTHONUNBUFFERED=1"
-ExecStart={py_exec} -m hub
+ExecStart={py_exec} -m beacon
 Restart=always
 RestartSec=3
 KillMode=process
 LimitNOFILE=4096
+
+# Systemd Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ReadWritePaths={resolved_base}/data {resolved_base}/projects {resolved_base}/scripts
 
 [Install]
 WantedBy=multi-user.target

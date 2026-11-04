@@ -20,7 +20,7 @@ import {
   Terminal,
 } from 'lucide-react';
 import { AcceptanceCheckItem, AuditEntry, ProjectItem } from '../types/hub';
-import { describeScheduleHuman, formatBytes, isPortAllowed } from '../utils/hubLogic';
+import { describeScheduleHuman, formatBytes, isPortAllowed, validateNewPassword } from '../utils/hubLogic';
 
 interface SettingsAndAcceptanceViewProps {
   mode: 'settings' | 'acceptance';
@@ -122,7 +122,7 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     setSaveMsg(null);
-    const portCheck = isPortAllowed(Number(settings.port || 8050));
+    const portCheck = isPortAllowed(Number(settings.port || 8050), settings.reserved_ports || '');
     if (!portCheck.allowed) {
       setSaveMsg({ type: 'err', text: portCheck.reason || 'Запрещённый порт' });
       return;
@@ -130,6 +130,11 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
 
     const payload = { ...settings };
     if (newPassword.trim()) {
+      const pwValid = validateNewPassword(newPassword.trim());
+      if (!pwValid.valid) {
+        setSaveMsg({ type: 'err', text: pwValid.reason || 'Пароль должен содержать минимум 8 символов' });
+        return;
+      }
       payload.new_password = newPassword.trim();
     }
 
@@ -739,11 +744,12 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
             <label className="block text-xs font-medium text-slate-200 mb-1">
-              Адрес локального HTTP-прокси (для Telegram и скриптов)
+              Адрес локального HTTP-прокси (по умолчанию пусто)
             </label>
             <input
               type="text"
-              value={settings.proxy_url || 'http://127.0.0.1:10808'}
+              placeholder="Например: http://127.0.0.1:10808"
+              value={settings.proxy_url || ''}
               onChange={(e) => setSettings({ ...settings, proxy_url: e.target.value })}
               className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
             />
@@ -751,13 +757,13 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
 
           <div>
             <label className="block text-xs font-medium text-slate-200 mb-1">
-              Сменить пароль входа в веб-панель (по умолчанию <code className="font-mono text-indigo-300">admin</code>)
+              Сменить пароль входа в веб-панель (мин. 8 символов; дефолт <code className="font-mono text-indigo-300">admin</code>)
             </label>
             <input
               type="password"
               value={newPassword}
               onChange={(e) => setNewPassword(e.target.value)}
-              placeholder="Новый пароль (оставьте пустым, чтобы не менять)"
+              placeholder="Новый пароль (минимум 8 символов)"
               className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
             />
           </div>
@@ -854,7 +860,7 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div>
                   <label className="block text-xs text-slate-300 mb-1">
-                    Порт панели (запрещены: 22, 3000, 2053, 3199, 8040, 10808, 25325)
+                    Порт панели (по умолчанию 8050)
                   </label>
                   <input
                     type="number"
@@ -866,15 +872,15 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
 
                 <div>
                   <label className="block text-xs text-slate-300 mb-1">
-                    Пользователь запуска процессов (Android chroot)
+                    Пользователь запуска процессов (при наличии hub-runner используется по умолчанию)
                   </label>
                   <select
                     value={settings.run_as_user || 'root'}
                     onChange={(e) => setSettings({ ...settings, run_as_user: e.target.value })}
                     className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
                   >
-                    <option value="root">root (по умолчанию в chroot)</option>
                     <option value="hub-runner">hub-runner (изолированный юзер с группой 3003 aid_inet)</option>
+                    <option value="root">root (полные права)</option>
                   </select>
                 </div>
 
@@ -889,6 +895,76 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
                     className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
                   />
                 </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-xs text-slate-300 mb-1">
+                    Доверенные обратные прокси (<code className="font-mono text-indigo-300">trusted_proxies</code>)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Пусто (или 127.0.0.1/32 для локального nginx/caddy)"
+                    value={settings.trusted_proxies || ''}
+                    onChange={(e) => setSettings({ ...settings, trusted_proxies: e.target.value })}
+                    className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs text-slate-300 mb-1">
+                    Зарезервированные порты (<code className="font-mono text-indigo-300">reserved_ports</code>)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Через запятую, например: 22, 80, 443"
+                    value={settings.reserved_ports || ''}
+                    onChange={(e) => setSettings({ ...settings, reserved_ports: e.target.value })}
+                    className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs text-slate-300 mb-1">
+                    Внешний Heartbeat Ping URL (Uptime Kuma / Healthchecks)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="https://hc-ping.com/..."
+                    value={settings.outbound_heartbeat_url || ''}
+                    onChange={(e) => setSettings({ ...settings, outbound_heartbeat_url: e.target.value })}
+                    className="w-full bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <label className="flex items-center gap-2 text-xs text-slate-200 cursor-pointer p-2.5 bg-[#0f172a] border border-slate-700 rounded-lg">
+                  <input
+                    type="checkbox"
+                    checked={settings.allow_tailscale === '1'}
+                    onChange={(e) => setSettings({ ...settings, allow_tailscale: e.target.checked ? '1' : '0' })}
+                  />
+                  Разрешить подсеть Tailscale (100.64.0.0/10)
+                </label>
+
+                <label className="flex items-center gap-2 text-xs text-slate-200 cursor-pointer p-2.5 bg-[#0f172a] border border-slate-700 rounded-lg">
+                  <input
+                    type="checkbox"
+                    checked={settings.cookie_secure === '1'}
+                    onChange={(e) => setSettings({ ...settings, cookie_secure: e.target.checked ? '1' : '0' })}
+                  />
+                  Принудительный флаг Secure для cookie сессии
+                </label>
+
+                <label className="flex items-center gap-2 text-xs text-amber-200 cursor-pointer p-2.5 bg-[#0f172a] border border-amber-700/40 rounded-lg">
+                  <input
+                    type="checkbox"
+                    checked={settings.safe_mode === '1'}
+                    onChange={(e) => setSettings({ ...settings, safe_mode: e.target.checked ? '1' : '0' })}
+                  />
+                  Safe Mode (отключить автозапуск всех проектов)
+                </label>
               </div>
 
               <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
