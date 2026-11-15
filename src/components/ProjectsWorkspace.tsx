@@ -6,6 +6,12 @@ import {
   Trash2,
   Save,
   FolderCode,
+  Folder,
+  FolderOpen,
+  FileCode2,
+  Download,
+  RefreshCw,
+  ChevronRight,
   FileText,
   Terminal,
   Plus,
@@ -30,7 +36,7 @@ import {
   Sparkles,
   ShieldCheck,
 } from 'lucide-react';
-import { ProjectItem, RunItem, SecretItem, WorkspaceSubTab, WebAuthSession } from '../types/hub';
+import { ProjectItem, RunItem, SecretItem, WorkspaceSubTab, WebAuthSession, FileTreeNode } from '../types/hub';
 import { formatBytes } from '../utils/hubLogic';
 
 function formatShortTime(ts: number | string | null | undefined): string {
@@ -90,32 +96,181 @@ interface FlatFileEntry {
   is_dir: boolean;
 }
 
-function flattenFileTree(nodes: any[]): FlatFileEntry[] {
-  const result: FlatFileEntry[] = [];
-  const walk = (list: any[]) => {
-    for (const item of list || []) {
-      if (item.type === 'dir') {
-        result.push({
-          path: item.path,
-          name: item.name,
-          size: 0,
-          is_dir: true,
-        });
-        if (Array.isArray(item.children)) {
-          walk(item.children);
-        }
-      } else {
-        result.push({
-          path: item.path,
-          name: item.name,
+function sortFileTree(nodes: FileTreeNode[]): FileTreeNode[] {
+  return [...nodes]
+    .sort((a, b) => {
+      if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+      return a.name.localeCompare(b.name, 'ru');
+    })
+    .map((node) => ({
+      ...node,
+      children: node.children ? sortFileTree(node.children) : undefined,
+    }));
+}
+
+function normalizeFileTree(nodes: any[]): FileTreeNode[] {
+  return sortFileTree(
+    (nodes || [])
+      .filter((item) => item && typeof item === 'object' && item.path && item.name)
+      .map((item) => {
+        const isDir = item.type === 'dir' || item.is_dir === true;
+        return {
+          name: String(item.name),
+          path: String(item.path).replace(/^\/+|\/+$/g, ''),
+          type: isDir ? 'dir' : 'file',
           size: Number(item.size || 0),
-          is_dir: false,
-        });
+          children: isDir && Array.isArray(item.children) ? normalizeFileTree(item.children) : undefined,
+        } as FileTreeNode;
+      })
+  );
+}
+
+function buildFileTreeFromFlat(files: any[]): FileTreeNode[] {
+  const root: FileTreeNode[] = [];
+  const findOrCreate = (list: FileTreeNode[], name: string, path: string, type: 'file' | 'dir', size = 0) => {
+    let node = list.find((item) => item.path === path);
+    if (!node) {
+      node = { name, path, type, size, ...(type === 'dir' ? { children: [] } : {}) };
+      list.push(node);
+    } else if (type === 'dir') {
+      node.type = 'dir';
+      node.children ||= [];
+    }
+    return node;
+  };
+
+  for (const raw of files || []) {
+    if (!raw || typeof raw !== 'object') continue;
+    const rawPath = String(raw.path || raw.name || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    if (!rawPath) continue;
+    const parts = rawPath.split('/').filter(Boolean);
+    let parent = root;
+    let currentPath = '';
+    parts.forEach((part, index) => {
+      currentPath = currentPath ? `${currentPath}/${part}` : part;
+      const isDirectory = index < parts.length - 1 || raw.is_dir === true || raw.type === 'dir';
+      const node = findOrCreate(parent, part, currentPath, isDirectory ? 'dir' : 'file', Number(raw.size || 0));
+      if (isDirectory) {
+        node.type = 'dir';
+        node.children ||= [];
+        parent = node.children;
       }
+    });
+  }
+  return sortFileTree(root);
+}
+
+function flattenFileTree(nodes: FileTreeNode[]): FlatFileEntry[] {
+  const result: FlatFileEntry[] = [];
+  const walk = (list: FileTreeNode[]) => {
+    for (const item of list || []) {
+      const isDir = item.type === 'dir';
+      result.push({
+        path: item.path,
+        name: item.name,
+        size: isDir ? 0 : Number(item.size || 0),
+        is_dir: isDir,
+      });
+      if (isDir && Array.isArray(item.children)) walk(item.children);
     }
   };
   walk(nodes);
   return result;
+}
+
+interface ProjectFileTreeProps {
+  nodes: FileTreeNode[];
+  selectedFilePath: string;
+  selectedFolderPath: string;
+  expandedFolders: Set<string>;
+  depth?: number;
+  onToggleFolder: (node: FileTreeNode) => void;
+  onSelectFile: (path: string) => void;
+}
+
+const ProjectFileTree: React.FC<ProjectFileTreeProps> = ({
+  nodes,
+  selectedFilePath,
+  selectedFolderPath,
+  expandedFolders,
+  depth = 0,
+  onToggleFolder,
+  onSelectFile,
+}) => (
+  <div className="space-y-0.5">
+    {sortFileTree(nodes).map((node) => {
+      const isDir = node.type === 'dir';
+      const isOpen = isDir && expandedFolders.has(node.path);
+      const isSelected = isDir ? selectedFolderPath === node.path : selectedFilePath === node.path;
+      return (
+        <React.Fragment key={node.path}>
+          <button
+            type="button"
+            title={node.path}
+            onClick={() => (isDir ? onToggleFolder(node) : onSelectFile(node.path))}
+            className={`w-full flex items-center gap-2 rounded-md py-1.5 pr-2 text-left text-xs transition-colors ${
+              isSelected
+                ? 'bg-indigo-600/20 text-indigo-100 ring-1 ring-inset ring-indigo-500/40'
+                : 'text-slate-300 hover:bg-[#182131] hover:text-white'
+            }`}
+            style={{ paddingLeft: `${8 + depth * 14}px` }}
+          >
+            {isDir ? (
+              <>
+                <ChevronRight className={`h-3.5 w-3.5 shrink-0 text-slate-500 transition-transform ${isOpen ? 'rotate-90' : ''}`} />
+                {isOpen ? <FolderOpen className="h-4 w-4 shrink-0 text-amber-300" /> : <Folder className="h-4 w-4 shrink-0 text-amber-300" />}
+              </>
+            ) : (
+              <>
+                <span className="w-3.5 shrink-0" />
+                <FileCode2 className={`h-4 w-4 shrink-0 ${isSelected ? 'text-indigo-200' : 'text-slate-500'}`} />
+              </>
+            )}
+            <span className="min-w-0 flex-1 truncate">{node.name}</span>
+            {!isDir && <span className="shrink-0 text-[10px] tabular-nums text-slate-500">{formatBytes(node.size || 0)}</span>}
+            {isDir && <span className="shrink-0 text-[10px] text-slate-600">{node.children?.length || 0}</span>}
+          </button>
+          {isDir && isOpen && (node.children?.length ? (
+            <ProjectFileTree
+              nodes={node.children}
+              selectedFilePath={selectedFilePath}
+              selectedFolderPath={selectedFolderPath}
+              expandedFolders={expandedFolders}
+              depth={depth + 1}
+              onToggleFolder={onToggleFolder}
+              onSelectFile={onSelectFile}
+            />
+          ) : (
+            <div className="py-1 text-[11px] italic text-slate-600" style={{ paddingLeft: `${37 + depth * 14}px` }}>
+              Папка пуста
+            </div>
+          ))}
+        </React.Fragment>
+      );
+    })}
+  </div>
+);
+
+function joinProjectPath(basePath: string, inputPath: string): string {
+  const normalizedInput = inputPath.trim().replace(/\\/g, '/');
+  const parts = `${basePath ? `${basePath}/` : ''}${normalizedInput}`
+    .replace(/^\/+|\/+$/g, '')
+    .split('/')
+    .filter(Boolean);
+  if (!parts.length || parts.some((part) => part === '.' || part === '..')) {
+    throw new Error('Укажите корректный относительный путь без . и ..');
+  }
+  return parts.join('/');
+}
+
+function fileLanguageLabel(path: string): string {
+  const ext = path.split('.').pop()?.toLowerCase() || '';
+  const labels: Record<string, string> = {
+    py: 'PYTHON', js: 'JAVASCRIPT', jsx: 'REACT JSX', ts: 'TYPESCRIPT', tsx: 'REACT TSX',
+    json: 'JSON', html: 'HTML', css: 'CSS', scss: 'SCSS', md: 'MARKDOWN', yml: 'YAML', yaml: 'YAML',
+    sh: 'SHELL', bash: 'SHELL', toml: 'TOML', txt: 'TEXT', sql: 'SQL',
+  };
+  return labels[ext] || (ext ? ext.toUpperCase() : 'TEXT');
 }
 
 interface ProjectsWorkspaceProps {
@@ -130,7 +285,7 @@ interface ProjectsWorkspaceProps {
   onStopProject: (id: number) => Promise<any>;
   onRestartProject: (id: number) => Promise<any>;
   onUpdateProject: (id: number, data: Record<string, any>) => Promise<any>;
-  onDeleteProject: (id: number) => Promise<any>;
+  onDeleteProject: (id: number, deleteFiles?: boolean) => Promise<any>;
   onCloneProject?: (id: number) => Promise<any>;
   onRefreshAll: () => void;
   apiFetch: (path: string, options?: RequestInit) => Promise<Response>;
@@ -181,12 +336,27 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     selectedProject ||
     projects[0] ||
     null;
+  const activeProjectIdRef = useRef<number | null>(activeProj?.id ?? null);
+  activeProjectIdRef.current = activeProj?.id ?? null;
 
   // Вкладка 1: Файлы и код
   const [files, setFiles] = useState<FlatFileEntry[]>([]);
+  const [fileTree, setFileTree] = useState<FileTreeNode[]>([]);
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  const [activeFolderPath, setActiveFolderPath] = useState<string>('');
   const [activeFilePath, setActiveFilePath] = useState<string>('');
   const [fileContent, setFileContent] = useState<string>('');
+  const [savedFileContent, setSavedFileContent] = useState<string>('');
   const [fileStatus, setFileStatus] = useState<string>('');
+  const [exportingProject, setExportingProject] = useState<boolean>(false);
+  const [editorFontSize, setEditorFontSize] = useState<number>(13);
+  const [editorWrap, setEditorWrap] = useState<boolean>(false);
+  const [editorScrollTop, setEditorScrollTop] = useState<number>(0);
+  const [editorCursor, setEditorCursor] = useState<{ line: number; column: number }>({ line: 1, column: 1 });
+  const fileRequestIdRef = useRef<number>(0);
+  const fileListRequestIdRef = useRef<number>(0);
+  const editorRef = useRef<HTMLTextAreaElement | null>(null);
+  const isFileDirty = Boolean(activeFilePath) && fileContent !== savedFileContent;
   const [newFileName, setNewFileName] = useState<string>('');
   const [newFolderName, setNewFolderName] = useState<string>('');
   const [fileActionMode, setFileActionMode] = useState<'none' | 'new_file' | 'new_folder'>('none');
@@ -226,6 +396,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   const [cliCommand, setCliCommand] = useState<string>('pip install -r requirements.txt');
   const [cliRunning, setCliRunning] = useState<boolean>(false);
   const [cliOutput, setCliOutput] = useState<string>('');
+  const [cliRunId, setCliRunId] = useState<number | null>(null);
 
   // Вкладка 4/5: Настройки, Расписание, Лимиты и Секреты
   const [cfgName, setCfgName] = useState<string>('');
@@ -244,7 +415,11 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   const [cfgTimeout, setCfgTimeout] = useState<number>(0);
   const [cfgEnvJson, setCfgEnvJson] = useState<string>('{}');
   const [cfgSelectedSecrets, setCfgSelectedSecrets] = useState<string[]>([]);
+  const [cfgWebhookHmacSecret, setCfgWebhookHmacSecret] = useState<string>('');
+  const [cfgParamsSchema, setCfgParamsSchema] = useState<Array<{ name: string; label: string; default: string }>>([]);
   const [cfgStatus, setCfgStatus] = useState<string>('');
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState<boolean>(false);
+  const [deleteFilesCheckbox, setDeleteFilesCheckbox] = useState<boolean>(false);
 
   // Конструктор расписания
   const [schedBuilderMode, setSchedBuilderMode] = useState<'minutes' | 'hours' | 'daily' | 'interval' | 'raw'>('minutes');
@@ -270,6 +445,22 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   // Инициализация полей при смене выбранного проекта
   useEffect(() => {
     if (!activeProj) return;
+    // Отменяем логически все ответы от предыдущего проекта.
+    fileRequestIdRef.current += 1;
+    fileListRequestIdRef.current += 1;
+    setEditorScrollTop(0);
+    setEditorCursor({ line: 1, column: 1 });
+    setFiles([]);
+    setFileTree([]);
+    setExpandedFolders(new Set());
+    setActiveFolderPath('');
+    setActiveFilePath('');
+    setFileContent('');
+    setSavedFileContent('');
+    setFileStatus('');
+    setFileActionMode('none');
+    setNewFileName('');
+    setNewFolderName('');
     setCfgName(activeProj.name);
     const pType = (activeProj.type === 'web' ? 'web' : activeProj.type === 'job' ? 'job' : 'service') as
       | 'service'
@@ -289,11 +480,26 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     setCfgMaxRam(activeProj.ram_limit_mb || 128);
     setCfgTimeout(activeProj.timeout_sec || 0);
     setCfgEnvJson(activeProj.env_json || '{}');
+    setCfgWebhookHmacSecret(activeProj.webhook_hmac_secret || '');
+    setCfgParamsSchema(
+      Array.isArray(activeProj.params_schema)
+        ? activeProj.params_schema.map((item) => ({
+            name: String(item.name || ''),
+            label: String(item.label || ''),
+            default: String(item.default || ''),
+          }))
+        : []
+    );
+    setDeleteConfirmOpen(false);
+    setDeleteFilesCheckbox(false);
 
     const expr = (activeProj.schedule_expr || '').trim();
     if (activeProj.schedule_type === 'interval') {
       setSchedBuilderMode('interval');
       setSchedIntervalSec(Number(expr) || 300);
+    } else if (activeProj.schedule_type === 'daily') {
+      setSchedBuilderMode('daily');
+      setSchedDailyTime(/^\d{1,2}:\d{2}$/.test(expr) ? expr : '09:00');
     } else if (/^\*\/(\d+) \* \* \* \*$/.test(expr)) {
       const m = expr.match(/^\*\/(\d+) \* \* \* \*$/);
       setSchedBuilderMode('minutes');
@@ -353,11 +559,12 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     setTgSaveStatus('');
     setCfgStatus('');
     setCliOutput('');
+    setCliRunId(null);
     setZipUploadStatus('');
     setWebAuthSession(null);
     setWebAuthStatusMsg('');
 
-    loadProjectFiles(activeProj.id);
+    loadProjectFiles(activeProj.id, undefined, true);
     loadProjectRuns(activeProj.id);
     loadProjectKv(activeProj.id);
   }, [activeProj?.id]);
@@ -395,7 +602,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     if (res.ok) {
       setNewKvKey('');
       setNewKvVal('');
-      setKvStatus('Ключ сохранён в hub.state');
+      setKvStatus('Ключ сохранён в beacon.state');
       await loadProjectKv(activeProj.id);
       setTimeout(() => setKvStatus(''), 2500);
     } else {
@@ -425,6 +632,8 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
       const data = await res.json();
       if (res.ok && data.run) {
         await loadProjectRuns(activeProj.id);
+        setCliRunId(data.run.id);
+        setCliOutput(`Установка зависимостей · Run #${data.run.id}\nВывод процесса поступает в реальном времени ниже.`);
         setSelectedRunId(data.run.id);
         onRefreshAll();
       } else {
@@ -449,49 +658,95 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     }
   };
 
-  const loadProjectFiles = async (projId: number, preferPath?: string) => {
+  const loadProjectFiles = async (projId: number, preferPath?: string, forceReload = false) => {
+    if (projId !== activeProjectIdRef.current) return;
+    const requestId = ++fileListRequestIdRef.current;
     try {
       const res = await apiFetch(`/api/projects/${projId}/files`);
-      if (res.ok) {
-        const data = await res.json();
-        const list: FlatFileEntry[] = Array.isArray(data.tree)
-          ? flattenFileTree(data.tree)
-          : Array.isArray(data.files)
-          ? data.files
-          : [];
-        setFiles(list);
-        const onlyFiles = list.filter((f) => !f.is_dir);
-        if (preferPath && onlyFiles.some((f) => f.path === preferPath)) {
-          loadSingleFile(projId, preferPath);
-        } else if (onlyFiles.length > 0) {
-          const mainFile =
-            onlyFiles.find((f) => f.path === 'main.py' || f.path === 'index.js' || f.path === 'run.sh') ||
-            onlyFiles[0];
-          loadSingleFile(projId, mainFile.path);
-        } else {
-          setActiveFilePath('');
-          setFileContent('');
-        }
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Не удалось получить список файлов');
       }
-    } catch {
-      // ignore
+
+      const data = await res.json();
+      if (requestId !== fileListRequestIdRef.current || projId !== activeProjectIdRef.current) return;
+      const tree: FileTreeNode[] = Array.isArray(data.tree)
+        ? normalizeFileTree(data.tree)
+        : buildFileTreeFromFlat(Array.isArray(data.files) ? data.files : []);
+      const list = flattenFileTree(tree);
+      const fileEntries = list.filter((entry) => !entry.is_dir);
+      const validFolders = new Set(list.filter((entry) => entry.is_dir).map((entry) => entry.path));
+
+      setFileTree(tree);
+      setFiles(list);
+      setExpandedFolders((prev) => {
+        const next = new Set([...prev].filter((path) => validFolders.has(path)));
+        tree.filter((node) => node.type === 'dir').forEach((node) => next.add(node.path));
+        return next;
+      });
+      if (activeFolderPath && !validFolders.has(activeFolderPath)) setActiveFolderPath('');
+
+      if (fileEntries.length === 0) {
+        if (!forceReload && isFileDirty && activeFilePath) {
+          setFileStatus('Список файлов пуст: несохранённый текст оставлен в редакторе');
+          return;
+        }
+        setActiveFilePath('');
+        setFileContent('');
+        setSavedFileContent('');
+        setFileStatus('В проекте пока нет файлов');
+        return;
+      }
+
+      const preferred = preferPath && fileEntries.find((entry) => entry.path === preferPath);
+      const current = activeFilePath ? fileEntries.find((entry) => entry.path === activeFilePath) : undefined;
+      const mainFile =
+        fileEntries.find((entry) => entry.path === 'main.py' || entry.path === 'index.js' || entry.path === 'run.sh') ||
+        fileEntries[0];
+      const target = preferred || current || mainFile;
+
+      // Обновление дерева не должно сбрасывать открытый документ. Перечитываем его
+      // только по явному предпочтительному пути или при чистом буфере после force-refresh.
+      const shouldLoad = Boolean(preferred) || !current || (forceReload && !isFileDirty);
+      if (target && shouldLoad) {
+        const bypassDirtyPrompt = Boolean(preferred) || (forceReload && !isFileDirty);
+        await loadSingleFile(projId, target.path, bypassDirtyPrompt);
+      }
+    } catch (e: any) {
+      if (requestId !== fileListRequestIdRef.current || projId !== activeProjectIdRef.current) return;
+      setFileStatus(e?.message || 'Ошибка загрузки списка файлов');
     }
   };
 
-  const loadSingleFile = async (projId: number, relPath: string) => {
+  const loadSingleFile = async (projId: number, relPath: string, force = false) => {
+    if (projId !== activeProjectIdRef.current || !relPath) return;
+    if (!force && relPath === activeFilePath) return;
+    if (!force && isFileDirty && !window.confirm('В файле есть несохранённые изменения. Переключиться и потерять их?')) {
+      return;
+    }
+
+    const requestId = ++fileRequestIdRef.current;
     setActiveFilePath(relPath);
-    setFileStatus('Загрузка...');
+    setFileContent('');
+    setSavedFileContent('');
+    setEditorScrollTop(0);
+    setEditorCursor({ line: 1, column: 1 });
+    setFileStatus('Загрузка файла...');
     try {
       const res = await apiFetch(`/api/projects/${projId}/files/content?path=${encodeURIComponent(relPath)}`);
-      if (res.ok) {
-        const data = await res.json();
-        setFileContent(data.content || '');
-        setFileStatus('');
-      } else {
-        setFileStatus('Не удалось прочитать файл');
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Не удалось прочитать файл');
       }
-    } catch {
-      setFileStatus('Ошибка чтения файла');
+      const data = await res.json();
+      if (requestId !== fileRequestIdRef.current || projId !== activeProjectIdRef.current) return;
+      const content = typeof data.content === 'string' ? data.content : '';
+      setFileContent(content);
+      setSavedFileContent(content);
+      setFileStatus('');
+    } catch (e: any) {
+      if (requestId !== fileRequestIdRef.current || projId !== activeProjectIdRef.current) return;
+      setFileStatus(e?.message || 'Ошибка чтения файла');
     }
   };
 
@@ -502,27 +757,39 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     if (!targetPath) return;
 
     setFileStatus('Сохранение...');
-    const res = await apiFetch(`/api/projects/${activeProj.id}/files/content`, {
-      method: 'PUT',
-      body: JSON.stringify({ path: targetPath, content: targetContent }),
-    });
-    if (res.ok) {
+    try {
+      const res = await apiFetch(`/api/projects/${activeProj.id}/files/content`, {
+        method: 'PUT',
+        body: JSON.stringify({ path: targetPath, content: targetContent }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Ошибка сохранения файла');
+      }
+      if (activeProjectIdRef.current !== activeProj.id) return;
+      if (targetPath === activeFilePath) setSavedFileContent(targetContent);
       setFileStatus('Сохранено');
-      loadProjectFiles(activeProj.id, targetPath);
+      await loadProjectFiles(activeProj.id, targetPath === activeFilePath ? undefined : targetPath, false);
       onRefreshAll();
-      setTimeout(() => setFileStatus(''), 2000);
-    } else {
-      const err = await res.json().catch(() => ({}));
-      setFileStatus(err.detail || 'Ошибка сохранения');
+      window.setTimeout(() => setFileStatus((current) => current === 'Сохранено' ? '' : current), 2000);
+    } catch (e: any) {
+      setFileStatus(e?.message || 'Ошибка сохранения файла');
     }
   };
 
   const handleCreateNewFile = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeProj || !newFileName.trim()) return;
-    const clean = newFileName.trim().replace(/^\/+/, '');
+    if (isFileDirty && !window.confirm('Текущий файл содержит несохранённые изменения. Продолжить создание файла и переключиться на него?')) return;
+    let clean = '';
+    try {
+      clean = joinProjectPath(activeFolderPath, newFileName);
+    } catch (err: any) {
+      setFileStatus(err?.message || 'Некорректный путь к файлу');
+      return;
+    }
     const initialBody = clean.endsWith('.py')
-      ? '# -*- coding: utf-8 -*-\nfrom hub_sdk import hub\n\nprint("Запуск скрипта...", flush=True)\n'
+      ? '# -*- coding: utf-8 -*-\nimport beacon\n\nprint("Запуск скрипта...", flush=True)\n'
       : clean.endsWith('.json')
       ? '{\n  \n}\n'
       : '';
@@ -534,32 +801,66 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   const handleCreateNewFolder = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeProj || !newFolderName.trim()) return;
-    const res = await apiFetch(`/api/projects/${activeProj.id}/files/mkdir`, {
-      method: 'POST',
-      body: JSON.stringify({ path: newFolderName.trim() }),
-    });
-    if (res.ok) {
+    let folderPath = '';
+    try {
+      folderPath = joinProjectPath(activeFolderPath, newFolderName);
+    } catch (err: any) {
+      setFileStatus(err?.message || 'Некорректный путь к папке');
+      return;
+    }
+    try {
+      const res = await apiFetch(`/api/projects/${activeProj.id}/files/mkdir`, {
+        method: 'POST',
+        body: JSON.stringify({ path: folderPath }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Ошибка создания папки');
+      }
+      if (activeProjectIdRef.current !== activeProj.id) return;
       setNewFolderName('');
       setFileActionMode('none');
-      loadProjectFiles(activeProj.id, activeFilePath);
-    } else {
-      const err = await res.json().catch(() => ({}));
-      setFileStatus(err.detail || 'Ошибка создания папки');
+      setActiveFolderPath(folderPath);
+      setExpandedFolders((prev) => new Set([...prev, ...folderPath.split('/').map((_, index, parts) => parts.slice(0, index + 1).join('/'))]));
+      await loadProjectFiles(activeProj.id);
+    } catch (e: any) {
+      setFileStatus(e?.message || 'Ошибка создания папки');
     }
+  };
+
+  const handleToggleFolder = (node: FileTreeNode) => {
+    setActiveFolderPath(node.path);
+    setExpandedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(node.path)) next.delete(node.path);
+      else next.add(node.path);
+      return next;
+    });
   };
 
   const handleDeleteFile = async (relPath: string) => {
     if (!activeProj || !relPath) return;
-    const res = await apiFetch(`/api/projects/${activeProj.id}/files?path=${encodeURIComponent(relPath)}`, {
-      method: 'DELETE',
-    });
-    if (res.ok) {
+    if (!window.confirm(`Удалить файл «${relPath}»? Это действие нельзя отменить.`)) return;
+    if (relPath === activeFilePath && isFileDirty && !window.confirm('В файле есть несохранённые изменения. Всё равно удалить его?')) return;
+    try {
+      const res = await apiFetch(`/api/projects/${activeProj.id}/files?path=${encodeURIComponent(relPath)}`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Ошибка удаления файла');
+      }
+      if (activeProjectIdRef.current !== activeProj.id) return;
+      if (relPath === activeFilePath) {
+        setActiveFilePath('');
+        setFileContent('');
+        setSavedFileContent('');
+      }
       setFileStatus(`Удалено: ${relPath}`);
-      loadProjectFiles(activeProj.id);
+      await loadProjectFiles(activeProj.id, undefined, true);
       onRefreshAll();
-    } else {
-      const err = await res.json().catch(() => ({}));
-      setFileStatus(err.detail || 'Ошибка удаления');
+    } catch (e: any) {
+      setFileStatus(e?.message || 'Ошибка удаления файла');
     }
   };
 
@@ -567,32 +868,128 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     const file = e.target.files?.[0];
     if (!file || !activeProj) return;
     setZipUploadStatus(`Загрузка ${file.name}...`);
-    const reader = new FileReader();
-    reader.onload = async () => {
-      const rawUrl = String(reader.result || '');
-      const base64Part = rawUrl.includes(',') ? rawUrl.split(',')[1] : rawUrl;
+    try {
+      const base64Part = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const rawUrl = String(reader.result || '');
+          resolve(rawUrl.includes(',') ? rawUrl.split(',')[1] : rawUrl);
+        };
+        reader.onerror = () => reject(new Error('Не удалось прочитать выбранный файл'));
+        reader.readAsDataURL(file);
+      });
       const isZip = file.name.toLowerCase().endsWith('.zip');
       const res = await apiFetch(`/api/projects/${activeProj.id}/files/upload?extract=${isZip ? 'true' : 'false'}`, {
         method: 'POST',
-        body: JSON.stringify({
-          filename: file.name,
-          content_base64: base64Part,
-          extract: isZip,
-        }),
+        body: JSON.stringify({ filename: file.name, content_base64: base64Part, extract: isZip }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        setZipUploadStatus(
-          isZip ? `Распаковано файлов: ${data.files?.length || 0}` : `Загружен файл: ${file.name}`
-        );
-        loadProjectFiles(activeProj.id);
-        onRefreshAll();
-      } else {
+      if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        setZipUploadStatus(err.detail || 'Ошибка загрузки файла');
+        throw new Error(err.detail || 'Ошибка загрузки файла');
       }
-    };
-    reader.readAsDataURL(file);
+      const data = await res.json().catch(() => ({}));
+      if (activeProjectIdRef.current !== activeProj.id) return;
+      setZipUploadStatus(isZip ? `Распаковано файлов: ${data.files?.length || 0}` : `Загружен файл: ${file.name}`);
+      await loadProjectFiles(activeProj.id, undefined, true);
+      onRefreshAll();
+    } catch (err: any) {
+      setZipUploadStatus(err?.message || 'Ошибка загрузки файла');
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  const handleDownloadActiveFile = () => {
+    if (!activeFilePath) return;
+    const blob = new Blob([fileContent], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = activeFilePath.split('/').pop() || 'project-file.txt';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const handleExportProject = async () => {
+    if (!activeProj || exportingProject) return;
+    if (isFileDirty) {
+      setZipUploadStatus('Перед экспортом сохраните изменения в открытом файле.');
+      return;
+    }
+    setExportingProject(true);
+    setZipUploadStatus('Подготовка ZIP-архива проекта...');
+    try {
+      const res = await apiFetch(`/api/projects/${activeProj.id}/export`);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Не удалось экспортировать проект');
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `${activeProj.name.replace(/[\\/:*?"<>|]+/g, '_')}_project.zip`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+      setZipUploadStatus('Архив проекта скачан');
+    } catch (err: any) {
+      setZipUploadStatus(err?.message || 'Ошибка экспорта проекта');
+    } finally {
+      setExportingProject(false);
+    }
+  };
+
+  const updateEditorCursor = (target: HTMLTextAreaElement) => {
+    const beforeCursor = target.value.slice(0, target.selectionStart);
+    const lines = beforeCursor.split('\n');
+    setEditorCursor({ line: lines.length, column: lines[lines.length - 1].length + 1 });
+  };
+
+  const handleEditorKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    const target = e.currentTarget;
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      void handleSaveFile();
+      return;
+    }
+
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const start = target.selectionStart;
+      const end = target.selectionEnd;
+      const inserted = '    ';
+      const nextValue = `${fileContent.slice(0, start)}${inserted}${fileContent.slice(end)}`;
+      setFileContent(nextValue);
+      requestAnimationFrame(() => {
+        target.focus();
+        target.setSelectionRange(start + inserted.length, start + inserted.length);
+        updateEditorCursor(target);
+      });
+      return;
+    }
+
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const start = target.selectionStart;
+      const end = target.selectionEnd;
+      const lineStart = fileContent.lastIndexOf('\n', start - 1) + 1;
+      const currentLinePrefix = fileContent.slice(lineStart, start);
+      const indentation = currentLinePrefix.match(/^\s*/)?.[0] || '';
+      const extraIndent = /:\s*$/.test(currentLinePrefix.trimEnd()) ? '    ' : '';
+      const inserted = `\n${indentation}${extraIndent}`;
+      const nextValue = `${fileContent.slice(0, start)}${inserted}${fileContent.slice(end)}`;
+      setFileContent(nextValue);
+      requestAnimationFrame(() => {
+        const nextCursor = start + inserted.length;
+        target.focus();
+        target.setSelectionRange(nextCursor, nextCursor);
+        updateEditorCursor(target);
+      });
+    }
   };
 
   const loadProjectRuns = async (projId: number) => {
@@ -624,80 +1021,91 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     return () => clearInterval(timer);
   }, [activeProj?.id]);
 
-  // Загрузка лога и live-обновление (SSE + надёжный опрос для прокси/iframe)
+  // SSE используется как основной канал. Опрос включается только при ошибке SSE,
+  // чтобы два источника не дублировали друг другу одни и те же фрагменты лога.
   useEffect(() => {
     if (!selectedRunId) return;
     let es: EventSource | null = null;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
     let cancelled = false;
 
-    const loadLogAndStream = async () => {
-      const res = await apiFetch(`/api/runs/${selectedRunId}/log`);
-      let startOffset = 0;
-      if (res.ok && !cancelled) {
-        const data = await res.json();
-        setLogText(data.log || '');
-        startOffset = Number(data.log_size || 0);
-      }
-
+    const pollLogs = async () => {
       if (cancelled) return;
-
-      let ticket = '';
       try {
-        const tRes = await apiFetch('/api/auth/stream_ticket', {
-          method: 'POST',
-          body: JSON.stringify({}),
-        });
-        if (tRes.ok) {
-          const tData = await tRes.json();
-          ticket = String(tData.ticket || '');
-        }
+        const response = await apiFetch(`/api/runs/${selectedRunId}/log`);
+        if (!response.ok || cancelled) return;
+        const data = await response.json();
+        if (!cancelled && typeof data.log === 'string') setLogText(data.log);
       } catch {
-        // fallback to polling
+        // Следующий интервал повторит запрос.
       }
-
-      if (cancelled) return;
-
-      const streamUrl = `/api/runs/${selectedRunId}/stream?offset=${startOffset}${
-        ticket ? `&ticket=${encodeURIComponent(ticket)}` : ''
-      }`;
-      es = new EventSource(streamUrl);
-      es.onmessage = (ev) => {
-        try {
-          const payload = JSON.parse(ev.data);
-          if (payload.type === 'log' && payload.data) {
-            setLogText((prev) => prev + payload.data);
-            if (logBoxRef.current) {
-              logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
-            }
-          } else if (payload.chunk) {
-            setLogText((prev) => prev + payload.chunk);
-          }
-          if (payload.type === 'eof' || payload.eof) {
-            es?.close();
-          }
-        } catch {
-          // ignore
-        }
-      };
-
-      pollTimer = setInterval(async () => {
-        if (cancelled) return;
-        const rRes = await apiFetch(`/api/runs/${selectedRunId}/log`);
-        if (rRes.ok && !cancelled) {
-          const rData = await rRes.json();
-          if (typeof rData.log === 'string') {
-            setLogText(rData.log);
-          }
-        }
-      }, 2000);
     };
 
-    loadLogAndStream();
+    const startPollingFallback = () => {
+      if (cancelled || pollTimer) return;
+      es?.close();
+      es = null;
+      void pollLogs();
+      pollTimer = setInterval(pollLogs, 2000);
+    };
 
+    const loadLogAndStream = async () => {
+      try {
+        const response = await apiFetch(`/api/runs/${selectedRunId}/log`);
+        let startOffset = 0;
+        if (response.ok && !cancelled) {
+          const data = await response.json();
+          if (cancelled) return;
+          setLogText(typeof data.log === 'string' ? data.log : '');
+          startOffset = Number(data.log_size || 0);
+        }
+
+        if (cancelled) return;
+        let ticket = '';
+        try {
+          const ticketResponse = await apiFetch('/api/auth/stream_ticket', {
+            method: 'POST',
+            body: JSON.stringify({ run_id: selectedRunId }),
+          });
+          if (ticketResponse.ok) {
+            const ticketData = await ticketResponse.json();
+            ticket = String(ticketData.ticket || '');
+          }
+        } catch {
+          // Без ticket пробуем SSE, затем при ошибке переключаемся на опрос.
+        }
+
+        if (cancelled) return;
+        const streamUrl = `/api/runs/${selectedRunId}/stream?offset=${startOffset}${
+          ticket ? `&ticket=${encodeURIComponent(ticket)}` : ''
+        }`;
+        try {
+          es = new EventSource(streamUrl);
+          es.onmessage = (event) => {
+            try {
+              const payload = JSON.parse(event.data);
+              const chunk = payload.type === 'log' ? payload.data : payload.chunk;
+              if (typeof chunk === 'string' && chunk.length) {
+                setLogText((previous) => previous + chunk);
+              }
+              if (payload.type === 'eof' || payload.eof) es?.close();
+            } catch {
+              // Игнорируем некорректное SSE-событие, не ломая просмотр лога.
+            }
+          };
+          es.onerror = startPollingFallback;
+        } catch {
+          startPollingFallback();
+        }
+      } catch {
+        startPollingFallback();
+      }
+    };
+
+    void loadLogAndStream();
     return () => {
       cancelled = true;
-      if (es) es.close();
+      es?.close();
       if (pollTimer) clearInterval(pollTimer);
     };
   }, [selectedRunId]);
@@ -708,26 +1116,38 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     const text = stdinInput;
     setStdinInput('');
     setStdinStatus('Отправка в FIFO...');
-    const res = await apiFetch(`/api/runs/${selectedRunId}/stdin`, {
-      method: 'POST',
-      body: JSON.stringify({ text }),
-    });
-    if (res.ok) {
-      setStdinStatus('Отправлено в stdin процесса');
-      setTimeout(() => setStdinStatus(''), 2500);
-    } else {
-      const err = await res.json().catch(() => ({}));
-      setStdinStatus(err.detail || 'Процесс не ожидает ввод');
+    try {
+      const res = await apiFetch(`/api/runs/${selectedRunId}/stdin`, {
+        method: 'POST',
+        body: JSON.stringify({ text }),
+      });
+      if (res.ok) {
+        setStdinStatus('Отправлено в stdin процесса');
+        setTimeout(() => setStdinStatus(''), 2500);
+      } else {
+        const err = await res.json().catch(() => ({}));
+        setStdinStatus(err.detail || 'Процесс не ожидает ввод');
+      }
+    } catch (error: any) {
+      setStdinStatus(error?.message || 'Не удалось отправить ввод в процесс');
     }
   };
 
   // Сохранение кук (и привязка к проекту через /api/projects/{id}/cookies)
   const handleSaveAndAttachCookies = async () => {
-    if (!activeProj || !cookieSecretName.trim()) return;
-    const raw = cookieJsonText.trim() || DEFAULT_COOKIE_SAMPLE;
+    if (!activeProj) return;
+    if (!cookieSecretName.trim()) {
+      setCookieSaveStatus('Укажите имя секрета в Сейфе.');
+      return;
+    }
+    const raw = cookieJsonText.trim();
+    if (!raw) {
+      setCookieSaveStatus('Вставьте реальные Cookies или загрузите JSON-файл. Шаблон не будет сохранён автоматически.');
+      return;
+    }
     try {
       const parsed = JSON.parse(raw);
-      if (!Array.isArray(parsed)) {
+      if (!Array.isArray(parsed) || !parsed.every((cookie) => cookie && typeof cookie === 'object' && !Array.isArray(cookie))) {
         setCookieSaveStatus('Ошибка: JSON должен быть массивом объектов Cookie [...]');
         return;
       }
@@ -737,25 +1157,24 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     }
 
     setCookieSaveStatus('Сохранение в сейф и запись cookies.json (0600)...');
-    const res = await apiFetch(`/api/projects/${activeProj.id}/cookies`, {
-      method: 'POST',
-      body: JSON.stringify({
-        name: cookieSecretName.trim(),
-        cookies_json: raw,
-      }),
-    });
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      setCookieSaveStatus(err.detail || 'Ошибка сохранения кук');
-      return;
+    try {
+      const res = await apiFetch(`/api/projects/${activeProj.id}/cookies`, {
+        method: 'POST',
+        body: JSON.stringify({ name: cookieSecretName.trim(), cookies_json: raw }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        setCookieSaveStatus(err.detail || 'Ошибка сохранения кук');
+        return;
+      }
+      const updatedSecrets = Array.from(new Set([...cfgSelectedSecrets, cookieSecretName.trim()]));
+      setCfgSelectedSecrets(updatedSecrets);
+      onRefreshAll();
+      void loadProjectFiles(activeProj.id);
+      setCookieSaveStatus(`Куки сохранены в «${cookieSecretName.trim()}» и подключены к проекту.`);
+    } catch (error: any) {
+      setCookieSaveStatus(error?.message || 'Не удалось связаться с сервером при сохранении Cookies');
     }
-
-    const updatedSecrets = Array.from(new Set([...cfgSelectedSecrets, cookieSecretName.trim()]));
-    setCfgSelectedSecrets(updatedSecrets);
-    onRefreshAll();
-    loadProjectFiles(activeProj.id, activeFilePath);
-    setCookieSaveStatus(`Куки сохранены в «${cookieSecretName.trim()}» (права 0600) и подключены к проекту!`);
   };
 
   const handleCookieFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -791,6 +1210,8 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
       } else {
         setWebAuthStatusMsg(data.detail || 'Ошибка HTTP-проверки');
       }
+    } catch (error: any) {
+      setWebAuthStatusMsg(error?.message || 'Не удалось выполнить HTTP-проверку');
     } finally {
       setWebAuthLoading(false);
     }
@@ -814,6 +1235,8 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
       } else {
         setWebAuthStatusMsg(data.detail || 'Ошибка сохранения сессии');
       }
+    } catch (error: any) {
+      setWebAuthStatusMsg(error?.message || 'Не удалось сохранить данные HTTP-сессии');
     } finally {
       setWebAuthLoading(false);
     }
@@ -824,11 +1247,14 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     e.preventDefault();
     if (!activeProj) return;
     setTgSaveStatus('Сохранение...');
-    let envObj: Record<string, string> = {};
+    let envObj: Record<string, string>;
     try {
-      envObj = JSON.parse(cfgEnvJson || '{}');
-    } catch {
-      envObj = {};
+      const parsed: unknown = JSON.parse(cfgEnvJson || '{}');
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('ENV должен быть JSON-объектом');
+      envObj = parsed as Record<string, string>;
+    } catch (error: any) {
+      setTgSaveStatus(error?.message || 'Ошибка JSON в ENV. Исправьте формат: текущие переменные не изменены.');
+      return;
     }
 
     if (tgBotToken.trim()) envObj.BOT_TOKEN = tgBotToken.trim();
@@ -856,15 +1282,20 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     }
 
     const updatedEnvStr = JSON.stringify(envObj, null, 2);
-    setCfgEnvJson(updatedEnvStr);
-    await onUpdateProject(activeProj.id, { env_json: updatedEnvStr });
-    setTgSaveStatus('Настройки Telegram и прокси сохранены в переменные окружения проекта');
+    try {
+      await onUpdateProject(activeProj.id, { env_json: updatedEnvStr });
+      setCfgEnvJson(updatedEnvStr);
+      setTgSaveStatus('Настройки Telegram и прокси сохранены в переменные окружения проекта');
+    } catch (error: any) {
+      setTgSaveStatus(error?.message || 'Не удалось сохранить настройки Telegram и прокси');
+    }
   };
 
   // Терминал и быстрые команды в рабочей папке проекта
   const runProjectCommand = async (cmd: string) => {
-    if (!activeProj || !cmd.trim()) return;
+    if (!activeProj || !cmd.trim() || cliRunning) return;
     setCliCommand(cmd);
+    setCliRunId(null);
     setCliRunning(true);
     setCliOutput(`$ ${cmd}\nЗапуск в ${activeProj.workdir}...\n`);
     try {
@@ -875,24 +1306,18 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
       const data = await res.json();
       if (res.ok && data.run) {
         const rId = data.run.id;
+        setCliRunId(rId);
         setSelectedRunId(rId);
-        setCliOutput(
-          `$ ${cmd}\nЗапущен процесс Run #${rId} (PID ${data.run.pid || '—'}). Ожидание вывода...\n`
-        );
-        await new Promise((r) => setTimeout(r, 900));
-        const logRes = await apiFetch(`/api/runs/${rId}/log`);
-        if (logRes.ok) {
-          const logData = await logRes.json();
-          setCliOutput(`$ ${cmd}\n[Run #${rId} · ${logData.status}]\n\n${logData.log || 'Выполнено.'}`);
-          setLogText(logData.log || '');
-        }
-        loadProjectRuns(activeProj.id);
-        loadProjectFiles(activeProj.id, activeFilePath);
+        setCliOutput(`$ ${cmd}\nRun #${rId} · PID ${data.run.pid || '—'}\nПоток вывода подключается...\n`);
+        void loadProjectRuns(activeProj.id);
+        void loadProjectFiles(activeProj.id);
         onRefreshAll();
       } else {
+        setCliRunId(null);
         setCliOutput(`$ ${cmd}\n[Ошибка]: ${data.detail || 'Не удалось выполнить команду'}`);
       }
     } catch (e: any) {
+      setCliRunId(null);
       setCliOutput(`$ ${cmd}\n[Ошибка]: ${e?.message || 'Сбой сети'}`);
     } finally {
       setCliRunning(false);
@@ -920,15 +1345,14 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
       setCfgScheduleType('cron');
       setCfgScheduleExpr(`0 */${Math.max(1, hourVal)} * * *`);
     } else if (mode === 'daily') {
-      const [hh, mm] = (dailyVal || '09:00').split(':');
-      setCfgScheduleType('cron');
-      setCfgScheduleExpr(`${Number(mm || 0)} ${Number(hh || 9)} * * *`);
+      setCfgScheduleType('daily');
+      setCfgScheduleExpr((dailyVal || '09:00').trim());
     } else if (mode === 'interval') {
       setCfgScheduleType('interval');
       setCfgScheduleExpr(String(Math.max(5, intVal)));
     } else {
       setCfgScheduleType('cron');
-      if (!cfgScheduleExpr.trim()) {
+      if (!cfgScheduleExpr.trim() || /^\d{1,2}:\d{2}$/.test(cfgScheduleExpr.trim())) {
         setCfgScheduleExpr('*/15 * * * *');
       }
     }
@@ -939,10 +1363,17 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     if (!activeProj) return;
     setCfgStatus('Сохранение конфигурации...');
     try {
+      const parsedEnv: unknown = JSON.parse(cfgEnvJson || '{}');
+      if (!parsedEnv || typeof parsedEnv !== 'object' || Array.isArray(parsedEnv)) {
+        throw new Error('ENV должен быть корректным JSON-объектом. Конфигурация не сохранена.');
+      }
       const parsedPort = cfgPort.trim() ? Number(cfgPort.trim()) : 0;
       const finalSchedType = cfgType === 'job' ? (cfgScheduleType === 'manual' ? 'cron' : cfgScheduleType) : 'manual';
       const finalSchedExpr =
-        cfgType === 'job' ? (cfgScheduleExpr.trim() || '*/15 * * * *') : '';
+        cfgType === 'job' ? (cfgScheduleExpr.trim() || (finalSchedType === 'daily' ? '09:00' : '*/15 * * * *')) : '';
+      const cleanParams = cfgParamsSchema
+        .filter((p) => p.name.trim())
+        .map((p) => ({ name: p.name.trim(), label: p.label.trim(), default: p.default }));
 
       await onUpdateProject(activeProj.id, {
         name: cfgName,
@@ -961,6 +1392,8 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
         timeout_sec: Number(cfgTimeout),
         env_json: cfgEnvJson,
         secrets_json: JSON.stringify(cfgSelectedSecrets),
+        webhook_hmac_secret: cfgWebhookHmacSecret.trim(),
+        params_schema: cleanParams,
       });
       setCfgStatus('Конфигурация проекта успешно сохранена');
       setTimeout(() => setCfgStatus(''), 3000);
@@ -1036,6 +1469,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   }
 
   const webhookUrl = `${window.location.origin}/api/webhook/${activeProj.webhook_token}`;
+  const pingUrl = `${window.location.origin}/api/ping/${activeProj.ping_token || '<ping_token>'}`;
   const isConfigTab = subTab === 'simple_cfg' || subTab === 'advanced_cfg';
 
   const getProjectTypeMeta = (p: ProjectItem) => {
@@ -1055,6 +1489,8 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
       label: p.schedule_expr
         ? p.schedule_type === 'interval'
           ? `Каждые ${p.schedule_expr}с`
+          : p.schedule_type === 'daily'
+          ? `Ежедневно ${p.schedule_expr}`
           : `Cron (${p.schedule_expr})`
         : 'Job / Скрипт',
       color: 'text-amber-300',
@@ -1133,7 +1569,10 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
             return (
               <div
                 key={p.id}
-                onClick={() => onSelectProject(p)}
+                onClick={() => {
+                  if (p.id !== activeProj.id && isFileDirty && !window.confirm('В редакторе есть несохранённые изменения. Переключить проект и потерять их?')) return;
+                  onSelectProject(p);
+                }}
                 className={`group rounded-lg p-2.5 border transition-all cursor-pointer ${
                   isSelected
                     ? 'bg-indigo-950/35 border-indigo-500/60 shadow-sm'
@@ -1291,21 +1730,9 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
 
               <button
                 type="button"
-                onClick={async () => {
-                  const res = await apiFetch(`/api/projects/${activeProj.id}/export`);
-                  if (res.ok) {
-                    const blob = await res.blob();
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = `${activeProj.name}_project.zip`;
-                    document.body.appendChild(a);
-                    a.click();
-                    a.remove();
-                    URL.revokeObjectURL(url);
-                  }
-                }}
-                className="px-2.5 py-2 text-xs font-medium text-slate-300 hover:text-white bg-[#0b0f17] hover:bg-slate-800 border border-[#1e2638] rounded-lg inline-flex items-center gap-1 cursor-pointer"
+                onClick={handleExportProject}
+                disabled={exportingProject}
+                className="px-2.5 py-2 text-xs font-medium text-slate-300 hover:text-white bg-[#0b0f17] hover:bg-slate-800 border border-[#1e2638] rounded-lg inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
                 title="Экспортировать проект в .zip с project.yaml (без значений секретов)"
               >
                 <FileText className="w-3.5 h-3.5 text-emerald-400" />
@@ -1314,7 +1741,10 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
 
               <button
                 type="button"
-                onClick={() => onDeleteProject(activeProj.id)}
+                onClick={() => {
+                  setDeleteFilesCheckbox(false);
+                  setDeleteConfirmOpen(true);
+                }}
                 className="p-2 text-xs text-rose-400 hover:text-rose-200 bg-rose-950/30 hover:bg-rose-900/50 border border-rose-900/50 rounded-lg inline-flex items-center cursor-pointer"
                 title="Удалить проект"
               >
@@ -1322,6 +1752,55 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
               </button>
             </div>
           </div>
+
+          {deleteConfirmOpen && (
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label={`Удаление проекта ${activeProj.name}`}
+              className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-xs flex items-center justify-center p-4"
+            >
+              <div className="bg-[#111622] border border-rose-500/50 rounded-xl max-w-md w-full p-5 space-y-4 shadow-2xl">
+                <div className="flex items-center gap-2.5 text-rose-300">
+                  <AlertTriangle className="w-5 h-5 shrink-0" />
+                  <h3 className="text-sm font-bold text-white">Удалить проект «{activeProj.name}»?</h3>
+                </div>
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  Запущенные процессы будут остановлены по PGID, а запись о проекте и история запусков будут удалены из базы данных Beacon.
+                </p>
+                <label className="flex items-start gap-2.5 p-3 bg-[#0b0f17] border border-slate-800 rounded-lg text-xs text-rose-200 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={deleteFilesCheckbox}
+                    onChange={(e) => setDeleteFilesCheckbox(e.target.checked)}
+                    className="mt-0.5"
+                  />
+                  <span>
+                    Также удалить рабочую папку с диска (<code className="font-mono text-rose-300">{activeProj.workdir}</code>)
+                  </span>
+                </label>
+                <div className="flex items-center justify-end gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setDeleteConfirmOpen(false)}
+                    className="px-3.5 py-1.5 text-xs font-medium text-slate-300 hover:text-white bg-slate-800 rounded-lg cursor-pointer"
+                  >
+                    Отмена
+                  </button>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setDeleteConfirmOpen(false);
+                      await onDeleteProject(activeProj.id, deleteFilesCheckbox);
+                    }}
+                    className="px-3.5 py-1.5 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-500 rounded-lg cursor-pointer"
+                  >
+                    Подтвердить удаление
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Навигация по 4 рабочим вкладкам проекта */}
           <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-[#1e2638]">
@@ -1386,131 +1865,156 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
         {subTab === 'editor' && (
           <div className="bg-[#111622] border border-[#1e2638] rounded-xl overflow-hidden">
             <div className="grid grid-cols-1 lg:grid-cols-12 min-h-[430px]">
-              {/* Левая боковая панель проводника файлов */}
-              <div className="lg:col-span-4 xl:col-span-3 border-b lg:border-b-0 lg:border-r border-[#1e2638] bg-[#0b0f17]/60 p-3 flex flex-col justify-between gap-3">
-                <div className="space-y-2.5">
-                  <div className="flex items-center justify-between gap-1">
-                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
-                      Файлы рабочей папки
-                    </span>
-                    <div className="flex items-center gap-1">
-                      <button
-                        type="button"
-                        onClick={() => setFileActionMode(fileActionMode === 'new_file' ? 'none' : 'new_file')}
-                        className="p-1.5 text-slate-300 hover:text-white bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded cursor-pointer"
-                        title="Новый файл"
-                      >
-                        <FilePlus className="w-3.5 h-3.5 text-indigo-400" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setFileActionMode(fileActionMode === 'new_folder' ? 'none' : 'new_folder')}
-                        className="p-1.5 text-slate-300 hover:text-white bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded cursor-pointer"
-                        title="Новая папка"
-                      >
-                        <FolderPlus className="w-3.5 h-3.5 text-amber-400" />
-                      </button>
-                      <input
-                        ref={zipInputRef}
-                        type="file"
-                        accept=".zip,.py,.js,.json,.txt,.sh"
-                        onChange={handleUploadZip}
-                        className="hidden"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => zipInputRef.current?.click()}
-                        className="p-1.5 text-slate-300 hover:text-white bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded cursor-pointer"
-                        title="Загрузить файл или распаковать .zip архив в проект"
-                      >
-                        <Upload className="w-3.5 h-3.5 text-emerald-400" />
-                      </button>
-                    </div>
+              {/* Левая боковая панель: полноценное дерево файлов */}
+              <div className="lg:col-span-4 xl:col-span-3 border-b lg:border-b-0 lg:border-r border-[#1e2638] bg-[#0b0f17]/70 p-3 flex flex-col gap-3 min-h-[560px]">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-[11px] font-bold uppercase tracking-wider text-slate-300">Проводник</div>
+                    <div className="text-[10px] text-slate-500">{files.filter((f) => !f.is_dir).length} файлов · {files.filter((f) => f.is_dir).length} папок</div>
                   </div>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => setFileActionMode(fileActionMode === 'new_file' ? 'none' : 'new_file')}
+                      className="p-1.5 text-slate-300 hover:text-white bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded-md cursor-pointer"
+                      title={`Новый файл в ${activeFolderPath || 'корне проекта'}`}
+                    >
+                      <FilePlus className="h-4 w-4 text-indigo-300" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFileActionMode(fileActionMode === 'new_folder' ? 'none' : 'new_folder')}
+                      className="p-1.5 text-slate-300 hover:text-white bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded-md cursor-pointer"
+                      title="Новая папка внутри выбранной папки"
+                    >
+                      <FolderPlus className="h-4 w-4 text-amber-300" />
+                    </button>
+                    <input
+                      ref={zipInputRef}
+                      type="file"
+                      onChange={handleUploadZip}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => zipInputRef.current?.click()}
+                      className="p-1.5 text-slate-300 hover:text-white bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded-md cursor-pointer"
+                      title="Загрузить файл или ZIP-архив"
+                    >
+                      <Upload className="h-4 w-4 text-emerald-300" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleExportProject}
+                      disabled={exportingProject}
+                      className="p-1.5 text-slate-300 hover:text-white bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded-md cursor-pointer disabled:opacity-50"
+                      title="Скачать весь проект в ZIP"
+                    >
+                      <Download className="h-4 w-4 text-cyan-300" />
+                      <span className="text-[10px] font-semibold">ZIP</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => loadProjectFiles(activeProj.id)}
+                      className="p-1.5 text-slate-300 hover:text-white bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded-md cursor-pointer"
+                      title="Обновить дерево файлов"
+                    >
+                      <RefreshCw className="h-4 w-4" />
+                    </button>
+                  </div>
+                </div>
 
-                  {fileActionMode === 'new_file' && (
-                    <form onSubmit={handleCreateNewFile} className="flex items-center gap-1.5">
+                <div className="flex min-w-0 items-center gap-1 overflow-x-auto rounded-md border border-[#1e2638] bg-[#111622] px-2 py-1.5 text-[10px] font-mono">
+                  <button
+                    type="button"
+                    onClick={() => setActiveFolderPath('')}
+                    className={`shrink-0 hover:text-white ${activeFolderPath ? 'text-slate-400' : 'text-indigo-300'}`}
+                    title="Корень проекта"
+                  >
+                    {activeProj.name}
+                  </button>
+                  {activeFolderPath.split('/').filter(Boolean).map((part, index, parts) => {
+                    const path = parts.slice(0, index + 1).join('/');
+                    return (
+                      <React.Fragment key={path}>
+                        <ChevronRight className="h-3 w-3 shrink-0 text-slate-600" />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setActiveFolderPath(path);
+                            setExpandedFolders((previous) => new Set([...previous, ...parts.slice(0, index + 1).map((_, parentIndex) => parts.slice(0, parentIndex + 1).join('/'))]));
+                          }}
+                          className={`max-w-[120px] shrink-0 truncate hover:text-white ${index === parts.length - 1 ? 'text-indigo-300' : 'text-slate-400'}`}
+                          title={path}
+                        >
+                          {part}
+                        </button>
+                      </React.Fragment>
+                    );
+                  })}
+                </div>
+
+                {fileActionMode === 'new_file' && (
+                  <form onSubmit={handleCreateNewFile} className="space-y-1.5 rounded-lg border border-indigo-500/30 bg-indigo-950/20 p-2">
+                    <div className="text-[10px] text-indigo-200">Создание файла в: {activeFolderPath || 'корне проекта'}</div>
+                    <div className="flex items-center gap-1.5">
                       <input
                         type="text"
                         value={newFileName}
                         onChange={(e) => setNewFileName(e.target.value)}
                         placeholder="script.py или utils/db.py"
                         autoFocus
-                        className="flex-1 bg-[#0b0f17] border border-indigo-500/70 rounded px-2 py-1 text-xs font-mono text-white outline-none"
+                        className="min-w-0 flex-1 bg-[#0b0f17] border border-indigo-500/50 rounded px-2 py-1.5 text-xs font-mono text-white outline-none focus:border-indigo-400"
                       />
-                      <button
-                        type="submit"
-                        className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-semibold cursor-pointer"
-                      >
-                        ОК
-                      </button>
-                    </form>
-                  )}
+                      <button type="submit" className="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-semibold cursor-pointer">Создать</button>
+                    </div>
+                  </form>
+                )}
 
-                  {fileActionMode === 'new_folder' && (
-                    <form onSubmit={handleCreateNewFolder} className="flex items-center gap-1.5">
+                {fileActionMode === 'new_folder' && (
+                  <form onSubmit={handleCreateNewFolder} className="space-y-1.5 rounded-lg border border-amber-500/30 bg-amber-950/10 p-2">
+                    <div className="text-[10px] text-amber-200">Создание папки в: {activeFolderPath || 'корне проекта'}</div>
+                    <div className="flex items-center gap-1.5">
                       <input
                         type="text"
                         value={newFolderName}
                         onChange={(e) => setNewFolderName(e.target.value)}
-                        placeholder="Имя папки (modules)"
+                        placeholder="modules или modules/utils"
                         autoFocus
-                        className="flex-1 bg-[#0b0f17] border border-amber-500/70 rounded px-2 py-1 text-xs font-mono text-white outline-none"
+                        className="min-w-0 flex-1 bg-[#0b0f17] border border-amber-500/50 rounded px-2 py-1.5 text-xs font-mono text-white outline-none focus:border-amber-400"
                       />
-                      <button
-                        type="submit"
-                        className="px-2.5 py-1 bg-amber-600 hover:bg-amber-500 text-white rounded text-xs font-semibold cursor-pointer"
-                      >
-                        ОК
-                      </button>
-                    </form>
-                  )}
+                      <button type="submit" className="px-2.5 py-1.5 bg-amber-600 hover:bg-amber-500 text-white rounded text-xs font-semibold cursor-pointer">Создать</button>
+                    </div>
+                  </form>
+                )}
 
-                  {zipUploadStatus && (
-                    <div className="text-[11px] font-mono text-emerald-300 bg-emerald-950/30 border border-emerald-800/50 rounded px-2 py-1">
-                      {zipUploadStatus}
+                {zipUploadStatus && (
+                  <div className="text-[10px] font-mono text-slate-300 bg-[#111622] border border-[#1e2638] rounded-md px-2.5 py-2 break-words">
+                    {zipUploadStatus}
+                  </div>
+                )}
+
+                <div className="flex-1 min-h-[220px] max-h-[520px] overflow-y-auto rounded-lg border border-[#1e2638] bg-[#080c14] p-1.5">
+                  {fileTree.length ? (
+                    <ProjectFileTree
+                      nodes={fileTree}
+                      selectedFilePath={activeFilePath}
+                      selectedFolderPath={activeFolderPath}
+                      expandedFolders={expandedFolders}
+                      onToggleFolder={handleToggleFolder}
+                      onSelectFile={(path) => loadSingleFile(activeProj.id, path)}
+                    />
+                  ) : (
+                    <div className="flex h-full min-h-[200px] flex-col items-center justify-center gap-2 px-4 text-center">
+                      <FolderCode className="h-8 w-8 text-slate-600" />
+                      <div className="text-xs text-slate-400">Папка проекта пуста</div>
+                      <div className="text-[10px] text-slate-600">Создайте файл, папку или загрузите ZIP-архив</div>
                     </div>
                   )}
-
-                  <div className="space-y-1 max-h-[340px] overflow-y-auto pr-0.5">
-                    {files.map((f) => {
-                      if (f.is_dir) {
-                        return (
-                          <div
-                            key={f.path}
-                            className="flex items-center justify-between px-2 py-1 text-xs font-mono text-amber-300/90"
-                          >
-                            <span>📁 {f.path}/</span>
-                          </div>
-                        );
-                      }
-                      const active = f.path === activeFilePath;
-                      return (
-                        <div
-                          key={f.path}
-                          onClick={() => loadSingleFile(activeProj.id, f.path)}
-                          className={`group flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg text-xs font-mono transition-colors cursor-pointer ${
-                            active
-                              ? 'bg-indigo-600 text-white font-semibold'
-                              : 'text-slate-300 hover:bg-[#111622] hover:text-white'
-                          }`}
-                        >
-                          <span className="truncate">{f.path}</span>
-                          <span
-                            className={`text-[10px] shrink-0 ${
-                              active ? 'text-indigo-100' : 'text-slate-400'
-                            }`}
-                          >
-                            {formatBytes(f.size || 0)}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
                 </div>
 
-                <div className="pt-2 border-t border-[#1e2638] text-[11px] font-mono text-slate-400 truncate" title={activeProj.workdir}>
-                  Путь: {activeProj.workdir}
+                <div className="border-t border-[#1e2638] pt-2 text-[10px] font-mono text-slate-500" title={activeProj.workdir}>
+                  <div className="truncate">{activeProj.workdir}</div>
                 </div>
               </div>
 
@@ -1518,48 +2022,44 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
               <div className="lg:col-span-8 xl:col-span-9 flex flex-col justify-between bg-[#070b14]">
                 <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 bg-[#111622] border-b border-[#1e2638]">
                   <div className="flex items-center gap-2 min-w-0">
-                    <span className="text-xs font-mono font-bold text-indigo-300 truncate">
+                    <span className="text-xs font-mono font-bold text-indigo-300 truncate" title={activeFilePath}>
                       {activeFilePath || 'Файл не выбран'}
                     </span>
+                    {activeFilePath && (
+                      <span className="shrink-0 rounded border border-[#293449] bg-[#0b0f17] px-1.5 py-0.5 text-[9px] font-semibold tracking-wide text-slate-400">
+                        {fileLanguageLabel(activeFilePath)}
+                      </span>
+                    )}
+                    {isFileDirty && <span className="shrink-0 text-[10px] font-semibold text-amber-300">● Не сохранено</span>}
                     {fileStatus && (
-                      <span className="text-[11px] font-mono text-emerald-400">{fileStatus}</span>
+                      <span className={`text-[11px] font-mono ${fileStatus.toLowerCase().includes('ошибка') || fileStatus.toLowerCase().includes('не удалось') ? 'text-rose-300' : fileStatus.toLowerCase().includes('загрузка') || fileStatus.toLowerCase().includes('сохранение') ? 'text-amber-300' : 'text-emerald-400'}`}>{fileStatus}</span>
                     )}
                   </div>
 
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setShowSdkCheatsheet((v) => !v)}
-                      className="px-2.5 py-1 text-[11px] font-mono text-slate-300 hover:text-white bg-[#0b0f17] border border-[#1e2638] rounded-lg inline-flex items-center gap-1 cursor-pointer"
-                    >
-                      <span>Шпаргалка SDK</span>
-                      {showSdkCheatsheet ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                  <div className="flex flex-wrap items-center justify-end gap-1.5">
+                    <div className="flex items-center rounded-lg border border-[#1e2638] bg-[#0b0f17] p-0.5">
+                      <button type="button" onClick={() => setEditorFontSize((size) => Math.max(10, size - 1))} disabled={editorFontSize <= 10} className="h-7 w-7 rounded text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-30" title="Уменьшить шрифт">A−</button>
+                      <span className="min-w-8 text-center text-[10px] font-mono text-slate-500">{editorFontSize}</span>
+                      <button type="button" onClick={() => setEditorFontSize((size) => Math.min(20, size + 1))} disabled={editorFontSize >= 20} className="h-7 w-7 rounded text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-30" title="Увеличить шрифт">A+</button>
+                    </div>
+                    <button type="button" onClick={() => setEditorWrap((value) => !value)} className={`px-2 py-1.5 text-[10px] rounded-md border cursor-pointer ${editorWrap ? 'border-indigo-500/60 bg-indigo-950/40 text-indigo-200' : 'border-[#1e2638] bg-[#0b0f17] text-slate-400 hover:text-white'}`} title="Переключить перенос строк">Перенос {editorWrap ? 'вкл.' : 'выкл.'}</button>
+                    <button type="button" onClick={handleDownloadActiveFile} disabled={!activeFilePath} className="px-2 py-1.5 text-[10px] rounded-md border border-[#1e2638] bg-[#0b0f17] text-slate-300 hover:text-white disabled:opacity-40 cursor-pointer inline-flex items-center gap-1" title="Скачать текущий файл"><Download className="h-3.5 w-3.5" />Скачать</button>
+                    <button type="button" onClick={() => { if (isFileDirty && !window.confirm('Перечитать файл с сервера и потерять несохранённые изменения?')) return; void loadSingleFile(activeProj.id, activeFilePath, true); }} disabled={!activeFilePath} className="p-1.5 rounded-md border border-[#1e2638] bg-[#0b0f17] text-slate-400 hover:text-white disabled:opacity-40 cursor-pointer" title="Перечитать файл с сервера"><RefreshCw className="h-3.5 w-3.5" /></button>
+                    <button type="button" onClick={() => setShowSdkCheatsheet((v) => !v)} className="px-2 py-1.5 text-[10px] rounded-md border border-[#1e2638] bg-[#0b0f17] text-slate-300 hover:text-white cursor-pointer inline-flex items-center gap-1">
+                      <span>SDK</span>{showSdkCheatsheet ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
                     </button>
-
-                    {activeFilePath && files.filter((x) => !x.is_dir).length > 1 && (
-                      <button
-                        type="button"
-                        onClick={() => handleDeleteFile(activeFilePath)}
-                        className="px-2.5 py-1 text-[11px] font-medium text-rose-300 hover:text-white bg-rose-950/40 hover:bg-rose-900/60 border border-rose-800/50 rounded-lg inline-flex items-center gap-1 cursor-pointer"
-                      >
-                        <Trash2 className="w-3 h-3" />
-                        Удалить файл
+                    {activeFilePath && (
+                      <button type="button" onClick={() => handleDeleteFile(activeFilePath)} className="px-2 py-1.5 text-[10px] rounded-md border border-rose-800/50 bg-rose-950/30 text-rose-300 hover:text-white cursor-pointer inline-flex items-center gap-1">
+                        <Trash2 className="w-3 h-3" />Удалить
                       </button>
                     )}
-
-                    <button
-                      type="button"
-                      onClick={() => handleSaveFile()}
-                      disabled={!activeFilePath}
-                      className="px-3.5 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
-                    >
-                      <Save className="w-3.5 h-3.5" />
-                      Сохранить (Ctrl+S)
+                    <button type="button" onClick={() => handleSaveFile()} disabled={!activeFilePath || !isFileDirty} className="px-3 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 rounded-lg inline-flex items-center gap-1.5 cursor-pointer">
+                      <Save className="w-3.5 h-3.5" />Сохранить
                     </button>
                   </div>
                 </div>
 
-                {/* Выдвижная панель быстрых сниппетов Hub SDK */}
+                {/* Выдвижная панель быстрых сниппетов Beacon SDK */}
                 {showSdkCheatsheet && (
                   <div className="px-4 py-2.5 bg-[#0b0f17] border-b border-[#1e2638] flex flex-wrap items-center gap-2">
                     <span className="text-[11px] text-slate-400 mr-1">Вставить в код:</span>
@@ -1567,62 +2067,98 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                       type="button"
                       onClick={() =>
                         insertSdkSnippet(
-                          'from hub_sdk import hub\n# Чтение и запись постоянного состояния (переживает рестарты):\ncount = int(hub.state.get("processed_count", 0))\nhub.state.set("processed_count", count + 1)'
+                          'import beacon\n# Чтение и запись постоянного состояния (переживает рестарты):\ncount = int(beacon.state.get("processed_count", 0))\nbeacon.state.set("processed_count", count + 1)'
                         )
                       }
                       className="px-2 py-1 text-[11px] font-mono bg-[#111622] hover:bg-slate-800 text-indigo-300 border border-[#1e2638] rounded cursor-pointer"
                     >
-                      + hub.state.get/set
+                      + beacon.state.get/set
                     </button>
                     <button
                       type="button"
                       onClick={() =>
                         insertSdkSnippet(
-                          'from hub_sdk import hub\n# Запрос 2FA/капчи в веб-панель и Telegram:\ncode = hub.ask("Введите код подтверждения из SMS:")\nprint("Получен код:", code, flush=True)'
+                          'import beacon\n# Запрос 2FA/капчи в веб-панель и Telegram:\ncode = beacon.ask("Введите код подтверждения из SMS:")\nprint("Получен код:", code, flush=True)'
                         )
                       }
                       className="px-2 py-1 text-[11px] font-mono bg-[#111622] hover:bg-slate-800 text-amber-300 border border-[#1e2638] rounded cursor-pointer"
                     >
-                      + hub.ask("2FA код")
+                      + beacon.ask("2FA код")
                     </button>
                     <button
                       type="button"
                       onClick={() =>
                         insertSdkSnippet(
-                          `from hub_sdk import hub\nimport json\n# Чтение кук из защищённого хранилища:\nraw_cookies = hub.secret("${cookieSecretName || activeProj.name + '_cookies'}")\ncookies = json.loads(raw_cookies) if raw_cookies else []`
+                          `import beacon, json\n# Чтение кук из защищённого хранилища:\nraw_cookies = beacon.secret("${cookieSecretName || activeProj.name + '_cookies'}")\ncookies = json.loads(raw_cookies) if isinstance(raw_cookies, str) and raw_cookies else (raw_cookies or [])`
                         )
                       }
                       className="px-2 py-1 text-[11px] font-mono bg-[#111622] hover:bg-slate-800 text-emerald-300 border border-[#1e2638] rounded cursor-pointer"
                     >
-                      + hub.secret("cookies")
+                      + beacon.secret("cookies")
                     </button>
                     <button
                       type="button"
                       onClick={() =>
                         insertSdkSnippet(
-                          `from hub_sdk import hub\n# Сигнал об истечении кук (вызовет тревогу в панели):\nhub.cookies_expired("${cookieSecretName || activeProj.name + '_cookies'}", "Требуется свежий экспорт Cookie-Editor")`
+                          `import beacon\n# Сигнал об истечении кук (вызовет тревогу в панели):\nbeacon.cookies_expired("${cookieSecretName || activeProj.name + '_cookies'}", "Требуется свежий экспорт Cookie-Editor")`
                         )
                       }
                       className="px-2 py-1 text-[11px] font-mono bg-[#111622] hover:bg-slate-800 text-rose-300 border border-[#1e2638] rounded cursor-pointer"
                     >
-                      + hub.cookies_expired()
+                      + beacon.cookies_expired()
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        insertSdkSnippet(
+                          'import beacon\n# Сигнал Dead Man\'s Switch (использует BEACON_PING_TOKEN):\nbeacon.ping()'
+                        )
+                      }
+                      className="px-2 py-1 text-[11px] font-mono bg-[#111622] hover:bg-slate-800 text-cyan-300 border border-[#1e2638] rounded cursor-pointer"
+                    >
+                      + beacon.ping()
                     </button>
                   </div>
                 )}
 
-                <textarea
-                  value={fileContent}
-                  onChange={(e) => setFileContent(e.target.value)}
-                  onKeyDown={(e) => {
-                    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-                      e.preventDefault();
-                      handleSaveFile();
-                    }
-                  }}
-                  spellCheck={false}
-                  placeholder="Выберите файл слева для редактирования..."
-                  className="w-full flex-1 min-h-[370px] bg-[#070b14] p-4 text-xs font-mono text-slate-100 leading-relaxed focus:outline-none resize-y"
-                />
+                <div className="flex min-h-[460px] flex-1 overflow-hidden bg-[#070b14]">
+                  <div className="w-12 shrink-0 overflow-hidden border-r border-[#1b2433] bg-[#0a0f19] text-right text-slate-600 select-none" aria-hidden="true">
+                    <div className="px-2 pt-3 font-mono leading-7" style={{ fontSize: `${editorFontSize}px`, transform: `translateY(-${editorScrollTop}px)` }}>
+                      {Array.from({ length: Math.max(1, fileContent.split('\n').length) }, (_, index) => (
+                        <div key={index + 1} className={`h-7 ${editorCursor.line === index + 1 ? 'text-indigo-300' : ''}`}>{index + 1}</div>
+                      ))}
+                    </div>
+                  </div>
+                  <textarea
+                    ref={editorRef}
+                    value={fileContent}
+                    onChange={(e) => setFileContent(e.target.value)}
+                    onKeyDown={handleEditorKeyDown}
+                    onScroll={(e) => setEditorScrollTop(e.currentTarget.scrollTop)}
+                    onClick={(e) => updateEditorCursor(e.currentTarget)}
+                    onKeyUp={(e) => updateEditorCursor(e.currentTarget)}
+                    onSelect={(e) => updateEditorCursor(e.currentTarget)}
+                    spellCheck={false}
+                    autoCapitalize="off"
+                    autoCorrect="off"
+                    disabled={!activeFilePath}
+                    placeholder="Выберите файл в проводнике слева или создайте новый..."
+                    wrap={editorWrap ? 'soft' : 'off'}
+                    style={{ fontSize: `${editorFontSize}px` }}
+                    className={`min-w-0 flex-1 min-h-[460px] bg-transparent px-4 py-3 font-mono leading-7 text-slate-100 caret-indigo-400 focus:outline-none resize-none disabled:cursor-default disabled:opacity-50 ${editorWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre overflow-x-auto'}`}
+                  />
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[#1b2433] bg-[#0b0f17] px-3 py-1.5 text-[10px] font-mono text-slate-500">
+                  <div className="flex items-center gap-3">
+                    <span>{activeFilePath ? fileLanguageLabel(activeFilePath) : 'Нет файла'}</span>
+                    <span>{fileContent.split('\n').length} строк</span>
+                    <span>{fileContent.length.toLocaleString('ru-RU')} символов</span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span>Строка {editorCursor.line}, столбец {editorCursor.column}</span>
+                    <span>{isFileDirty ? 'Изменения не сохранены' : 'Синхронизировано'}</span>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -1677,7 +2213,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
             </div>
 
             {cfgStatus && (
-              <div className="px-3.5 py-2 rounded-lg bg-emerald-950/40 border border-emerald-800/60 text-xs font-mono text-emerald-300">
+              <div className={`px-3.5 py-2 rounded-lg border text-xs font-mono ${cfgStatus.toLowerCase().includes('ошибка') || cfgStatus.toLowerCase().includes('не сохранена') ? 'bg-rose-950/30 border-rose-800/60 text-rose-300' : 'bg-emerald-950/40 border-emerald-800/60 text-emerald-300'}`}>
                 {cfgStatus}
               </div>
             )}
@@ -1998,7 +2534,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                 </div>
               </div>
             ) : (
-              /* Вкладка ENV, Секреты и Webhook */
+              /* Вкладка ENV, Секреты, Webhook и Параметры */
               <div className="space-y-4">
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                   <div>
@@ -2016,7 +2552,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
 
                   <div>
                     <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-                      Привязанные секреты из Сейфа (доступны через hub.secret)
+                      Привязанные секреты из Сейфа (доступны через beacon.secret)
                     </label>
                     <div className="bg-[#0b0f17] border border-[#1e2638] rounded-lg p-3 max-h-[172px] overflow-y-auto space-y-1.5">
                       {secrets.map((s) => {
@@ -2048,21 +2584,134 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                   </div>
                 </div>
 
-                <div className="bg-[#0b0f17] border border-[#1e2638] rounded-lg p-3.5 flex flex-wrap items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="text-xs font-semibold text-slate-300">
-                      Внешний Webhook URL для удалённого запуска проекта (POST)
+                {/* Webhook URL, HMAC-секрет и Dead Man's Switch ping_token */}
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  <div className="bg-[#0b0f17] border border-[#1e2638] rounded-lg p-3.5 space-y-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="text-xs font-semibold text-slate-300">
+                          Внешний Webhook URL (POST)
+                        </div>
+                        <div className="text-xs font-mono text-indigo-300 truncate mt-0.5">{webhookUrl}</div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => navigator.clipboard?.writeText(webhookUrl)}
+                        className="px-2.5 py-1.5 text-xs font-mono text-slate-200 bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded-lg inline-flex items-center gap-1 cursor-pointer shrink-0"
+                      >
+                        <Copy className="w-3.5 h-3.5" />
+                        URL
+                      </button>
                     </div>
-                    <div className="text-xs font-mono text-indigo-300 truncate mt-0.5">{webhookUrl}</div>
+                    <div>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Секрет подписи <code className="font-mono text-indigo-300">X-Beacon-Signature</code> (HMAC-SHA256)
+                      </label>
+                      <input
+                        type="password"
+                        value={cfgWebhookHmacSecret}
+                        onChange={(e) => setCfgWebhookHmacSecret(e.target.value)}
+                        placeholder="Оставьте пустым для обычного токена URL"
+                        className="w-full bg-[#111622] border border-[#1e2638] rounded-lg px-2.5 py-1.5 text-xs font-mono text-white"
+                      />
+                    </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => navigator.clipboard?.writeText(webhookUrl)}
-                    className="px-3 py-1.5 text-xs font-mono text-slate-200 bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <Copy className="w-3.5 h-3.5" />
-                    Копировать URL
-                  </button>
+
+                  <div className="bg-[#0b0f17] border border-[#1e2638] rounded-lg p-3.5 flex flex-col justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-300">
+                        Dead Man&apos;s Switch URL (<code className="font-mono text-cyan-300">beacon.ping()</code>)
+                      </div>
+                      <div className="text-xs font-mono text-cyan-300 truncate mt-1">{pingUrl}</div>
+                      <p className="text-[11px] text-slate-400 mt-1">
+                        Передаётся в процесс через <code className="font-mono text-slate-300">BEACON_PING_TOKEN</code>.
+                      </p>
+                    </div>
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() => navigator.clipboard?.writeText(pingUrl)}
+                        className="px-3 py-1.5 text-xs font-mono text-slate-200 bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <Copy className="w-3.5 h-3.5" />
+                        Копировать Ping URL
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Редактор разрешённых параметров запуска (params_schema) */}
+                <div className="bg-[#0b0f17] border border-[#1e2638] rounded-lg p-3.5 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-200">
+                        Схема параметров запуска (<code className="font-mono text-indigo-300">params_schema</code>)
+                      </div>
+                      <div className="text-[11px] text-slate-400">
+                        Только объявленные имена разрешены для передачи как <code className="font-mono">PARAM_*</code> при старте
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCfgParamsSchema((prev) => [...prev, { name: '', label: '', default: '' }])
+                      }
+                      className="px-2.5 py-1 text-xs font-semibold text-indigo-200 bg-indigo-950/60 hover:bg-indigo-900/70 border border-indigo-700/50 rounded-lg inline-flex items-center gap-1 cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      Добавить параметр
+                    </button>
+                  </div>
+
+                  {cfgParamsSchema.length > 0 && (
+                    <div className="space-y-2">
+                      {cfgParamsSchema.map((param, idx) => (
+                        <div key={idx} className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-center">
+                          <input
+                            type="text"
+                            value={param.name}
+                            onChange={(e) => {
+                              const next = [...cfgParamsSchema];
+                              next[idx] = { ...next[idx], name: e.target.value };
+                              setCfgParamsSchema(next);
+                            }}
+                            placeholder="имя (напр. LIMIT)"
+                            className="sm:col-span-3 bg-[#111622] border border-[#1e2638] rounded px-2.5 py-1 text-xs font-mono text-white"
+                          />
+                          <input
+                            type="text"
+                            value={param.label}
+                            onChange={(e) => {
+                              const next = [...cfgParamsSchema];
+                              next[idx] = { ...next[idx], label: e.target.value };
+                              setCfgParamsSchema(next);
+                            }}
+                            placeholder="Подпись для UI"
+                            className="sm:col-span-4 bg-[#111622] border border-[#1e2638] rounded px-2.5 py-1 text-xs text-white"
+                          />
+                          <input
+                            type="text"
+                            value={param.default}
+                            onChange={(e) => {
+                              const next = [...cfgParamsSchema];
+                              next[idx] = { ...next[idx], default: e.target.value };
+                              setCfgParamsSchema(next);
+                            }}
+                            placeholder="Значение по умолчанию"
+                            className="sm:col-span-4 bg-[#111622] border border-[#1e2638] rounded px-2.5 py-1 text-xs font-mono text-white"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setCfgParamsSchema((prev) => prev.filter((_, i) => i !== idx))}
+                            className="sm:col-span-1 p-1.5 text-rose-400 hover:text-rose-200 bg-[#111622] border border-[#1e2638] rounded flex items-center justify-center cursor-pointer"
+                            title="Удалить параметр"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -2081,7 +2730,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                     Куки авторизации (Cookie-Editor JSON · 0600)
                   </h3>
                   <p className="text-xs text-slate-400">
-                    Хранятся в защищённом файле и читаются скриптом через <code className="text-indigo-300">hub.secret(&quot;{cookieSecretName}&quot;)</code>
+                    Хранятся в защищённом файле и читаются скриптом через <code className="text-indigo-300">beacon.secret(&quot;{cookieSecretName}&quot;)</code>
                   </p>
                 </div>
                 <input
@@ -2132,7 +2781,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
               />
 
               {cookieSaveStatus && (
-                <div className="text-xs font-mono text-emerald-300 bg-emerald-950/30 border border-emerald-800/50 rounded-lg px-3 py-2">
+                <div className={`text-xs font-mono rounded-lg px-3 py-2 border ${cookieSaveStatus.toLowerCase().includes('ошибка') || cookieSaveStatus.toLowerCase().includes('вставьте') ? 'text-rose-300 bg-rose-950/30 border-rose-800/50' : 'text-emerald-300 bg-emerald-950/30 border-emerald-800/50'}`}>
                   {cookieSaveStatus}
                 </div>
               )}
@@ -2279,7 +2928,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
               </div>
 
               {tgSaveStatus && (
-                <div className="text-xs font-mono text-emerald-300 bg-emerald-950/30 border border-emerald-800/50 rounded-lg px-3 py-2">
+                <div className={`text-xs font-mono rounded-lg px-3 py-2 border ${tgSaveStatus.toLowerCase().includes('ошибка') || tgSaveStatus.toLowerCase().includes('не удалось') || tgSaveStatus.toLowerCase().includes('должен') ? 'text-rose-300 bg-rose-950/30 border-rose-800/50' : 'text-emerald-300 bg-emerald-950/30 border-emerald-800/50'}`}>
                   {tgSaveStatus}
                 </div>
               )}
@@ -2318,8 +2967,9 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                   <button
                     key={btn.label}
                     type="button"
+                    disabled={cliRunning}
                     onClick={() => runProjectCommand(btn.cmd)}
-                    className="px-2.5 py-1 text-[11px] font-mono text-slate-200 bg-[#0b0f17] hover:bg-slate-800 border border-[#1e2638] rounded-lg cursor-pointer"
+                    className="px-2.5 py-1 text-[11px] font-mono text-slate-200 bg-[#0b0f17] hover:bg-slate-800 border border-[#1e2638] rounded-lg cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {btn.label}
                   </button>
@@ -2348,9 +2998,15 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
             </form>
 
             {cliOutput && (
-              <pre className="bg-[#070b14] border border-[#1e2638] rounded-lg p-3.5 text-xs font-mono text-slate-200 max-h-56 overflow-y-auto whitespace-pre-wrap">
-                {cliOutput}
-              </pre>
+              <div className="overflow-hidden rounded-lg border border-[#1e2638] bg-[#070b14]">
+                <div className="flex items-center justify-between gap-2 border-b border-[#1e2638] bg-[#0b0f17] px-3 py-1.5">
+                  <span className="text-[10px] font-mono text-slate-400">Вывод команды {cliRunId ? `· Run #${cliRunId}` : ''}</span>
+                  {cliRunId && cliRunId === selectedRunId && <button type="button" onClick={() => setBottomConsoleTab('logs')} className="text-[10px] text-indigo-300 hover:text-white">Открыть большой лог ↓</button>}
+                </div>
+                <pre className="max-h-64 overflow-auto whitespace-pre-wrap p-3.5 text-xs font-mono text-slate-200">
+                  {cliOutput}{cliRunId && cliRunId === selectedRunId ? (logText || '\nОжидание вывода процесса...') : ''}
+                </pre>
+              </div>
             )}
 
             {/* Таблица истории запусков */}
@@ -2451,7 +3107,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                 }`}
               >
                 <Database className="w-3.5 h-3.5" />
-                Хранилище hub.state ({kvItems.length})
+                Хранилище beacon.state ({kvItems.length})
               </button>
 
               <button
@@ -2562,15 +3218,15 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                   type="submit"
                   className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold cursor-pointer"
                 >
-                  Сохранить в hub.state
+                  Сохранить в beacon.state
                 </button>
                 {kvStatus && <span className="text-xs font-mono text-emerald-400">{kvStatus}</span>}
               </form>
 
               {kvItems.length === 0 ? (
                 <div className="text-xs text-slate-400 py-4 text-center font-mono">
-                  Хранилище hub.state для этого проекта пусто. Используйте в Python:{' '}
-                  <code className="text-indigo-300">hub.state.set(&quot;key&quot;, &quot;value&quot;)</code>
+                  Хранилище beacon.state для этого проекта пусто. Используйте в Python:{' '}
+                  <code className="text-indigo-300">beacon.state.set(&quot;key&quot;, &quot;value&quot;)</code>
                 </div>
               ) : (
                 <div className="max-h-44 overflow-y-auto border border-[#1e2638] rounded-lg">

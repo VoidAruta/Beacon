@@ -178,12 +178,14 @@ export interface ProjectItem {
   health_status?: string;
   has_venv?: boolean;
   has_project_yaml?: boolean;
-  schedule_type: 'manual' | 'cron' | 'interval';
+  schedule_type: 'manual' | 'cron' | 'interval' | 'daily';
   schedule_expr: string;
   timeout_sec: number;
   max_retries: number;
   retry_delay_sec: number;
   webhook_token: string;
+  ping_token?: string;
+  webhook_hmac_secret?: string;
   autostart: number;
   restart_policy: 'no' | 'on-failure' | 'always';
   backoff_min_sec: number;
@@ -227,7 +229,7 @@ export interface ProjectItem {
 export interface UpcomingRun {
   project_id: number;
   project_name: string;
-  schedule_type: 'cron' | 'interval';
+  schedule_type: 'cron' | 'interval' | 'daily';
   schedule_expr: string;
   next_run_at: number;
   in_seconds: number;

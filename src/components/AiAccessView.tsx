@@ -23,14 +23,15 @@ interface AiTokenItem {
   name: string;
   token_prefix: string;
   scopes: string[];
-  allowed_projects: string[];
-  auto_approve_projects: string[];
+  allowed_projects: string[] | string;
+  auto_approve_projects: string[] | string;
   allowed_ips: string;
   rate_limit_per_min: number;
   expires_at: number | null;
   last_used_at: number | null;
-  last_used_ip: string;
-  is_revoked: number;
+  last_used_ip?: string;
+  is_revoked?: number;
+  revoked?: number;
   created_at: number;
 }
 
@@ -40,9 +41,10 @@ interface AiApprovalItem {
   token_name: string;
   action: string;
   project_name: string;
-  params: Record<string, any>;
+  params?: Record<string, any>;
+  payload?: Record<string, any>;
   diff_text: string;
-  status: 'pending' | 'approved' | 'rejected' | 'expired';
+  status: 'pending' | 'approved' | 'executed' | 'rejected' | 'expired' | 'failed';
   result: any;
   created_at: number;
   expires_at: number;
@@ -55,17 +57,21 @@ interface AiAuditItem {
   token_id: number | null;
   token_name: string;
   ip: string;
-  method: string;
-  tool_or_path: string;
-  project_name: string;
-  params_summary: string;
+  tool_or_endpoint?: string;
+  args_summary?: string;
+  result_summary?: string;
   status: string;
-  duration_ms: number;
+  tool_or_path?: string;
+  project_name?: string;
+  duration_ms?: number;
 }
 
 interface AiAccessViewProps {
   projects: ProjectItem[];
   apiFetch: (path: string, options?: RequestInit) => Promise<Response>;
+  aiAccessPaused?: boolean;
+  isDefaultPassword?: boolean;
+  userRole?: string;
   onRefreshDashboard: () => Promise<void>;
   onOpenSettingsTab: () => void;
 }
@@ -77,18 +83,22 @@ const AVAILABLE_SCOPES: Array<{ id: string; label: string; desc: string }> = [
   { id: 'run', label: 'run', desc: 'Запуск, остановка, перезапуск и install_deps' },
   { id: 'schedule:write', label: 'schedule:write', desc: 'Изменение расписания cron и restart_policy' },
   { id: 'templates:create', label: 'templates:create', desc: 'Создание проектов строго из шаблонов' },
-  { id: 'ask:answer', label: 'ask:answer', desc: 'Ответы на интерактивные запросы aruta.ask()' },
+  { id: 'ask:answer', label: 'ask:answer', desc: 'Ответы на интерактивные запросы beacon.ask()' },
 ];
 
 export const AiAccessView: React.FC<AiAccessViewProps> = ({
   projects,
   apiFetch,
+  aiAccessPaused,
+  isDefaultPassword: isDefaultPasswordProp,
+  userRole = 'admin',
   onRefreshDashboard,
   onOpenSettingsTab,
 }) => {
   const [enabled, setEnabled] = useState<boolean>(false);
   const [paused, setPaused] = useState<boolean>(false);
-  const [isDefaultPassword, setIsDefaultPassword] = useState<boolean>(true);
+  const [isDefaultPassword, setIsDefaultPassword] = useState<boolean>(Boolean(isDefaultPasswordProp));
+  const [accessDenied, setAccessDenied] = useState<boolean>(userRole !== 'admin');
   const [tokens, setTokens] = useState<AiTokenItem[]>([]);
   const [approvals, setApprovals] = useState<AiApprovalItem[]>([]);
   const [auditLogs, setAuditLogs] = useState<AiAuditItem[]>([]);
@@ -100,40 +110,80 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
   const [selectedScopes, setSelectedScopes] = useState<string[]>(['read', 'files:read', 'files:write', 'run']);
   const [selectedAllowedProjects, setSelectedAllowedProjects] = useState<string[]>(['*']);
   const [selectedAutoApproveProjects, setSelectedAutoApproveProjects] = useState<string[]>([]);
-  const [allowedIps, setAllowedIps] = useState<string>('');
+  const [allowedIps, setAllowedIps] = useState<string>('127.0.0.1');
+  const [allowAnyIp, setAllowAnyIp] = useState<boolean>(false);
   const [rateLimit, setRateLimit] = useState<number>(60);
   const [expiresDays, setExpiresDays] = useState<number>(90);
   const [createdPlainToken, setCreatedPlainToken] = useState<string>('');
   const [copiedConfig, setCopiedConfig] = useState<boolean>(false);
+  const [copiedMcpJson, setCopiedMcpJson] = useState<boolean>(false);
 
-  const loadAiConfig = async () => {
-    setLoading(true);
+  const loadAiConfig = async (silent: boolean = false) => {
+    if (userRole !== 'admin') {
+      setAccessDenied(true);
+      return;
+    }
+    if (!silent) setLoading(true);
     try {
-      const res = await apiFetch('/api/ai/config');
-      if (res.ok) {
-        const data = await res.json();
-        setEnabled(Boolean(data.enabled));
-        setPaused(Boolean(data.paused));
-        setIsDefaultPassword(Boolean(data.is_default_password));
-        setTokens(Array.isArray(data.tokens) ? data.tokens : []);
-        setApprovals(Array.isArray(data.approvals) ? data.approvals : []);
-        setAuditLogs(Array.isArray(data.audit_log) ? data.audit_log : []);
+      const [stRes, tokRes, aprRes, audRes] = await Promise.all([
+        apiFetch('/api/ai/status'),
+        apiFetch('/api/ai/tokens'),
+        apiFetch('/api/ai/approvals'),
+        apiFetch('/api/ai/audit'),
+      ]);
+      if (stRes.status === 403) {
+        setAccessDenied(true);
+        return;
+      }
+      setAccessDenied(false);
+      if (stRes.ok) {
+        const st = await stRes.json();
+        setEnabled(Boolean(st.ai_access_enabled));
+        setPaused(Boolean(st.ai_access_paused));
+        setIsDefaultPassword(Boolean(st.is_default_password));
+      }
+      if (tokRes.ok) {
+        const tokList = await tokRes.json();
+        setTokens(Array.isArray(tokList) ? tokList : []);
+      }
+      if (aprRes.ok) {
+        const aprList = await aprRes.json();
+        setApprovals(Array.isArray(aprList) ? aprList : []);
+      }
+      if (audRes.ok) {
+        const audList = await audRes.json();
+        setAuditLogs(Array.isArray(audList) ? audList : []);
       }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
   useEffect(() => {
-    loadAiConfig();
-    const timer = setInterval(loadAiConfig, 3000);
+    loadAiConfig(false);
+    const timer = setInterval(() => loadAiConfig(true), 3000);
     return () => clearInterval(timer);
-  }, []);
+  }, [userRole]);
+
+  useEffect(() => {
+    if (typeof aiAccessPaused === 'boolean') {
+      setPaused(aiAccessPaused);
+    }
+  }, [aiAccessPaused]);
+
+  useEffect(() => {
+    if (typeof isDefaultPasswordProp === 'boolean') {
+      setIsDefaultPassword(isDefaultPasswordProp);
+      if (!isDefaultPasswordProp) {
+        loadAiConfig(true);
+      }
+    }
+  }, [isDefaultPasswordProp]);
 
   const handleToggleEnabled = async (nextEnabled: boolean) => {
     setStatusMsg(null);
-    const res = await apiFetch('/api/ai/config', {
-      method: 'PUT',
+    const res = await apiFetch('/api/ai/toggle', {
+      method: 'POST',
       body: JSON.stringify({ enabled: nextEnabled }),
     });
     if (res.ok) {
@@ -151,8 +201,8 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
 
   const handleTogglePause = async (nextPaused: boolean) => {
     setStatusMsg(null);
-    const res = await apiFetch('/api/ai/config', {
-      method: 'PUT',
+    const res = await apiFetch('/api/ai/pause', {
+      method: 'POST',
       body: JSON.stringify({ paused: nextPaused }),
     });
     if (res.ok) {
@@ -164,6 +214,9 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
           ? 'Экстренная пауза ИИ включена (все запросы к /mcp и /api/v1/ заблокированы).'
           : 'Пауза ИИ снята.',
       });
+    } else {
+      const err = await res.json().catch(() => ({}));
+      setStatusMsg({ type: 'err', text: err.detail || 'Не удалось переключить паузу ИИ' });
     }
   };
 
@@ -171,16 +224,26 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
     e.preventDefault();
     setStatusMsg(null);
     setCreatedPlainToken('');
+    if (!allowedIps.trim() && !allowAnyIp) {
+      setStatusMsg({
+        type: 'err',
+        text: 'Укажите разрешённые IP / CIDR (например 127.0.0.1) или отметьте подтверждение доступа с любого IP.',
+      });
+      return;
+    }
+    const safeExpires = Math.max(1, Number(expiresDays) || 1);
+    const safeRateLimit = Math.max(1, Math.min(600, Number(rateLimit) || 60));
     const res = await apiFetch('/api/ai/tokens', {
       method: 'POST',
       body: JSON.stringify({
         name: newTokenName.trim(),
         scopes: selectedScopes,
-        allowed_projects: selectedAllowedProjects,
-        auto_approve_projects: selectedAutoApproveProjects,
+        allowed_projects: selectedAllowedProjects.join(',') || '*',
+        auto_approve_projects: selectedAutoApproveProjects.join(','),
         allowed_ips: allowedIps.trim(),
-        rate_limit_per_min: rateLimit,
-        expires_days: expiresDays,
+        allow_any_ip: allowAnyIp,
+        rate_limit_per_min: safeRateLimit,
+        ttl_days: safeExpires,
       }),
     });
     if (res.ok) {
@@ -198,34 +261,78 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
   };
 
   const handleRevokeToken = async (tokenId: number) => {
-    await apiFetch(`/api/ai/tokens/${tokenId}`, { method: 'DELETE' });
-    await loadAiConfig();
-  };
-
-  const handleApproveAction = async (approvalId: string) => {
-    const res = await apiFetch(`/api/ai/approvals/${approvalId}/approve`, {
+    setStatusMsg(null);
+    const res = await apiFetch(`/api/ai/tokens/${tokenId}/revoke`, {
       method: 'POST',
       body: JSON.stringify({}),
     });
     if (res.ok) {
       await loadAiConfig();
       await onRefreshDashboard();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      setStatusMsg({ type: 'err', text: err.detail || 'Не удалось отозвать токен ИИ' });
+    }
+  };
+
+  const handleDeleteToken = async (tokenId: number) => {
+    setStatusMsg(null);
+    const res = await apiFetch(`/api/ai/tokens/${tokenId}`, {
+      method: 'DELETE',
+    });
+    if (res.ok) {
+      await loadAiConfig();
+      await onRefreshDashboard();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      setStatusMsg({ type: 'err', text: err.detail || 'Не удалось удалить токен ИИ' });
+    }
+  };
+
+  const handleApproveAction = async (approvalId: string) => {
+    const res = await apiFetch(`/api/ai/approvals/${approvalId}/decide`, {
+      method: 'POST',
+      body: JSON.stringify({ decision: 'approve' }),
+    });
+    if (res.ok) {
+      await loadAiConfig();
+      await onRefreshDashboard();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      setStatusMsg({ type: 'err', text: err.detail || 'Не удалось одобрить запрос ИИ' });
     }
   };
 
   const handleRejectAction = async (approvalId: string) => {
-    const res = await apiFetch(`/api/ai/approvals/${approvalId}/reject`, {
+    const res = await apiFetch(`/api/ai/approvals/${approvalId}/decide`, {
       method: 'POST',
-      body: JSON.stringify({}),
+      body: JSON.stringify({ decision: 'reject' }),
     });
     if (res.ok) {
       await loadAiConfig();
       await onRefreshDashboard();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      setStatusMsg({ type: 'err', text: err.detail || 'Не удалось отклонить запрос ИИ' });
     }
   };
 
   const toggleScope = (scopeId: string) => {
     setSelectedScopes((prev) => (prev.includes(scopeId) ? prev.filter((s) => s !== scopeId) : [...prev, scopeId]));
+  };
+
+  const toggleAllowedProject = (projName: string) => {
+    if (projName === '*') {
+      setSelectedAllowedProjects(['*']);
+      return;
+    }
+    setSelectedAllowedProjects((prev) => {
+      const withoutStar = prev.filter((p) => p !== '*');
+      const next = withoutStar.includes(projName)
+        ? withoutStar.filter((p) => p !== projName)
+        : [...withoutStar, projName];
+      return next.length > 0 ? next : ['*'];
+    });
   };
 
   const toggleAutoApproveProject = (projName: string) => {
@@ -253,6 +360,22 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
   );
 
   const pendingApprovals = approvals.filter((a) => a.status === 'pending');
+
+  if (accessDenied) {
+    return (
+      <div className="bg-amber-950/60 border border-amber-500/40 rounded-xl p-5 flex items-start gap-3">
+        <ShieldAlert className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+        <div className="text-xs text-amber-100 space-y-1">
+          <div className="font-bold text-amber-300 text-sm">
+            Управление ИИ-доступом доступно только администратору (admin)
+          </div>
+          <p>
+            Ваша текущая роль «{userRole}» не позволяет выпускать MCP-токены и подтверждать изменения кода от ИИ.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -340,7 +463,7 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
 
           <button
             type="button"
-            onClick={loadAiConfig}
+            onClick={() => loadAiConfig(false)}
             className="p-2 text-slate-400 hover:text-white bg-[#0b0f17] border border-slate-800 rounded-lg cursor-pointer"
             title="Обновить"
           >
@@ -396,7 +519,7 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
                       className={`px-2 py-0.5 font-mono text-[10px] rounded uppercase font-semibold ${
                         item.status === 'pending'
                           ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
-                          : item.status === 'approved'
+                          : item.status === 'approved' || item.status === 'executed'
                           ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
                           : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
                       }`}
@@ -442,9 +565,9 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
                   </pre>
                 )}
 
-                {!item.diff_text && item.params && (
+                {!item.diff_text && (item.payload || item.params) && (
                   <div className="text-[11px] font-mono text-slate-400 truncate">
-                    Параметры: {JSON.stringify(item.params)}
+                    Параметры: {JSON.stringify(item.payload || item.params)}
                   </div>
                 )}
               </div>
@@ -476,7 +599,7 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
               />
             </div>
             <div>
-              <label className="block text-xs text-slate-300 mb-1">Разрешённые IP / CIDR (пусто = любые из подсети)</label>
+              <label className="block text-xs text-slate-300 mb-1">Разрешённые IP / CIDR (обязательно или подтвердите любой IP)</label>
               <input
                 type="text"
                 value={allowedIps}
@@ -484,6 +607,16 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
                 placeholder="127.0.0.1, 192.168.1.0/24"
                 className="w-full bg-[#0b0f17] border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white font-mono"
               />
+              {!allowedIps.trim() && (
+                <label className="mt-1.5 flex items-center gap-1.5 text-[11px] text-amber-300 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={allowAnyIp}
+                    onChange={(e) => setAllowAnyIp(e.target.checked)}
+                  />
+                  Разрешить подключение с любого IP-адреса
+                </label>
+              )}
             </div>
             <div>
               <label className="block text-xs text-slate-300 mb-1">Лимит запросов в минуту (Rate Limit)</label>
@@ -492,18 +625,18 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
                 min={5}
                 max={600}
                 value={rateLimit}
-                onChange={(e) => setRateLimit(Number(e.target.value))}
+                onChange={(e) => setRateLimit(Math.max(1, Math.min(600, Number(e.target.value) || 60)))}
                 className="w-full bg-[#0b0f17] border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white font-mono"
               />
             </div>
             <div>
-              <label className="block text-xs text-slate-300 mb-1">Срок действия (дней)</label>
+              <label className="block text-xs text-slate-300 mb-1">Срок действия (дней, от 1)</label>
               <input
                 type="number"
                 min={1}
                 max={3650}
                 value={expiresDays}
-                onChange={(e) => setExpiresDays(Number(e.target.value))}
+                onChange={(e) => setExpiresDays(Math.max(1, Number(e.target.value) || 1))}
                 className="w-full bg-[#0b0f17] border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white font-mono"
               />
             </div>
@@ -533,32 +666,72 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
           </div>
 
           {projects.length > 0 && (
-            <div className="space-y-1.5">
-              <label className="block text-xs font-semibold text-slate-300">
-                Проекты с авто-одобрением (без постановки в очередь подтверждений)
-              </label>
-              <div className="flex flex-wrap gap-2">
-                {projects.map((p) => (
+            <div className="space-y-3">
+              <div className="space-y-1.5">
+                <label className="block text-xs font-semibold text-slate-300">
+                  Разрешённые проекты (белый список доступа для этого токена)
+                </label>
+                <div className="flex flex-wrap gap-2">
                   <button
-                    key={p.id}
                     type="button"
-                    onClick={() => toggleAutoApproveProject(p.name)}
+                    onClick={() => toggleAllowedProject('*')}
                     className={`px-2.5 py-1 text-xs font-mono rounded-lg border cursor-pointer ${
-                      selectedAutoApproveProjects.includes(p.name)
-                        ? 'bg-emerald-950/70 text-emerald-300 border-emerald-600/60'
+                      selectedAllowedProjects.includes('*')
+                        ? 'bg-indigo-950/70 text-indigo-300 border-indigo-500/60'
                         : 'bg-[#0b0f17] text-slate-400 border-slate-800'
                     }`}
                   >
-                    {p.name}
+                    * (Все проекты)
                   </button>
-                ))}
+                  {projects.map((p) => (
+                    <button
+                      key={`allow-${p.id}`}
+                      type="button"
+                      onClick={() => toggleAllowedProject(p.name)}
+                      className={`px-2.5 py-1 text-xs font-mono rounded-lg border cursor-pointer ${
+                        !selectedAllowedProjects.includes('*') && selectedAllowedProjects.includes(p.name)
+                          ? 'bg-indigo-950/70 text-indigo-300 border-indigo-500/60'
+                          : 'bg-[#0b0f17] text-slate-400 border-slate-800'
+                      }`}
+                    >
+                      {p.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="block text-xs font-semibold text-slate-300">
+                  Проекты с авто-одобрением (без постановки в очередь подтверждений)
+                </label>
+                <div className="flex flex-wrap gap-2">
+                  {projects.map((p) => (
+                    <button
+                      key={`auto-${p.id}`}
+                      type="button"
+                      onClick={() => toggleAutoApproveProject(p.name)}
+                      className={`px-2.5 py-1 text-xs font-mono rounded-lg border cursor-pointer ${
+                        selectedAutoApproveProjects.includes(p.name)
+                          ? 'bg-emerald-950/70 text-emerald-300 border-emerald-600/60'
+                          : 'bg-[#0b0f17] text-slate-400 border-slate-800'
+                      }`}
+                    >
+                      {p.name}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
           )}
 
           <button
             type="submit"
-            disabled={isDefaultPassword || !newTokenName.trim() || selectedScopes.length === 0}
+            disabled={
+              isDefaultPassword ||
+              !newTokenName.trim() ||
+              selectedScopes.length === 0 ||
+              (!allowedIps.trim() && !allowAnyIp)
+            }
             className="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
           >
             <Plus className="w-4 h-4" />
@@ -577,7 +750,7 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
                 <button
                   type="button"
                   onClick={() => {
-                    navigator.clipboard?.writeText(createdPlainToken);
+                    navigator.clipboard?.writeText(createdPlainToken).catch(() => {});
                     setCopiedConfig(true);
                     setTimeout(() => setCopiedConfig(false), 2000);
                   }}
@@ -600,11 +773,15 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
             </div>
             <button
               type="button"
-              onClick={() => navigator.clipboard?.writeText(claudeCodeConfig)}
+              onClick={() => {
+                navigator.clipboard?.writeText(claudeCodeConfig).catch(() => {});
+                setCopiedMcpJson(true);
+                setTimeout(() => setCopiedMcpJson(false), 2000);
+              }}
               className="px-2.5 py-1 text-[11px] font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 rounded inline-flex items-center gap-1 cursor-pointer"
             >
               <Copy className="w-3 h-3" />
-              JSON
+              {copiedMcpJson ? 'Скопировано' : 'JSON'}
             </button>
           </div>
 
@@ -644,41 +821,77 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
                   <th className="py-2 pr-3">Имя</th>
                   <th className="py-2 pr-3">Префикс</th>
                   <th className="py-2 pr-3">Права (Scopes)</th>
-                  <th className="py-2 pr-3">Лимит</th>
+                  <th className="py-2 pr-3">Проекты</th>
+                  <th className="py-2 pr-3">IP / Лимит</th>
                   <th className="py-2 pr-3">Статус</th>
                   <th className="py-2 text-right">Действие</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/60">
-                {tokens.map((t) => (
-                  <tr key={t.id}>
-                    <td className="py-2.5 pr-3 font-semibold text-white">{t.name}</td>
-                    <td className="py-2.5 pr-3 font-mono text-slate-300">{t.token_prefix}...</td>
-                    <td className="py-2.5 pr-3 font-mono text-[11px] text-indigo-300">
-                      {(t.scopes || []).join(', ')}
-                    </td>
-                    <td className="py-2.5 pr-3 font-mono text-slate-400">{t.rate_limit_per_min}/мин</td>
-                    <td className="py-2.5 pr-3">
-                      {t.is_revoked ? (
-                        <span className="text-rose-400 font-mono text-[11px]">ОТОЗВАН</span>
-                      ) : (
-                        <span className="text-emerald-400 font-mono text-[11px]">АКТИВЕН</span>
-                      )}
-                    </td>
-                    <td className="py-2.5 text-right">
-                      {!t.is_revoked && (
-                        <button
-                          type="button"
-                          onClick={() => handleRevokeToken(t.id)}
-                          className="px-2.5 py-1 text-[11px] bg-rose-950/70 hover:bg-rose-900 text-rose-200 rounded border border-rose-700/50 inline-flex items-center gap-1 cursor-pointer"
-                        >
-                          <Trash2 className="w-3 h-3" />
-                          Отозвать
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                {tokens.map((t) => {
+                  const allowedProjText = Array.isArray(t.allowed_projects)
+                    ? t.allowed_projects.join(', ')
+                    : (t.allowed_projects || '*')
+                        .split(',')
+                        .map((s) => s.trim())
+                        .filter(Boolean)
+                        .join(', ') || '*';
+                  const autoApproveText = Array.isArray(t.auto_approve_projects)
+                    ? t.auto_approve_projects.join(', ')
+                    : (t.auto_approve_projects || '')
+                        .split(',')
+                        .map((s) => s.trim())
+                        .filter(Boolean)
+                        .join(', ');
+                  const isRevoked = Boolean(t.revoked || t.is_revoked);
+                  return (
+                    <tr key={t.id}>
+                      <td className="py-2.5 pr-3 font-semibold text-white">{t.name}</td>
+                      <td className="py-2.5 pr-3 font-mono text-slate-300">{t.token_prefix}</td>
+                      <td className="py-2.5 pr-3 font-mono text-[11px] text-indigo-300">
+                        {(t.scopes || []).join(', ')}
+                      </td>
+                      <td className="py-2.5 pr-3 font-mono text-[11px] text-slate-300">
+                        <div>{allowedProjText}</div>
+                        {autoApproveText && (
+                          <div className="text-[10px] text-emerald-400">auto: {autoApproveText}</div>
+                        )}
+                      </td>
+                      <td className="py-2.5 pr-3 font-mono text-[11px] text-slate-400">
+                        <div>{t.allowed_ips || '—'}</div>
+                        <div>{t.rate_limit_per_min}/мин</div>
+                      </td>
+                      <td className="py-2.5 pr-3">
+                        {isRevoked ? (
+                          <span className="text-rose-400 font-mono text-[11px]">ОТОЗВАН</span>
+                        ) : (
+                          <span className="text-emerald-400 font-mono text-[11px]">АКТИВЕН</span>
+                        )}
+                      </td>
+                      <td className="py-2.5 text-right">
+                        {!isRevoked ? (
+                          <button
+                            type="button"
+                            onClick={() => handleRevokeToken(t.id)}
+                            className="px-2.5 py-1 text-[11px] bg-rose-950/70 hover:bg-rose-900 text-rose-200 rounded border border-rose-700/50 inline-flex items-center gap-1 cursor-pointer"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            Отозвать
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteToken(t.id)}
+                            className="px-2.5 py-1 text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 inline-flex items-center gap-1 cursor-pointer"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            Удалить
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -701,24 +914,26 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
                   <th className="py-1.5 pr-3">Время</th>
                   <th className="py-1.5 pr-3">Токен</th>
                   <th className="py-1.5 pr-3">Инструмент / Путь</th>
-                  <th className="py-1.5 pr-3">Проект</th>
+                  <th className="py-1.5 pr-3">Аргументы / Результат</th>
                   <th className="py-1.5 pr-3">Статус</th>
-                  <th className="py-1.5 text-right">Длит.</th>
+                  <th className="py-1.5 text-right">IP / Длит.</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/50 text-[11px]">
                 {auditLogs.slice(0, 40).map((log) => (
                   <tr key={log.id}>
-                    <td className="py-1.5 pr-3 text-slate-400">
+                    <td className="py-1.5 pr-3 text-slate-400 whitespace-nowrap">
                       {new Date(log.timestamp * 1000).toLocaleTimeString('ru-RU')}
                     </td>
-                    <td className="py-1.5 pr-3 text-slate-200">{log.token_name}</td>
-                    <td className="py-1.5 pr-3 text-indigo-300">{log.tool_or_path}</td>
-                    <td className="py-1.5 pr-3 text-slate-300">{log.project_name || '—'}</td>
-                    <td className="py-1.5 pr-3">
+                    <td className="py-1.5 pr-3 text-slate-200 whitespace-nowrap">{log.token_name || '—'}</td>
+                    <td className="py-1.5 pr-3 text-indigo-300">{log.tool_or_endpoint || log.tool_or_path || '—'}</td>
+                    <td className="py-1.5 pr-3 text-slate-300 max-w-xs truncate" title={log.result_summary || log.args_summary || ''}>
+                      {log.result_summary || log.args_summary || log.project_name || '—'}
+                    </td>
+                    <td className="py-1.5 pr-3 whitespace-nowrap">
                       <span
                         className={
-                          log.status === 'ok' || log.status === 'approved'
+                          log.status === 'ok' || log.status === 'approved' || log.status === 'executed'
                             ? 'text-emerald-400'
                             : log.status === 'queued_approval'
                             ? 'text-amber-300'
@@ -728,7 +943,9 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
                         {log.status}
                       </span>
                     </td>
-                    <td className="py-1.5 text-right text-slate-400">{log.duration_ms} мс</td>
+                    <td className="py-1.5 text-right text-slate-400 whitespace-nowrap">
+                      {typeof log.duration_ms === 'number' ? `${log.duration_ms} мс` : log.ip || '—'}
+                    </td>
                   </tr>
                 ))}
               </tbody>
