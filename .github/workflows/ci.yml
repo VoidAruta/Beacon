@@ -1,4 +1,4 @@
-name: Aruta Control Panel CI
+name: Beacon Control Panel CI
 
 on:
   push:
@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: ["ubuntu-latest", "ubuntu-24.04-arm"]
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -24,26 +24,50 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install lightweight runtime dependencies & pip-audit
+      - name: Install runtime dependencies, ruff & pip-audit
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt pip-audit
+          python -m pip install -r requirements.txt ruff pip-audit
+
+      - name: Lint Python code (ruff)
+        run: ruff check hub beacon aruta
 
       - name: Audit Python dependencies (pip-audit)
         run: |
-          pip-audit -r requirements.txt || true
+          pip-audit -r requirements.txt --format columns || {
+            echo "::warning::pip-audit обнаружил рекомендации/уязвимости в зависимостях (см. лог)"
+          }
 
-      - name: Run Aruta Doctor & Generate systemd units
+      - name: Verify shell syntax (scripts/*.sh)
+        run: bash -n scripts/*.sh
+
+      - name: Run Beacon Doctor & Generate systemd unit
         run: |
-          python3 -m aruta systemd
-          python3 -m aruta doctor
+          python3 -m beacon systemd
+          python3 -m beacon doctor
 
       - name: Run Backend Unit & Security Suite
+        run: python3 -m unittest discover -s tests -v
+
+  compat-fallback-test:
+    name: Zero-Dependency Stdlib Fallback Test (Py 3.11)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11 (no external pip packages)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Beacon Doctor & Unit Tests without requirements.txt
         run: |
+          python3 -m beacon doctor
           python3 -m unittest discover -s tests -v
 
   frontend-build:
-    name: Frontend TypeScript Tests & Bundle Build
+    name: Frontend TypeScript Tests & Bundle Verification
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -58,8 +82,48 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: TypeScript typecheck
+        run: npm run lint
+
       - name: Run Pure Logic Unit Tests (node:test)
         run: npx tsx --test src/utils/hubLogic.test.ts
 
-      - name: Build Production Static Bundle into hub/static
-        run: npm run build
+      - name: Build Production Static Bundle into hub/static & verify hygiene
+        run: |
+          npm run build
+          test ! -d hub/static/assets/aistudio
+          python3 -c '
+          import pathlib, re
+          html = pathlib.Path("hub/static/index.html").read_text(encoding="utf-8")
+          refs = set(re.findall(r"/assets/([a-zA-Z0-9._-]+)", html))
+          assert refs, "No asset refs in hub/static/index.html"
+          assets = {p.name for p in pathlib.Path("hub/static/assets").iterdir() if p.is_file()}
+          assert refs == assets, f"Mismatch refs={refs} vs assets={assets}"
+          js_blob = "".join(p.read_text(encoding="utf-8", errors="ignore") for p in pathlib.Path("hub/static/assets").glob("*.js"))
+          assert "ai_access" in js_blob, "ai_access missing from built bundle"
+          '
+          git diff --exit-code hub/static
+
+  release-smoke:
+    name: Simulated Release Tarball Smoke Test
+    runs-on: ubuntu-latest
+    needs: [backend-tests, frontend-build]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Package & verify release tarball
+        run: |
+          mkdir -p dist-release/beacon-server/data
+          cp -r beacon aruta hub sdk scripts projects docs AGENTS.md requirements.txt README.md LICENSE SECURITY.md CONTRIBUTING.md CHANGELOG.md .gitignore dist-release/beacon-server/
+          cp data/.gitkeep dist-release/beacon-server/data/
+          tar -czf beacon-release.tar.gz -C dist-release beacon-server
+          mkdir -p /tmp/beacon-smoke
+          tar -xzf beacon-release.tar.gz -C /tmp/beacon-smoke
+          BEACON_DIR=/tmp/beacon-smoke/beacon-server python3 -m pip install -r /tmp/beacon-smoke/beacon-server/requirements.txt --quiet
+          cd /tmp/beacon-smoke/beacon-server && BEACON_DIR=/tmp/beacon-smoke/beacon-server python3 -m beacon doctor

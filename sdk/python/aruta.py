@@ -2,6 +2,6 @@
 Совместимый алиас `import aruta` -> `import beacon`.
 """
 
-from beacon import ask, cookies_expired, notify, secret, state
+from beacon import BeaconApiError, ask, cookies_expired, notify, ping, secret, state
 
-__all__ = ["notify", "secret", "cookies_expired", "ask", "state"]
+__all__ = ["BeaconApiError", "notify", "secret", "cookies_expired", "ask", "ping", "state"]

@@ -4,7 +4,7 @@
 
 ## Незыблемые архитектурные правила (Architecture Invariants)
 
-При внесении изменений в ядро (`beacon/`) обязательно соблюдайте следующие ограничения целевой платформы (смартфон в круглосуточном режиме 24/7, ARM64 `aarch64`, отсутствие systemd внутри chroot):
+При внесении изменений в ядро (`hub/` и `beacon/`) обязательно соблюдайте следующие ограничения целевой платформы (смартфон в круглосуточном режиме 24/7, ARM64 `aarch64`, отсутствие systemd внутри chroot):
 
 1. **Управление группами процессов (`os.setsid()` + `os.killpg()`):**
    - Каждый запускаемый проект должен стартовать в новой сессии (`os.setsid` в `preexec_fn`), чтобы его `PGID` совпадал с `PID` лидера.
@@ -32,20 +32,21 @@ source .venv/bin/activate
 pip install -r requirements.txt
 python3 -m beacon
 ```
-По умолчанию сервер слушает `http://127.0.0.1:8050`.
+По умолчанию сервер слушает `0.0.0.0:8050` (локально доступен по `http://127.0.0.1:8050`).
 
 ### 2. Разработка фронтенда и сборка статики
-На самом телефоне Node.js не требуется — готовая статика лежит в `beacon/static/`. Если вы меняете интерфейс в `src/`:
+На самом телефоне Node.js не требуется — готовая статика лежит в `hub/static/`. Если вы меняете интерфейс в `src/`:
 ```bash
 npm install
 npm run build:static
 ```
-Команда `npm run build:static` компилирует React/Tailwind-приложение напрямую в `beacon/static/`, после чего `python3 -m beacon` раздаёт обновлённый интерфейс без участия Node.js.
+Команда `npm run build:static` (синоним `npm run build`) компилирует React/Tailwind-приложение напрямую в `hub/static/`, после чего `python3 -m beacon` раздаёт обновлённый интерфейс без участия Node.js.
 
 ### 3. Требования к Pull Request
-- Проверьте, что в коммит не попали файлы из `data/` (`beacon.db`, `secret.key`, `cookies/`, `logs/`) и пользовательские папки из `projects/` (кроме `projects/examples/`).
-- Убедитесь, что все тесты проходят (если тестовый файл переименован):
+- Проверьте, что в коммит не попали файлы из `data/` (`hub.db`, `session.secret`, `internal.token`, `secrets/`, `logs/`, `backups/`) и пользовательские папки из `projects/` (кроме `projects/examples/`).
+- Убедитесь, что все тесты проходят:
   ```bash
-  npx tsx --test src/utils/beaconLogic.test.ts
+  python3 -m unittest discover -s tests -v
+  npx tsx --test src/utils/hubLogic.test.ts
   ```
 - Опишите в PR сценарий проверки на целевом устройстве (Android chroot / Linux ARM64).

@@ -130,14 +130,24 @@ export function validateCookieEditorJson(rawJson: string): {
 /**
  * Проверяет, что порт находится в допустимом диапазоне 1024–65535 и не входит в настраиваемый список reserved_ports.
  */
-export function isPortAllowed(port: number, reservedPorts: readonly number[] = FORBIDDEN_PORTS): { allowed: boolean; reason?: string } {
+export function isPortAllowed(
+  port: number,
+  reservedPorts: readonly number[] | string = FORBIDDEN_PORTS
+): { allowed: boolean; reason?: string } {
   if (!Number.isInteger(port) || port < 1024 || port > 65535) {
     return { allowed: false, reason: 'Порт должен быть целым числом в диапазоне 1024–65535' };
   }
-  if (reservedPorts.includes(port)) {
+  const parsedList: number[] =
+    typeof reservedPorts === 'string'
+      ? reservedPorts
+          .split(',')
+          .map((s) => Number(s.trim()))
+          .filter((n) => Number.isInteger(n) && n > 0)
+      : Array.from(reservedPorts);
+  if (parsedList.includes(port)) {
     return {
       allowed: false,
-      reason: `Порт ${port} зарезервирован в настройках (reserved_ports: ${reservedPorts.join(', ')})`,
+      reason: `Порт ${port} зарезервирован в настройках (reserved_ports: ${parsedList.join(', ')})`,
     };
   }
   return { allowed: true };
@@ -158,16 +168,23 @@ export function validateNewPassword(password: string): { valid: boolean; error?:
 }
 
 /**
- * Проверяет корректность расписания задачи (manual | cron | interval).
+ * Проверяет корректность расписания задачи (manual | cron | interval | daily).
  */
 export function validateScheduleConfig(
-  scheduleType: 'manual' | 'cron' | 'interval',
+  scheduleType: 'manual' | 'cron' | 'interval' | 'daily',
   scheduleExpr: string
 ): { valid: boolean; error?: string } {
   if (scheduleType === 'manual') return { valid: true };
   const expr = (scheduleExpr || '').trim();
   if (!expr) {
     return { valid: false, error: 'Укажите выражение расписания' };
+  }
+  if (scheduleType === 'daily') {
+    const m = expr.match(/^(\d{1,2}):(\d{2})$/);
+    if (!m || Number(m[1]) > 23 || Number(m[2]) > 59) {
+      return { valid: false, error: 'Укажите время в формате HH:MM (например 09:00)' };
+    }
+    return { valid: true };
   }
   if (scheduleType === 'interval') {
     const sec = Number(expr);
@@ -203,6 +220,8 @@ export function formatDurationSec(seconds: number): string {
   return `${h}ч ${remM}м`;
 }
 
+export const formatDurationSeconds = formatDurationSec;
+
 export function formatBytes(bytes: number): string {
   const b = Math.max(0, Number(bytes || 0));
   if (b < 1024) return `${b} Б`;
@@ -216,7 +235,7 @@ export function formatBytes(bytes: number): string {
 
 export function describeScheduleHuman(
   type: 'service' | 'job' | 'web',
-  scheduleType: 'manual' | 'cron' | 'interval',
+  scheduleType: 'manual' | 'cron' | 'interval' | 'daily',
   scheduleExpr: string,
   restartPolicy: 'no' | 'on-failure' | 'always' = 'on-failure',
   autostart: number | boolean = 0
@@ -233,6 +252,10 @@ export function describeScheduleHuman(
 
   if (scheduleType === 'manual') {
     return 'Только вручную (по кнопке «Старт» или по ссылке Webhook)';
+  }
+
+  if (scheduleType === 'daily') {
+    return `Ежедневно в ${(scheduleExpr || '09:00').trim()}`;
   }
 
   if (scheduleType === 'interval') {
@@ -343,3 +366,89 @@ export function parseGitHubRepoUrl(rawUrl: string): {
     repo,
   };
 }
+
+export type ProjectTypeFilter = 'all' | 'service' | 'web' | 'job';
+
+export function filterDashboardProjects<
+  T extends {
+    name: string;
+    description?: string;
+    group_tag?: string;
+    type: 'service' | 'job' | 'web';
+    is_test?: number | boolean;
+  }
+>(
+  projects: T[],
+  searchQuery: string,
+  typeFilter: ProjectTypeFilter = 'all',
+  hideTests: boolean = false
+): T[] {
+  const q = (searchQuery || '').trim().toLowerCase();
+  return (projects || []).filter((p) => {
+    if (hideTests && (p.is_test === 1 || p.is_test === true)) {
+      return false;
+    }
+    if (typeFilter !== 'all' && p.type !== typeFilter) {
+      return false;
+    }
+    if (!q) return true;
+    return (
+      p.name.toLowerCase().includes(q) ||
+      (p.description || '').toLowerCase().includes(q) ||
+      (p.group_tag || '').toLowerCase().includes(q)
+    );
+  });
+}
+
+export function getRunStatusBadge(status: string): {
+  label: string;
+  colorClass: string;
+  dotClass: string;
+} {
+  switch (status) {
+    case 'running':
+      return {
+        label: 'Работает',
+        colorClass: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40',
+        dotClass: 'bg-emerald-400',
+      };
+    case 'waiting_input':
+      return {
+        label: 'Ждёт 2FA / Ввод',
+        colorClass: 'bg-amber-500/20 text-amber-200 border-amber-500/50 animate-pulse',
+        dotClass: 'bg-amber-400',
+      };
+    case 'failed':
+      return {
+        label: 'Ошибка',
+        colorClass: 'bg-red-500/15 text-red-300 border-red-500/40',
+        dotClass: 'bg-red-400',
+      };
+    case 'crash_loop':
+      return {
+        label: 'Crash Loop',
+        colorClass: 'bg-red-500/25 text-red-200 border-red-500/50',
+        dotClass: 'bg-red-500',
+      };
+    case 'killed_oom':
+      return {
+        label: 'OOM Kill',
+        colorClass: 'bg-rose-500/20 text-rose-200 border-rose-500/50',
+        dotClass: 'bg-rose-400',
+      };
+    case 'killed_timeout':
+      return {
+        label: 'Таймаут',
+        colorClass: 'bg-amber-500/15 text-amber-300 border-amber-500/40',
+        dotClass: 'bg-amber-400',
+      };
+    case 'stopped':
+    default:
+      return {
+        label: 'Остановлен',
+        colorClass: 'bg-slate-800 text-slate-400 border-slate-700',
+        dotClass: 'bg-slate-500',
+      };
+  }
+}
+

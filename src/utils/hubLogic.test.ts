@@ -70,11 +70,14 @@ test('validateNewPassword enforces min 8 characters and rejects admin', () => {
   assert.equal(validateNewPassword('StrongPass2026!').valid, true);
 });
 
-test('validateScheduleConfig validates cron and interval expressions', () => {
+test('validateScheduleConfig validates cron, interval, and daily expressions', () => {
   assert.equal(validateScheduleConfig('cron', '*/15 * * * *').valid, true);
   assert.equal(validateScheduleConfig('cron', 'invalid cron').valid, false);
   assert.equal(validateScheduleConfig('interval', '3600').valid, true);
   assert.equal(validateScheduleConfig('interval', '2').valid, false);
+  assert.equal(validateScheduleConfig('daily', '09:30').valid, true);
+  assert.equal(validateScheduleConfig('daily', '25:00').valid, false);
+  assert.equal(validateScheduleConfig('daily', 'invalid').valid, false);
   assert.equal(formatDurationSec(125), '2м 5с');
 });
 
@@ -88,6 +91,10 @@ test('formatBytes and describeScheduleHuman format disk usage and human schedule
   assert.equal(
     describeScheduleHuman('job', 'cron', '30 9 * * *'),
     'Ежедневно в 09:30 (30 9 * * *)'
+  );
+  assert.equal(
+    describeScheduleHuman('job', 'daily', '08:15'),
+    'Ежедневно в 08:15'
   );
   assert.equal(
     describeScheduleHuman('job', 'interval', '1800'),
@@ -125,3 +132,70 @@ test('parseGitHubRepoUrl validates GitHub URLs and extracts clean project slug',
   const bad = parseGitHubRepoUrl('not-a-url');
   assert.equal(bad.valid, false);
 });
+
+import {
+  classifyStatusNotice,
+  formatLiveUptime,
+  getDepsButtonMeta,
+  generateBeaconFileTemplate,
+  getRuntimeSdkSnippets,
+  findNextInCode,
+  findAndReplaceInCode,
+} from '../components/projects/projectWorkspaceUtils';
+
+test('findNextInCode and findAndReplaceInCode respect caseSensitive flag consistently', () => {
+  const code = 'import beacon\nBeacon.notify("Hello")\nbeacon.notify("World")';
+
+  // Case-insensitive search finds both "Beacon" and "beacon"
+  const firstInsensitive = findNextInCode(code, 'beacon.notify', 0, false);
+  assert.equal(firstInsensitive, 14);
+  const secondInsensitive = findNextInCode(code, 'beacon.notify', 20, false);
+  assert.equal(secondInsensitive, 37);
+
+  // Case-sensitive search skips "Beacon.notify" and finds only lowercase "beacon.notify"
+  const onlySensitive = findNextInCode(code, 'beacon.notify', 0, true);
+  assert.equal(onlySensitive, 37);
+
+  // Case-sensitive replace only replaces exact case matches
+  const replacedSensitive = findAndReplaceInCode(code, 'beacon.notify', 'beacon.ask', true);
+  assert.equal(replacedSensitive.count, 1);
+  assert.ok(replacedSensitive.nextContent.includes('Beacon.notify("Hello")'));
+  assert.ok(replacedSensitive.nextContent.includes('beacon.ask("World")'));
+
+  // Case-insensitive replace replaces both
+  const replacedInsensitive = findAndReplaceInCode(code, 'beacon.notify', 'beacon.ask', false);
+  assert.equal(replacedInsensitive.count, 2);
+});
+
+test('getDepsButtonMeta adapts dependency button to python, node, and bash runtimes', () => {
+  assert.equal(getDepsButtonMeta('python').show, true);
+  assert.equal(getDepsButtonMeta('python').label, '.venv / pip install');
+  assert.equal(getDepsButtonMeta('node').show, true);
+  assert.equal(getDepsButtonMeta('node').label, 'npm install');
+  assert.equal(getDepsButtonMeta('bash').show, false);
+});
+
+test('classifyStatusNotice, formatLiveUptime, getRuntimeSdkSnippets, and generateBeaconFileTemplate work as expected', () => {
+  assert.equal(classifyStatusNotice('Ошибка сохранения: 500'), 'error');
+  assert.equal(classifyStatusNotice('Сетевой сбой при запросе'), 'error');
+  assert.equal(classifyStatusNotice('Требуется перезапуск'), 'warning');
+  assert.equal(classifyStatusNotice('Файл сохранён'), 'success');
+
+  const now = Date.UTC(2026, 4, 10, 12, 5, 30);
+  const started = new Date(Date.UTC(2026, 4, 10, 12, 0, 0)).toISOString();
+  assert.equal(formatLiveUptime(started, now), '5м 30с');
+
+  const pySnippets = getRuntimeSdkSnippets('python', 'my_cookies');
+  assert.equal(pySnippets.length, 6);
+  assert.ok(pySnippets.some((s) => s.id === 'notify' && s.code.includes('import beacon')));
+
+  const nodeSnippets = getRuntimeSdkSnippets('node', 'my_cookies');
+  assert.equal(nodeSnippets.length, 6);
+  assert.ok(nodeSnippets.some((s) => s.id === 'notify' && s.code.includes("require('beacon')")));
+
+  const reqTpl = generateBeaconFileTemplate('requirements.txt', 'demo_bot');
+  assert.ok(reqTpl.includes('httpx>=0.27.0'));
+  const yamlTpl = generateBeaconFileTemplate('project.yaml', 'demo_bot');
+  assert.ok(yamlTpl.includes('name: demo_bot'));
+});
+

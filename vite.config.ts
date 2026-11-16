@@ -6,6 +6,7 @@ import {defineConfig} from 'vite';
 export default defineConfig(() => {
   return {
     plugins: [react(), tailwindcss()],
+    publicDir: false as const,
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
@@ -16,6 +17,9 @@ export default defineConfig(() => {
       emptyOutDir: true,
     },
     server: {
+      host: '0.0.0.0',
+      port: 3000,
+      allowedHosts: true as const,
       hmr: false,
       watch: null,
     },

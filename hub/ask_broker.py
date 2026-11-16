@@ -8,12 +8,16 @@ import uuid
 from typing import Any, Optional
 
 from hub.compat import httpx
-from hub.db import execute_sql, get_all_settings, query_all, query_one
+from hub.db import execute_sql, get_all_settings, get_setting, query_all, query_one, set_setting
+from hub.log import get_logger
 from hub.notifier import send_telegram_message
+
+logger = get_logger("ask_broker")
 
 # В памяти: ask_id -> asyncio.Event
 _ASK_EVENTS: dict[str, asyncio.Event] = {}
 _TG_OFFSET: int = 0
+_TG_BOOTSTRAPPED: bool = False
 _POLLER_TASK: Optional[asyncio.Task[None]] = None
 
 
@@ -83,17 +87,30 @@ def answer_ask(ask_id: str, answer: str, source: str = "web") -> bool:
     return True
 
 
-async def poll_ask(ask_id: str, wait_sec: float = 10.0) -> dict[str, Any]:
+async def poll_ask(
+    ask_id: str,
+    wait_sec: float = 10.0,
+    expected_project_id: Optional[int] = None,
+) -> dict[str, Any]:
     """
     Long-poll ожидания ответа до wait_sec секунд.
     Контракт: { "status": "pending|answered|timeout|cancelled", "answer": "..." }
     """
-    row = query_one("SELECT id, run_id, status, answer, expires_at FROM pending_asks WHERE id = ?", (ask_id,))
+    row = query_one(
+        "SELECT id, run_id, project_id, status, answer, expires_at FROM pending_asks WHERE id = ?",
+        (ask_id,),
+    )
     if not row:
         return {"status": "cancelled", "answer": None}
 
+    if expected_project_id is not None and int(row["project_id"]) != int(expected_project_id):
+        raise PermissionError("Доступ к запросу ввода другого проекта запрещён")
+
     if row["status"] != "pending":
-        return {"status": row["status"], "answer": row["answer"]}
+        ans = row["answer"]
+        if row["status"] == "answered" and ans is not None:
+            execute_sql("UPDATE pending_asks SET answer = NULL WHERE id = ?", (ask_id,))
+        return {"status": row["status"], "answer": ans}
 
     now = time.time()
     if now >= row["expires_at"]:
@@ -128,7 +145,11 @@ async def poll_ask(ask_id: str, wait_sec: float = 10.0) -> dict[str, Any]:
     if updated["status"] != "pending":
         _ASK_EVENTS.pop(ask_id, None)
 
-    return {"status": updated["status"], "answer": updated["answer"]}
+    ans = updated["answer"]
+    if updated["status"] == "answered" and ans is not None:
+        execute_sql("UPDATE pending_asks SET answer = NULL WHERE id = ?", (ask_id,))
+
+    return {"status": updated["status"], "answer": ans}
 
 
 def get_active_asks() -> list[dict[str, Any]]:
@@ -174,13 +195,13 @@ async def handle_telegram_command(raw_text: str) -> Optional[str]:
 
     if cmd in ("/help", "/start") and not arg:
         return (
-            "🤖 Команды системного бота Hub:\n"
+            "🤖 Команды системного бота Beacon:\n"
             "• /status — ОЗУ, CPU, батарея смартфона, ZRAM и диск\n"
             "• /projects — список всех программ (service) и скриптов (job)\n"
             "• /start <имя> — запустить проект\n"
             "• /stop <имя> — остановить проект\n"
-            "• /doctor — самодиагностика Android Chroot (8 проверок)\n"
-            "• Reply на запрос — передать код в hub.ask()"
+            "• /doctor — самодиагностика среды (11 проверок)\n"
+            "• Reply на запрос — передать код в beacon.ask()"
         )
 
     if cmd == "/status":
@@ -200,8 +221,8 @@ async def handle_telegram_command(raw_text: str) -> Optional[str]:
             query_all("SELECT id FROM runs WHERE status IN ('running', 'waiting_input')")
         )
         return (
-            f"📊 Статус сервера Aruta:\n"
-            f"• Память Aruta: {hub_rss} МБ (лимит 80 МБ)\n"
+            f"📊 Статус сервера Beacon:\n"
+            f"• Память Beacon: {hub_rss} МБ (лимит 80 МБ)\n"
             f"• CPU: {cpu_pct}% | ОЗУ: {round(vm.used / 1048576)}/{round(vm.total / 1048576)} МБ ({vm.percent}%)\n"
             f"• ZRAM Swap: {hw['swap_used_mb']}/{hw['swap_total_mb']} МБ | Аптайм: {hw['uptime_human']}\n"
             f"• Батарея: {hw['battery_percent']}% ({hw['raw_status']}, {hw['battery_temp_c']}°C, {hw['voltage_mv']} мВ)\n"
@@ -213,7 +234,7 @@ async def handle_telegram_command(raw_text: str) -> Optional[str]:
         projs = query_all("SELECT id, name, type, desired_state FROM projects ORDER BY id ASC")
         if not projs:
             return "Список проектов пуст."
-        lines = ["📦 Проекты в Aruta:"]
+        lines = ["📦 Проекты в Beacon:"]
         for p in projs:
             last_r = query_one(
                 "SELECT status, pid FROM runs WHERE project_id = ? ORDER BY id DESC LIMIT 1",
@@ -253,7 +274,7 @@ async def handle_telegram_command(raw_text: str) -> Optional[str]:
 
         rep = run_hub_doctor(auto_fix_perms=True)
         lines = [
-            f"🩺 Aruta Doctor ({rep['duration_ms']} мс): OK={rep['ok_count']} | WARN={rep['warn_count']} | ERROR={rep['error_count']}"
+            f"🩺 Beacon Doctor ({rep['duration_ms']} мс): OK={rep['ok_count']} | WARN={rep['warn_count']} | ERROR={rep['error_count']}"
         ]
         for c in rep["checks"]:
             mark = "✅" if c["status"] == "ok" else ("⚠️" if c["status"] == "warn" else "❌")
@@ -273,8 +294,87 @@ def ensure_tg_poller_running() -> None:
         pass
 
 
-async def _tg_polling_loop() -> None:
+async def _process_tg_updates(updates: list[dict[str, Any]], cfg: dict[str, str]) -> int:
+    """
+    Обрабатывает список update-объектов Telegram Bot API (P2-05):
+    - Отслеживает tg_offset (и сохраняет в settings).
+    - Проверяет chat_id и список разрешённых tg_allowed_user_ids (from.id).
+    - Принимает ответы на ask строго через Reply на сообщение вопроса и не старше ask.created_at.
+    """
     global _TG_OFFSET
+    chat_id = str(cfg.get("tg_chat_id") or "").strip()
+    allowed_uids = {
+        uid.strip()
+        for uid in str(cfg.get("tg_allowed_user_ids") or "").split(",")
+        if uid.strip()
+    }
+    prev_offset = _TG_OFFSET
+
+    for upd in updates:
+        upd_id = int(upd.get("update_id") or 0)
+        if upd_id + 1 > _TG_OFFSET:
+            _TG_OFFSET = upd_id + 1
+
+        msg = upd.get("message") or {}
+        msg_chat_id = str((msg.get("chat") or {}).get("id") or "")
+        text = str(msg.get("text") or "").strip()
+        if not text or (chat_id and msg_chat_id != chat_id):
+            continue
+
+        sender_id = str((msg.get("from") or {}).get("id") or "").strip()
+        if allowed_uids and sender_id not in allowed_uids:
+            logger.warning("Игнорировано Telegram-сообщение от неавторизованного user_id=%s", sender_id or "unknown")
+            continue
+
+        # 1. Системные команды управления панелью (/status, /projects, /start, /stop, /doctor)
+        if text.startswith("/"):
+            reply_text = await handle_telegram_command(text)
+            if reply_text:
+                await send_telegram_message(reply_text, settings=cfg)
+            continue
+
+        # 2. Ответ на интерактивный запрос beacon.ask() строго через Reply и не старше создания ask
+        reply_to_id = (msg.get("reply_to_message") or {}).get("message_id")
+        if reply_to_id is None:
+            continue
+
+        msg_date = int(msg.get("date") or 0)
+        matched_ask_id: Optional[str] = None
+        current_asks = get_active_asks()
+        for a in current_asks:
+            if a.get("tg_message_id") == reply_to_id:
+                if msg_date > 0 and msg_date < int(a.get("created_at") or 0):
+                    logger.warning(
+                        "Игнорирован устаревший Telegram Reply (msg_date=%s < ask.created_at=%s) для ask=%s",
+                        msg_date,
+                        a.get("created_at"),
+                        a["id"],
+                    )
+                    break
+                matched_ask_id = a["id"]
+                break
+
+        if matched_ask_id:
+            answer_ask(matched_ask_id, text, source="telegram")
+            await send_telegram_message(f"✅ Ответ передан в скрипт (ask_id={matched_ask_id[:8]}).", settings=cfg)
+
+    if _TG_OFFSET > prev_offset:
+        set_setting("tg_offset", str(_TG_OFFSET))
+    return _TG_OFFSET
+
+
+async def _tg_polling_loop() -> None:
+    global _TG_OFFSET, _TG_BOOTSTRAPPED
+    backoff = 2.0
+
+    # Загружаем сохранённый offset из настроек при старте
+    try:
+        saved_offset = int(get_setting("tg_offset", "0") or 0)
+        if saved_offset > _TG_OFFSET:
+            _TG_OFFSET = saved_offset
+    except (TypeError, ValueError):
+        pass
+
     while True:
         cfg = get_all_settings()
         token = cfg.get("tg_bot_token", "").strip()
@@ -295,41 +395,63 @@ async def _tg_polling_loop() -> None:
 
         try:
             async with httpx.AsyncClient(proxy=proxy_url, timeout=15.0) as client:
+                # Если offset ещё не задан при запуске — пропускаем старые накопившиеся команды (offset=-1)
+                if not _TG_BOOTSTRAPPED and _TG_OFFSET == 0:
+                    boot_resp = await client.get(url, params={"offset": -1, "limit": 1, "timeout": 0})
+                    if boot_resp.status_code == 200:
+                        boot_data = boot_resp.json()
+                        boot_updates = boot_data.get("result", []) if isinstance(boot_data, dict) else []
+                        if boot_updates:
+                            _TG_OFFSET = max(_TG_OFFSET, int(boot_updates[-1].get("update_id", 0)) + 1)
+                            set_setting("tg_offset", str(_TG_OFFSET))
+                        _TG_BOOTSTRAPPED = True
+                        backoff = 2.0
+                    else:
+                        retry_after = 0.0
+                        try:
+                            err_json = boot_resp.json()
+                            if isinstance(err_json, dict):
+                                retry_after = float((err_json.get("parameters") or {}).get("retry_after") or 0.0)
+                        except Exception:
+                            pass
+                        sleep_sec = max(backoff, retry_after) if retry_after > 0 else backoff
+                        backoff = min(60.0, backoff * 2.0)
+                        logger.warning(
+                            "Telegram getUpdates bootstrap вернул HTTP %s, повтор через %.1fс",
+                            boot_resp.status_code,
+                            sleep_sec,
+                        )
+                        await asyncio.sleep(sleep_sec)
+                        continue
+                else:
+                    _TG_BOOTSTRAPPED = True
+
                 resp = await client.get(url, params={"offset": _TG_OFFSET, "timeout": 10})
                 if resp.status_code == 200:
+                    backoff = 2.0
                     data = resp.json()
-                    for upd in data.get("result", []):
-                        _TG_OFFSET = max(_TG_OFFSET, int(upd.get("update_id", 0)) + 1)
-                        msg = upd.get("message") or {}
-                        msg_chat_id = str(msg.get("chat", {}).get("id", ""))
-                        text = (msg.get("text") or "").strip()
-                        if not text or (chat_id and msg_chat_id != chat_id):
-                            continue
-
-                        # 1. Системные команды управления панелью (/status, /projects, /start, /stop, /doctor)
-                        if text.startswith("/"):
-                            reply_text = await handle_telegram_command(text)
-                            if reply_text:
-                                await send_telegram_message(reply_text, settings=cfg)
-                            continue
-
-                        # 2. Ответ на интерактивный запрос hub.ask()
-                        reply_to_id = (msg.get("reply_to_message") or {}).get("message_id")
-                        matched_ask_id: Optional[str] = None
-                        current_asks = get_active_asks()
-
-                        if reply_to_id is not None:
-                            for a in current_asks:
-                                if a.get("tg_message_id") == reply_to_id:
-                                    matched_ask_id = a["id"]
-                                    break
-
-                        if matched_ask_id is None and len(current_asks) == 1:
-                            matched_ask_id = current_asks[0]["id"]
-
-                        if matched_ask_id:
-                            answer_ask(matched_ask_id, text, source="telegram")
-                            await send_telegram_message(f"✅ Ответ передан в скрипт (ask_id={matched_ask_id[:8]}).", settings=cfg)
+                    updates = data.get("result", []) if isinstance(data, dict) else []
+                    if updates:
+                        await _process_tg_updates(updates, cfg)
+                else:
+                    retry_after = 0.0
+                    try:
+                        err_json = resp.json()
+                        if isinstance(err_json, dict):
+                            retry_after = float((err_json.get("parameters") or {}).get("retry_after") or 0.0)
+                    except Exception:
+                        pass
+                    sleep_sec = max(backoff, retry_after) if retry_after > 0 else backoff
+                    backoff = min(60.0, backoff * 2.0)
+                    logger.warning(
+                        "Telegram getUpdates вернул HTTP %s, повтор через %.1fс",
+                        resp.status_code,
+                        sleep_sec,
+                    )
+                    await asyncio.sleep(sleep_sec)
         except Exception:
-            await asyncio.sleep(3.0)
+            logger.exception("Ошибка в цикле _tg_polling_loop (повтор через %.1fс)", backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(60.0, backoff * 2.0)
+
 

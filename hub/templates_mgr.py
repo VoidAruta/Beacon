@@ -1,10 +1,10 @@
 """
-Генератор шаблонов новых проектов в /opt/aruta/projects/<name> (/opt/hub/projects/<name>):
-- python: Универсальный Python-скрипт с поддержкой .venv (через uv или python3 -m venv) и SDK aruta / hub
+Генератор шаблонов новых проектов в projects/<name>:
+- python: Универсальный Python-скрипт с поддержкой .venv (через uv или python3 -m venv) и SDK beacon
 - web: Веб-бэкенд / REST API с переменной $PORT и HTTP /health эндпоинтом
 - tg_bot: Шаблон Telegram-бота с индивидуальным BOT_TOKEN проекта
 - cookie_parser: Шаблон скрипта с индивидуальными куки проекта (Cookie-Editor) и интерактивным ask()
-- node: Node.js проект с SDK aruta / hub
+- node: Node.js проект с SDK beacon
 - bash: Bash-скрипт для системных и периодических задач
 Также автоматически генерирует AGENTS.md (контекст для ИИ-агентов) и project.yaml (конфигурация как код).
 """
@@ -53,18 +53,22 @@ def write_project_agents_md(
     proj_type: str = "service",
     runtime: str = "python",
     cmd: str = "",
+    secrets_list: list[str] | None = None,
+    env_keys: list[str] | None = None,
 ) -> Path:
     """Генерирует локальный файл AGENTS.md внутри директории проекта для ИИ-агентов (MCP / Claude Code / Cursor)."""
     wdir = Path(workdir)
     agents_file = wdir / "AGENTS.md"
-    content = f"""# AGENTS.md — Контекст проекта «{name}» (Beacon / Hub Control Panel)
+    sec_line = f"- **Привязанные секреты:** {', '.join(secrets_list) if secrets_list else 'нет'}\n" if secrets_list is not None else ""
+    env_line = f"- **Переменные окружения (ключи):** {', '.join(env_keys) if env_keys else 'нет'}\n" if env_keys is not None else ""
+    content = f"""# AGENTS.md — Контекст проекта «{name}» (Beacon Control Panel)
 
-Этот проект выполняется под управлением легковесного супервизора **Beacon (Hub Control Panel)** без Docker.
+Этот проект выполняется под управлением легковесного супервизора **Beacon Control Panel** без Docker.
 
 ## 1. Среда выполнения и изоляция
 - **Тип проекта:** `{proj_type}` (`service` — демон 24/7, `web` — HTTP/API сервер с `$PORT`, `job` — задача по расписанию/вручную).
 - **Рантайм:** `{runtime}` (рабочая директория: `{wdir}`, команда: `{cmd or 'main.py'}`).
-- **Изолированные каталоги:** `TMPDIR={wdir}/.tmp`, `HOME={wdir}/.home`, виртуальное окружение Python: `.venv/bin/python`.
+{sec_line}{env_line}- **Изолированные каталоги:** `TMPDIR={wdir}/.tmp`, `HOME={wdir}/.home`, виртуальное окружение Python: `.venv/bin/python`.
 - **Логирование:** весь вывод `stdout` и `stderr` пишется напрямую в файловый дескриптор лога (`buffering=0`, без `subprocess.PIPE`). Всегда используйте `flush=True` в `print()`.
 
 ## 2. Встроенный SDK (`import beacon` или `import hub`)
@@ -140,7 +144,7 @@ def sync_project_yaml(workdir_or_meta: Path | str | dict[str, Any], meta: dict[s
             secrets_list = []
 
     lines = [
-        "# Декларативная конфигурация проекта Beacon / Hub (project.yaml)",
+        "# Декларативная конфигурация проекта Beacon (project.yaml)",
         f"name: {name}",
         f"type: {proj_type}",
         f"runtime: {runtime}",
@@ -207,19 +211,19 @@ def create_project_from_template(name: str, template: str, runtime: str, proj_ty
         (workdir / "bot.py").write_text(
             f"""import os
 import time
-import aruta
+import beacon
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "не_задан_токен_бота_проекта")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "не_задан_chat_id")
 PROXY_URL = os.environ.get("HTTP_PROXY", "")
 
 print(f"[{name}] Старт Telegram-бота проекта. Прокси={{PROXY_URL or 'прямое соединение'}}", flush=True)
-aruta.notify(f"Бот проекта {name} запущен", level="info")
+beacon.notify(f"Бот проекта {name} запущен", level="info")
 
-cycle = int(aruta.state.get("cycle", 0) or 0)
+cycle = int(beacon.state.get("cycle", 0) or 0)
 while True:
     cycle += 1
-    aruta.state.set("cycle", cycle)
+    beacon.state.set("cycle", cycle)
     print(f"[{name}] Ожидание событий Telegram Bot API... цикл #{{cycle}}", flush=True)
     time.sleep(2.0)
 """,
@@ -235,22 +239,22 @@ while True:
         (workdir / "main.py").write_text(
             f"""import os
 import time
-import aruta
+import beacon
 
 COOKIE_SECRET = "{cookie_secret_name}"
 print(f"[{name}] Чтение индивидуальных куки проекта '{{COOKIE_SECRET}}'...", flush=True)
 
 try:
-    cookies = aruta.secret(COOKIE_SECRET)
+    cookies = beacon.secret(COOKIE_SECRET)
     print(f"[{name}] Загружено куки: {{len(cookies)}} шт.", flush=True)
 except Exception as err:
     print(f"[{name}] Куки ещё не загружены ({{err}}). Отправляем сигнал cookies_expired()...", flush=True)
-    aruta.cookies_expired(COOKIE_SECRET, note="Загрузите свежие куки во вкладке проекта")
+    beacon.cookies_expired(COOKIE_SECRET, note="Загрузите свежие куки во вкладке проекта")
     raise SystemExit(1)
 
-last_id = aruta.state.get("last_item_id", 0)
-print(f"[{name}] Последний обработанный ID из aruta.state: {{last_id}}", flush=True)
-aruta.state.set("last_item_id", int(last_id) + 1)
+last_id = beacon.state.get("last_item_id", 0)
+print(f"[{name}] Последний обработанный ID из beacon.state: {{last_id}}", flush=True)
+beacon.state.set("last_item_id", int(last_id) + 1)
 """,
             encoding="utf-8",
         )
@@ -259,11 +263,11 @@ aruta.state.set("last_item_id", int(last_id) + 1)
     elif template == "node" or runtime == "node":
         default_cmd = "node index.js"
         (workdir / "index.js").write_text(
-            """const aruta = require('aruta');
+            """const beacon = require('beacon');
 
 async function main() {
   console.log('[node-worker] Старт процесса PID=' + process.pid + ' PORT=' + (process.env.PORT || 'none'));
-  await aruta.notify('Node.js проект успешно запущен', 'info');
+  await beacon.notify('Node.js проект успешно запущен', 'info');
   setInterval(() => {
     console.log('[node-worker] Heartbeat ' + new Date().toISOString());
   }, 2000);
@@ -321,7 +325,7 @@ echo "[bash-runner] Успешное завершение."
             code = f"""import json
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import aruta
+import beacon
 
 PORT = int(os.environ.get("PORT", "8080") or 8080)
 
@@ -333,8 +337,8 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({{"ok": True, "service": "{name}", "port": PORT}}).encode("utf-8"))
             return
-        hits = int(aruta.state.get("hits", 0) or 0) + 1
-        aruta.state.set("hits", hits)
+        hits = int(beacon.state.get("hits", 0) or 0) + 1
+        beacon.state.set("hits", hits)
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -349,7 +353,7 @@ HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
         elif proj_type == "service":
             code = f"""import os
 import time
-import aruta
+import beacon
 
 print(f"[{name}] Постоянный сервис запущен (PID={{os.getpid()}}, TMPDIR={{os.environ.get('TMPDIR')}})", flush=True)
 while True:
@@ -359,13 +363,13 @@ while True:
         else:
             code = f"""import os
 import time
-import aruta
+import beacon
 
 print(f"[{name}] Запуск задачи (PID={{os.getpid()}})", flush=True)
-runs_cnt = int(aruta.state.get("runs_count", 0) or 0) + 1
-aruta.state.set("runs_count", runs_cnt)
+runs_cnt = int(beacon.state.get("runs_count", 0) or 0) + 1
+beacon.state.set("runs_count", runs_cnt)
 time.sleep(1.0)
-aruta.notify(f"Задача {name} выполнена (#{{runs_cnt}})!", level="info")
+beacon.notify(f"Задача {name} выполнена (#{{runs_cnt}})!", level="info")
 print(f"[{name}] Выполнение #{{runs_cnt}} завершено.", flush=True)
 """
         (workdir / "main.py").write_text(code, encoding="utf-8")

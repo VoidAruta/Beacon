@@ -11,6 +11,7 @@
 
 import asyncio
 import fcntl
+import ipaddress
 import json
 import os
 import pwd
@@ -21,6 +22,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -28,14 +30,26 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Optional
 
-from hub.auth import get_internal_token
 from hub.compat import psutil
-from hub.config import FORBIDDEN_PORTS, LOGS_DIR, SDK_NODE_DIR, SDK_PYTHON_DIR, parse_reserved_ports
-from hub.db import execute_sql, get_all_settings, query_all, query_one
+from hub.config import FORBIDDEN_PORTS, LOGS_DIR, SDK_NODE_DIR, SDK_PYTHON_DIR, get_runtime_port, parse_reserved_ports
+from hub.db import execute_sql, get_all_settings, get_setting, query_all, query_one
 from hub.disk_guard import can_start_new_run
 from hub.env_detect import get_environment_profile
+from hub.log import get_logger
 from hub.notifier import send_notification
 from hub.secrets_mgr import get_secret_raw, redact_log_text
+
+logger = get_logger("process_mgr")
+
+_LAUNCHER_PATH = Path(__file__).resolve().parent / "launcher.py"
+
+_WATCH_LOOP_STATUS: dict[str, Any] = {
+    "last_tick_at": 0.0,
+    "ticks": 0,
+    "error_count": 0,
+    "last_error": "",
+    "last_error_at": 0.0,
+}
 
 # Активные отслеживаемые запуски в памяти:
 # run_id -> {
@@ -51,11 +65,17 @@ _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # Коллбэк в планировщик при завершении процесса
 _ON_FINISH_CALLBACK: Optional[Callable[[dict[str, Any], int, str, str], Coroutine[Any, Any, None]]] = None
+_ON_HEALTHCHECK_FAIL_CALLBACK: Optional[Callable[[dict[str, Any], str, str], Coroutine[Any, Any, None]]] = None
 
 
 def set_on_finish_callback(cb: Callable[[dict[str, Any], int, str, str], Coroutine[Any, Any, None]]) -> None:
     global _ON_FINISH_CALLBACK
     _ON_FINISH_CALLBACK = cb
+
+
+def set_on_healthcheck_fail_callback(cb: Callable[[dict[str, Any], str, str], Coroutine[Any, Any, None]]) -> None:
+    global _ON_HEALTHCHECK_FAIL_CALLBACK
+    _ON_HEALTHCHECK_FAIL_CALLBACK = cb
 
 
 def _reap_zombies() -> None:
@@ -71,8 +91,8 @@ def _reap_zombies() -> None:
                 rc = popen_obj.poll()
                 if rc is not None:
                     info["reaped_exit_code"] = int(rc)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Ошибка poll() при сборе зомби (PID=%s): %s", info.get("pid"), exc)
 
     while True:
         try:
@@ -81,7 +101,8 @@ def _reap_zombies() -> None:
                 break
             try:
                 code = os.waitstatus_to_exitcode(wstatus)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Не удалось декодировать waitstatus=%s: %s", wstatus, exc)
                 code = 0
             for info in list(ACTIVE_RUNS.values()):
                 if info.get("pid") == wpid and info.get("reaped_exit_code") is None:
@@ -104,9 +125,76 @@ def _get_pgid_processes(pgid: int) -> list[Any]:
     return procs
 
 
+def _has_other_active_runs(project_id: int, exclude_run_id: Optional[int] = None) -> bool:
+    """Проверяет, есть ли у проекта другие активные запуски в памяти или БД."""
+    for rid, info in list(ACTIVE_RUNS.items()):
+        if int(info.get("project_id") or 0) == int(project_id) and int(rid) != int(exclude_run_id or -1):
+            return True
+    row = query_one(
+        "SELECT id FROM runs WHERE project_id = ? AND status IN ('running', 'waiting_input') AND id != ? LIMIT 1",
+        (int(project_id), int(exclude_run_id or -1)),
+    )
+    return row is not None
+
+
+def _kill_pids_gracefully(pids: list[int]) -> int:
+    if not pids:
+        return 0
+    for opid in pids:
+        try:
+            os.kill(opid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    time.sleep(0.15)
+    for opid in pids:
+        try:
+            os.kill(opid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    _reap_zombies()
+    return len(pids)
+
+
+def kill_orphan_processes_by_run_id(
+    run_id: int,
+    project_id: Optional[int] = None,
+    exclude_pids: Optional[set[int]] = None,
+) -> int:
+    """
+    Находит и завершает осиротевшие процессы только конкретного запуска (_BEACON_RUN_ID / _HUB_RUN_ID),
+    не затрагивая параллельно работающие сервисы того же проекта (P0-3).
+    """
+    target_run = str(run_id)
+    target_proj = str(project_id) if project_id is not None else None
+    my_pid = os.getpid()
+    excluded = (exclude_pids or set()) | {my_pid}
+    orphan_pids: list[int] = []
+
+    for p in psutil.process_iter():
+        try:
+            if p.pid in excluded or not p.is_running() or p.status() == "zombie":
+                continue
+            env = p.environ()
+            if not env:
+                continue
+            env_run = env.get("_BEACON_RUN_ID") or env.get("_ARUTA_RUN_ID") or env.get("_HUB_RUN_ID")
+            if env_run != target_run:
+                continue
+            if target_proj is not None:
+                env_proj = env.get("_BEACON_PROJECT_ID") or env.get("_ARUTA_PROJECT_ID") or env.get("_HUB_PROJECT_ID")
+                if env_proj and env_proj != target_proj:
+                    continue
+            orphan_pids.append(p.pid)
+        except (ProcessLookupError, PermissionError, psutil.NoSuchProcess, psutil.AccessDenied, Exception):
+            continue
+
+    return _kill_pids_gracefully(orphan_pids)
+
+
 def kill_orphan_processes_by_project_id(project_id: int, exclude_pids: Optional[set[int]] = None) -> int:
     """
-    Сканирует /proc/*/environ через psutil и находит процессы-сироты с меткой _HUB_PROJECT_ID=<project_id>,
+    Сканирует /proc/*/environ через psutil и находит процессы-сироты с меткой проекта,
     которые могли сменить группу через собственный os.setsid(), и принудительно завершает их.
     """
     target_val = str(project_id)
@@ -119,27 +207,15 @@ def kill_orphan_processes_by_project_id(project_id: int, exclude_pids: Optional[
             if p.pid in excluded or not p.is_running() or p.status() == "zombie":
                 continue
             env = p.environ()
-            if env and env.get("_HUB_PROJECT_ID") == target_val:
+            if not env:
+                continue
+            env_proj = env.get("_BEACON_PROJECT_ID") or env.get("_ARUTA_PROJECT_ID") or env.get("_HUB_PROJECT_ID")
+            if env_proj == target_val:
                 orphan_pids.append(p.pid)
         except (ProcessLookupError, PermissionError, psutil.NoSuchProcess, psutil.AccessDenied, Exception):
             continue
 
-    for opid in orphan_pids:
-        try:
-            os.kill(opid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-
-    if orphan_pids:
-        time.sleep(0.15)
-        for opid in orphan_pids:
-            try:
-                os.kill(opid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-        _reap_zombies()
-
-    return len(orphan_pids)
+    return _kill_pids_gracefully(orphan_pids)
 
 
 def cleanup_project_tmp_dir(workdir: str | Path) -> int:
@@ -163,6 +239,23 @@ def cleanup_project_tmp_dir(workdir: str | Path) -> int:
     return removed
 
 
+def _exit_file_for_log(log_path: str | Path, run_id: int) -> Path:
+    lp = Path(log_path)
+    return lp.with_name(f"{run_id}.exit")
+
+
+def _read_exit_code_file(exit_path: Optional[Path]) -> Optional[int]:
+    if not exit_path or not exit_path.exists():
+        return None
+    try:
+        raw = exit_path.read_text(encoding="utf-8", errors="ignore").strip()
+        if not raw:
+            return None
+        return int(raw.splitlines()[0].strip())
+    except (OSError, ValueError):
+        return None
+
+
 def is_tcp_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
     """Проверяет, занят ли TCP-порт локальным процессом."""
     if port <= 0:
@@ -172,10 +265,46 @@ def is_tcp_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
         return s.connect_ex((host, int(port))) == 0
 
 
-def check_endpoint_health(healthcheck_url: str, fallback_port: int = 0, timeout: float = 2.5) -> tuple[bool, str]:
+def _is_loopback_or_self_host(host: str) -> bool:
+    """Проверяет, что хост healthcheck указывает на loopback или собственный локальный адрес панели (P2-11)."""
+    clean = (host or "").strip().strip("[]").lower()
+    if not clean:
+        return True
+    if clean in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        return True
+    try:
+        ip_obj = ipaddress.ip_address(clean)
+        return ip_obj.is_loopback
+    except ValueError:
+        pass
+    try:
+        local_name = socket.gethostname().lower()
+        if clean == local_name:
+            return True
+        infos = socket.getaddrinfo(clean, None)
+        if not infos:
+            return False
+        for fam, _, _, _, sockaddr in infos:
+            addr = sockaddr[0].split("%", 1)[0]
+            try:
+                if not ipaddress.ip_address(addr).is_loopback:
+                    return False
+            except ValueError:
+                return False
+        return True
+    except OSError:
+        return False
+
+
+def check_endpoint_health(
+    healthcheck_url: str,
+    fallback_port: int = 0,
+    timeout: float = 2.5,
+    allow_external: Optional[bool] = None,
+) -> tuple[bool, str]:
     """
-    Проверяет доступность сервиса по HTTP/HTTPS (ожидается код 200..399) или TCP (tcp://host:port).
-    Если healthcheck_url пуст, но задан fallback_port > 0, проверяет TCP-соединение с 127.0.0.1:<fallback_port>.
+    Проверяет доступность сервиса по HTTP/HTTPS (код 200..399) или TCP (tcp://host:port).
+    По умолчанию разрешены только loopback / собственный хост (SSRF-защита, P2-11).
     """
     url = (healthcheck_url or "").strip()
     if not url and fallback_port > 0:
@@ -183,22 +312,36 @@ def check_endpoint_health(healthcheck_url: str, fallback_port: int = 0, timeout:
     if not url:
         return True, "not_configured"
 
+    if allow_external is None:
+        allow_external = get_setting("healthcheck_allow_external", "0") == "1"
+
     if url.startswith("tcp://"):
         parsed = urllib.parse.urlparse(url)
         host = parsed.hostname or "127.0.0.1"
+        if not allow_external and not _is_loopback_or_self_host(host):
+            return False, "blocked_external_healthcheck_host"
         port = parsed.port or fallback_port
         if not port:
             return False, "invalid_tcp_port"
         try:
             with socket.create_connection((host, int(port)), timeout=timeout):
                 return True, f"TCP {host}:{port} OK"
-        except OSError as e:
-            return False, f"TCP {host}:{port} failed: {e}"
+        except TimeoutError:
+            return False, f"TCP {host}:{port} timeout"
+        except OSError:
+            return False, f"TCP {host}:{port} failed"
 
     if not url.startswith(("http://", "https://")):
+        if "://" in url:
+            return False, "unsupported_healthcheck_scheme"
         url = f"http://{url}"
 
-    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "Hub-Healthcheck/2.0"})
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or ""
+    if not host or (not allow_external and not _is_loopback_or_self_host(host)):
+        return False, "blocked_external_healthcheck_host"
+
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "Beacon-Healthcheck/2.2"})
     try:
         with _NO_PROXY_OPENER.open(req, timeout=timeout) as resp:
             code = getattr(resp, "status", 200)
@@ -207,27 +350,32 @@ def check_endpoint_health(healthcheck_url: str, fallback_port: int = 0, timeout:
             return False, f"HTTP {code}"
     except urllib.error.HTTPError as e:
         return False, f"HTTP {e.code}"
-    except Exception as e:
-        return False, str(e)
+    except TimeoutError:
+        return False, "healthcheck_timeout"
+    except Exception:
+        return False, "healthcheck_connection_failed"
 
 
-def build_install_deps_command(workdir: Path, runtime: str) -> str:
+def build_install_deps_command(workdir: Path, runtime: str) -> list[str]:
     """
-    Формирует команду изолированной установки зависимостей проекта:
-    - Для Node.js: npm install --no-audit --no-fund
-    - Для Python:
-      1) Если установлен `uv` (shutil.which("uv")), использует `uv venv .venv` и `uv pip install --python .venv/bin/python -r requirements.txt` (с кэшем хардлинков).
-      2) Если `uv` нет — создаёт полноценный `python3 -m venv .venv` (с fallback на `--without-pip` + `ensurepip` или установкой через системный `pip3 --python .venv/bin/python` / `--prefix .venv`), чтобы пакеты ставились строго внутрь `.venv` проекта.
+    Формирует argv-команду изолированной установки зависимостей проекта (P1-10):
+    - Для Node.js: npm ci (если есть package-lock.json) или npm install без маскировки кода ошибки (без || echo).
+    - Для Python: uv venv / python3 -m venv .venv + установка из requirements.txt.
     """
-    if runtime == "node" or (workdir / "package.json").exists() and not (workdir / "requirements.txt").exists():
-        return (
-            "/bin/bash -c '"
-            'echo "[deps] Установка npm-пакетов в локальный node_modules..."; '
-            "npm install --no-audit --no-fund 2>&1 || echo \"[deps] Завершено\"'"
+    if runtime == "node" or ((workdir / "package.json").exists() and not (workdir / "requirements.txt").exists()):
+        npm_subcmd = (
+            "npm ci --no-audit --no-fund 2>&1"
+            if (workdir / "package-lock.json").exists() or (workdir / "npm-shrinkwrap.json").exists()
+            else "npm install --no-audit --no-fund 2>&1"
         )
+        script = (
+            "set -e; "
+            'echo "[deps] Установка npm-пакетов в локальный node_modules..."; '
+            f"{npm_subcmd}"
+        )
+        return ["/bin/bash", "-c", script]
 
-    return (
-        "/bin/bash -c '"
+    script = (
         "set -e; "
         "if command -v uv >/dev/null 2>&1; then "
         '  echo "[deps] Обнаружен пакетный менеджер uv — создаём изолированное окружение .venv..."; '
@@ -255,8 +403,9 @@ def build_install_deps_command(workdir: Path, runtime: str) -> str:
         "    fi; "
         "  fi; "
         "fi; "
-        'echo "[deps] Окружение .venv готово ($(.venv/bin/python --version 2>&1 || python3 --version))."\''
+        'echo "[deps] Окружение .venv готово ($(.venv/bin/python --version 2>&1 || python3 --version))."'
     )
+    return ["/bin/bash", "-c", script]
 
 
 def collect_all_pgid_metrics(target_pgids: set[int]) -> dict[int, tuple[float, float, int]]:
@@ -348,11 +497,16 @@ def read_log_tail_bytes(log_path: str | Path, max_bytes: int = 131072, max_lines
             lines = lines[-max_lines:]
         return redact_log_text("\n".join(lines))
     except Exception:
+        logger.exception("Ошибка чтения хвоста лога %s", path)
         return ""
 
 
 def _read_log_tail(log_path: str, max_lines: int = 15) -> str:
     return read_log_tail_bytes(log_path, max_bytes=8192, max_lines=max_lines)
+
+
+_SHELL_META_RE_CHARS = ("&&", "||", "|", ";", ">", "<", "$(", "`")
+_NODE_DIRECT_BINS = frozenset({"npm", "npx", "pnpm", "yarn", "bun", "tsx", "ts-node", "pm2", "next", "vite", "nuxt"})
 
 
 def _build_command_args(project: dict[str, Any], custom_cmd: Optional[str] = None) -> list[str]:
@@ -363,31 +517,102 @@ def _build_command_args(project: dict[str, Any], custom_cmd: Optional[str] = Non
     if not cmd_str:
         raise ValueError("Пустая команда запуска проекта")
 
+    bash_bin = "/bin/bash" if os.path.exists("/bin/bash") else (shutil.which("bash") or "bash")
+
+    if runtime == "bash":
+        parts = shlex.split(cmd_str)
+        if not parts:
+            raise ValueError("Не удалось разобрать команду запуска")
+        if parts[0] in ("bash", "sh", "/bin/bash", "/bin/sh") and not any(tok in cmd_str for tok in _SHELL_META_RE_CHARS):
+            parts[0] = bash_bin
+            return parts
+        return [bash_bin, "-c", cmd_str]
+
+    proj_port = int(project.get("port") or 0)
+
+    # Если команда содержит пайплайны или составные операторы (например: alembic upgrade head && uvicorn ...)
+    if any(tok in cmd_str for tok in _SHELL_META_RE_CHARS):
+        resolved_cmd = (
+            cmd_str.replace("${PORT}", str(proj_port)).replace("$PORT", str(proj_port))
+            if proj_port > 0
+            else cmd_str
+        )
+        return [bash_bin, "-c", resolved_cmd]
+
     parts = shlex.split(cmd_str)
     if not parts:
         raise ValueError("Не удалось разобрать команду запуска")
 
+    # Подстановка $PORT / ${PORT} в аргументы прямого запуска, если порт задан у проекта
+    if proj_port > 0:
+        port_str = str(proj_port)
+        parts = [p.replace("${PORT}", port_str).replace("$PORT", port_str) for p in parts]
+
+    first_bin = parts[0]
+
     if runtime == "python":
-        venv_py = workdir / ".venv" / "bin" / "python"
+        venv_bin_dir = workdir / ".venv" / "bin"
+        venv_py = venv_bin_dir / "python"
         py_bin = str(venv_py) if venv_py.exists() else (shutil.which("python3") or "python3")
-        if parts[0] in ("python", "python3", ".venv/bin/python"):
+        if first_bin in ("python", "python3", ".venv/bin/python", ".venv/bin/python3"):
             parts[0] = py_bin
-        elif not parts[0].endswith("python") and not parts[0].endswith("python3") and not os.path.isabs(parts[0]):
-            parts = [py_bin] + parts
+        elif os.path.isabs(first_bin) or first_bin.startswith("./"):
+            pass
+        else:
+            # Проверяем CLI-инструменты внутри .venv/bin (uvicorn, gunicorn, celery, rq, streamlit, pytest и т.д.)
+            venv_tool = venv_bin_dir / first_bin
+            if venv_tool.is_file():
+                parts[0] = str(venv_tool)
+            elif first_bin.endswith(".py"):
+                parts = [py_bin] + parts
+            else:
+                sys_tool = shutil.which(first_bin)
+                if sys_tool and not first_bin.endswith(("python", "python3")):
+                    parts[0] = sys_tool
+                elif not first_bin.endswith(("python", "python3")):
+                    parts = [py_bin] + parts
     elif runtime == "node":
         node_bin = shutil.which("node") or "node"
-        if parts[0] == "node":
+        local_node_tool = workdir / "node_modules" / ".bin" / first_bin
+        if first_bin == "node":
             parts[0] = node_bin
-        elif not parts[0].endswith("node") and not os.path.isabs(parts[0]):
-            parts = [node_bin] + parts
-    elif runtime == "bash":
-        bash_bin = "/bin/bash" if os.path.exists("/bin/bash") else (shutil.which("bash") or "bash")
-        if parts[0] in ("bash", "sh", "/bin/bash", "/bin/sh"):
-            parts[0] = bash_bin
-        else:
-            parts = [bash_bin, "-c", cmd_str]
+        elif local_node_tool.exists() and os.access(local_node_tool, os.X_OK):
+            parts[0] = str(local_node_tool)
+        elif first_bin in _NODE_DIRECT_BINS:
+            resolved_mgr = shutil.which(first_bin)
+            if resolved_mgr:
+                parts[0] = resolved_mgr
+        elif not first_bin.endswith("node") and not os.path.isabs(first_bin) and not first_bin.startswith("./"):
+            sys_tool = shutil.which(first_bin)
+            if sys_tool and not first_bin.endswith((".js", ".mjs", ".cjs", ".ts")):
+                parts[0] = sys_tool
+            else:
+                parts = [node_bin] + parts
 
     return parts
+
+
+_RESERVED_PARAM_EXACT = frozenset(
+    {"PATH", "ENV", "SHELLOPTS", "PS4", "PORT", "HOME", "TMPDIR", "TEMP", "TMP", "VIRTUAL_ENV", "IFS"}
+)
+_RESERVED_PARAM_PREFIXES = ("LD_", "PYTHON", "NODE_", "BASH_", "GIT_", "BEACON", "ARUTA_", "HUB", "XDG_")
+_RESERVED_PARAM_SUBSTRS = ("PROXY",)
+
+
+def is_reserved_param_name(name: str) -> bool:
+    clean = (name or "").strip().upper()
+    if not clean:
+        return True
+    if clean in _RESERVED_PARAM_EXACT:
+        return True
+    if any(clean.startswith(pref) for pref in _RESERVED_PARAM_PREFIXES):
+        return True
+    if any(sub in clean for sub in _RESERVED_PARAM_SUBSTRS):
+        return True
+    return False
+
+
+_SAFE_CHILD_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "SSL_CERT_FILE", "SSL_CERT_DIR")
 
 
 def _build_process_env(
@@ -395,8 +620,19 @@ def _build_process_env(
     run_token: str,
     settings: dict[str, str],
     run_id: Optional[int] = None,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> dict[str, str]:
-    env = dict(os.environ)
+    # Собираем окружение ребёнка ТОЛЬКО из безопасного белого списка, никогда не копируя весь os.environ (P0-4)
+    env: dict[str, str] = {}
+    for k in _SAFE_CHILD_ENV_KEYS:
+        val = os.environ.get(k)
+        if val is not None:
+            env[k] = val
+    if extra_env and isinstance(extra_env, dict):
+        for ek, ev in extra_env.items():
+            key_str = str(ek).strip()
+            if key_str.startswith("PARAM_") or not is_reserved_param_name(key_str):
+                env[key_str] = str(ev)
     workdir = Path(project.get("workdir", "")).resolve()
 
     # 1. Изоляция ФС проекта: собственные каталоги .tmp, .home и .home/.cache
@@ -450,20 +686,19 @@ def _build_process_env(
             for k, v in proj_env.items():
                 env[str(k)] = str(v)
     except Exception:
-        pass
+        logger.exception("Некорректный env_json у проекта id=%s", project.get("id"))
 
-    hub_port = settings.get("port", "8050")
+    hub_port = str(get_runtime_port() or settings.get("port", "8050") or "8050")
     internal_url = f"http://127.0.0.1:{hub_port}/internal"
-    internal_tok = get_internal_token()
     env["BEACON_API_URL"] = internal_url
     env["ARUTA_API_URL"] = internal_url
     env["HUB_API_URL"] = internal_url
     env["BEACON_RUN_TOKEN"] = run_token
     env["ARUTA_RUN_TOKEN"] = run_token
     env["HUB_RUN_TOKEN"] = run_token
-    env["BEACON_INTERNAL_TOKEN"] = internal_tok
-    env["ARUTA_INTERNAL_TOKEN"] = internal_tok
-    env["HUB_INTERNAL_TOKEN"] = internal_tok
+    ping_tok = str(project.get("ping_token") or "").strip()
+    if ping_tok:
+        env["BEACON_PING_TOKEN"] = ping_tok
 
     # Подключение SDK через PYTHONPATH и NODE_PATH
     existing_py = env.get("PYTHONPATH", "")
@@ -489,23 +724,26 @@ def _build_process_env(
             for sec_name in sec_names:
                 sec = get_secret_raw(str(sec_name))
                 if sec:
+                    sec_type = str(sec.get("type") or "text")
                     env[f"BEACON_SECRET_FILE_{sec['name']}"] = str(sec["file_path"])
                     env[f"ARUTA_SECRET_FILE_{sec['name']}"] = str(sec["file_path"])
                     env[f"HUB_SECRET_FILE_{sec['name']}"] = str(sec["file_path"])
+                    env[f"BEACON_SECRET_TYPE_{sec['name']}"] = sec_type
+                    env[f"ARUTA_SECRET_TYPE_{sec['name']}"] = sec_type
+                    env[f"HUB_SECRET_TYPE_{sec['name']}"] = sec_type
     except Exception:
-        pass
+        logger.exception("Ошибка подготовки секретов для проекта id=%s", project.get("id"))
 
     return env
 
 
-def _make_preexec_fn(run_as_user: str) -> Callable[[], None]:
+def _make_preexec_fn(run_as_user: str, drop_privileges: bool = True) -> Callable[[], None]:
     """
     Создаёт функцию preexec_fn для дочернего процесса:
     1. os.setsid() -> лидер новой группы процессов (PGID = PID).
     2. resource.setrlimit: ТОЛЬКО RLIMIT_CORE=(0,0) и RLIMIT_NOFILE=(4096,4096). (БЕЗ RLIMIT_AS!)
-    3. Сброс привилегий (run_as_user != 'root'): НЕ проваливается молча!
-       При любой ошибке поиска пользователя или setgroups/setgid/setuid пишет причину в лог (fd 2)
-       и завершает дочерний процесс с кодом 126 (os._exit(126)).
+    3. Сброс привилегий (run_as_user != 'root' и drop_privileges=True):
+       если привилегии сбрасывает systemd-run (--uid/--gid), preexec не сбрасывает uid раньше exec (P1-8).
     """
     user_clean = (run_as_user or "root").strip() or "root"
     target_uid: Optional[int] = None
@@ -513,7 +751,7 @@ def _make_preexec_fn(run_as_user: str) -> Callable[[], None]:
     lookup_error: Optional[str] = None
     is_android = bool(get_environment_profile().get("is_android_chroot"))
 
-    if user_clean != "root":
+    if drop_privileges and user_clean != "root":
         try:
             pw = pwd.getpwnam(user_clean)
             target_uid = pw.pw_uid
@@ -534,7 +772,7 @@ def _make_preexec_fn(run_as_user: str) -> Callable[[], None]:
         except Exception:
             pass
 
-        if user_clean != "root":
+        if drop_privileges and user_clean != "root":
             if lookup_error is not None or target_uid is None or target_gid is None:
                 msg = f"\n[Privilege Drop Fatal Error (exit 126)]: {lookup_error or 'UID/GID не определены'}\n"
                 try:
@@ -564,14 +802,109 @@ def _make_preexec_fn(run_as_user: str) -> Callable[[], None]:
     return _preexec
 
 
+_SYSTEMD_RUN_SCOPE_CAPABLE: Optional[bool] = None
+
+
+def check_systemd_run_scope_capable(systemd_run_bin: Optional[str] = None) -> tuple[bool, str]:
+    """Проверяет на хосте работу `systemd-run --scope --property=MemoryMax=64M` (P1-8)."""
+    bin_path = systemd_run_bin or shutil.which("systemd-run")
+    if not bin_path:
+        return False, "systemd-run не установлен"
+    if os.geteuid() != 0:
+        return False, "для создания cgroup scope требуются права root"
+    try:
+        res = subprocess.run(
+            [bin_path, "--scope", "-q", "--property=MemoryMax=64M", "--", "/bin/true"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if res.returncode == 0:
+            return True, "OK"
+        err = (res.stderr or res.stdout or f"exit {res.returncode}").strip()
+        return False, err[:160]
+    except Exception as exc:
+        return False, str(exc)[:160]
+
+
+def _can_use_systemd_run_scope(systemd_run_bin: str) -> bool:
+    global _SYSTEMD_RUN_SCOPE_CAPABLE
+    if _SYSTEMD_RUN_SCOPE_CAPABLE is None:
+        ok, _ = check_systemd_run_scope_capable(systemd_run_bin)
+        _SYSTEMD_RUN_SCOPE_CAPABLE = ok
+    return _SYSTEMD_RUN_SCOPE_CAPABLE
+
+
+def build_systemd_run_args(
+    systemd_run_bin: str,
+    ram_limit_mb: int,
+    run_as_user: str = "root",
+) -> tuple[list[str], bool]:
+    """Собирает корректные аргументы systemd-run --scope (--property=MemoryMax=..., --uid, --gid) (P1-8)."""
+    cmd = [systemd_run_bin, "--scope", "-q", f"--property=MemoryMax={int(ram_limit_mb)}M"]
+    user_clean = (run_as_user or "root").strip() or "root"
+    if user_clean != "root":
+        try:
+            pw = pwd.getpwnam(user_clean)
+            cmd.extend([f"--uid={pw.pw_uid}", f"--gid={pw.pw_gid}"])
+        except KeyError:
+            return [], False
+    return cmd, True
+
+
+def _prepare_workdir_ownership(workdir: Path, uid: int, gid: int, exit_path: Optional[Path] = None) -> None:
+    """
+    Меняет владельца workdir (lchown) только если владелец корня отличается от целевого uid/gid.
+    Строго пропускает символические ссылки и файлы с st_nlink > 1 (защита от hardlink-атаки, P2-18).
+    """
+    try:
+        root_st = os.lstat(str(workdir))
+        if root_st.st_uid != uid or root_st.st_gid != gid:
+            if not os.path.islink(str(workdir)):
+                os.lchown(str(workdir), uid, gid)
+            for dirpath, dirnames, filenames in os.walk(str(workdir), followlinks=False):
+                for dname in list(dirnames):
+                    dp = os.path.join(dirpath, dname)
+                    try:
+                        if os.path.islink(dp):
+                            continue
+                        st = os.lstat(dp)
+                        if st.st_uid != uid or st.st_gid != gid:
+                            os.lchown(dp, uid, gid)
+                    except OSError:
+                        pass
+                for fname in filenames:
+                    fp = os.path.join(dirpath, fname)
+                    try:
+                        st = os.lstat(fp)
+                        if os.path.islink(fp) or st.st_nlink > 1:
+                            continue
+                        if st.st_uid != uid or st.st_gid != gid:
+                            os.lchown(fp, uid, gid)
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+    if exit_path is not None:
+        try:
+            fd_exit = os.open(str(exit_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.close(fd_exit)
+            os.lchown(str(exit_path), uid, gid)
+        except OSError:
+            pass
+
+
 async def start_project_run(
     project_id: int,
     trigger: str = "manual",
     custom_cmd: Optional[str] = None,
     extra_env: Optional[dict[str, str]] = None,
+    custom_argv: Optional[list[str]] = None,
+    chain_depth: int = 0,
 ) -> dict[str, Any]:
     """
     Запускает проект (или команду установки зависимостей) с записью вывода напрямую в файловый дескриптор лога.
+    Все проверки, разбор команды и сборка окружения выполняются ДО INSERT INTO runs (P1-5).
     """
     allowed, reason = can_start_new_run()
     if not allowed:
@@ -581,29 +914,38 @@ async def start_project_run(
     if not project:
         raise ValueError(f"Проект id={project_id} не найден")
 
+    is_auxiliary = custom_cmd is not None or custom_argv is not None
+
     for r_id, info in list(ACTIVE_RUNS.items()):
-        if info["project_id"] == project_id and custom_cmd is None:
+        if info["project_id"] == project_id and not is_auxiliary:
             raise RuntimeError(f"Проект «{project['name']}» уже выполняется (run_id={r_id}, PID={info['pid']})")
 
     settings = get_all_settings()
     reserved_ports = parse_reserved_ports(settings.get("reserved_ports", "")) | FORBIDDEN_PORTS
     panel_port = int(settings.get("port", "8050") or 8050)
 
-    # Если у проекта задан сетевой порт (port > 0) и это штатный запуск (не install_deps):
+    # Проверка сетевого порта до создания записи запуска
     proj_port = int(project.get("port") or 0)
-    if proj_port > 0 and custom_cmd is None:
+    if proj_port > 0 and not is_auxiliary:
         if proj_port == panel_port or proj_port in reserved_ports:
             raise RuntimeError(
                 f"Порт {proj_port} зарезервирован настройками панели ({sorted(list(reserved_ports | {panel_port}))})"
             )
         if is_tcp_port_in_use(proj_port):
-            # Сначала пробуем зачистить возможные осиротевшие процессы этого же проекта
-            kill_orphan_processes_by_project_id(project_id)
+            if not _has_other_active_runs(project_id):
+                await asyncio.to_thread(kill_orphan_processes_by_project_id, project_id)
             if is_tcp_port_in_use(proj_port):
                 raise RuntimeError(f"Порт {proj_port} уже занят другим процессом в системе (авто-подмена порта запрещена)")
 
-    run_as_user = settings.get("run_as_user", "root").strip() or "root"
+    # Разбор команды и подготовка argv + окружения ДО INSERT INTO runs (P1-5)
+    if custom_argv is not None:
+        if not isinstance(custom_argv, list) or not custom_argv:
+            raise ValueError("Пустой список аргументов запуска")
+        cmd_args = [str(a) for a in custom_argv]
+    else:
+        cmd_args = _build_command_args(project, custom_cmd=custom_cmd)
 
+    run_as_user = settings.get("run_as_user", "root").strip() or "root"
     workdir = Path(project["workdir"])
     workdir.mkdir(parents=True, exist_ok=True)
     proj_log_dir = LOGS_DIR / project["name"]
@@ -612,169 +954,197 @@ async def start_project_run(
     now = int(time.time())
     run_token = secrets.token_hex(24)
 
+    # Предварительная сборка и валидация окружения до INSERT (extra_env применяется ДО служебных переменных, P1-1)
+    env = _build_process_env(project, run_token, settings, run_id=None, extra_env=extra_env)
+
+    prev_desired_state = str(project.get("desired_state") or "stopped")
+    prev_health_status = str(project.get("health_status") or "stopped")
+
     temp_log_path = str(proj_log_dir / f"pending_{now}.log")
     run_id = execute_sql(
         """INSERT INTO runs (
             project_id, status, trigger, pid, pgid, proc_create_time,
-            started_at, finished_at, exit_code, run_token, log_path, error_summary
-        ) VALUES (?, 'running', ?, NULL, NULL, NULL, ?, NULL, NULL, ?, ?, '')""",
-        (project_id, trigger, now, run_token, temp_log_path),
+            started_at, finished_at, exit_code, run_token, log_path, error_summary, is_auxiliary
+        ) VALUES (?, 'running', ?, NULL, NULL, NULL, ?, NULL, NULL, ?, ?, '', ?)""",
+        (project_id, trigger, now, run_token, temp_log_path, 1 if is_auxiliary else 0),
     )
 
     log_path = proj_log_dir / f"{run_id}.log"
-    execute_sql("UPDATE runs SET log_path = ? WHERE id = ?", (str(log_path), run_id))
-
-    if project["type"] in ("service", "web") and custom_cmd is None:
-        execute_sql(
-            "UPDATE projects SET desired_state = 'running', health_status = 'starting', updated_at = ? WHERE id = ?",
-            (now, project_id),
-        )
-
-    cmd_args = _build_command_args(project, custom_cmd=custom_cmd)
-    env_prof = get_environment_profile()
-    ram_limit_mb = int(project.get("ram_limit_mb") or 0)
-    if (
-        env_prof.get("env_mode") == "systemd_linux"
-        and env_prof.get("has_systemd_run")
-        and env_prof.get("has_cgroups_v2")
-        and ram_limit_mb > 0
-        and custom_cmd is None
-        and os.geteuid() == 0
-    ):
-        systemd_run_bin = shutil.which("systemd-run")
-        if systemd_run_bin:
-            cmd_args = [systemd_run_bin, "--scope", "-q", f"-p=MemoryMax={ram_limit_mb}M", "--"] + cmd_args
-
-    env = _build_process_env(project, run_token, settings, run_id=run_id)
-    if extra_env and isinstance(extra_env, dict):
-        for ek, ev in extra_env.items():
-            env[str(ek)] = str(ev)
-
-    if run_as_user and run_as_user != "root" and os.geteuid() == 0:
-        try:
-            pw = pwd.getpwnam(run_as_user)
-            subprocess.run(["chown", "-R", f"{pw.pw_uid}:{pw.pw_gid}", str(workdir)], check=False)
-        except KeyError:
-            pass
-
-    log_fd = open(log_path, "ab", buffering=0)
-    header_line = (
-        f"=== [Aruta/Hub Run #{run_id}] Started at {time.strftime('%Y-%m-%d %H:%M:%S')} | "
-        f"Trigger: {trigger} | Cmd: {' '.join(cmd_args)} ===\n"
-    ).encode("utf-8")
-    log_fd.write(header_line)
-
-    stdin_fifo_path = proj_log_dir / f"stdin_{run_id}.fifo"
+    exit_path = _exit_file_for_log(log_path, run_id)
+    log_fd = None
     stdin_r_fd: Optional[int] = None
     stdin_w_fd: Optional[int] = None
-    try:
-        if stdin_fifo_path.exists():
-            stdin_fifo_path.unlink()
-        os.mkfifo(stdin_fifo_path, 0o600)
-        stdin_r_fd = os.open(str(stdin_fifo_path), os.O_RDONLY | os.O_NONBLOCK)
-        stdin_w_fd = os.open(str(stdin_fifo_path), os.O_WRONLY | os.O_NONBLOCK)
-        r_flags = fcntl.fcntl(stdin_r_fd, fcntl.F_GETFL)
-        fcntl.fcntl(stdin_r_fd, fcntl.F_SETFL, r_flags & ~os.O_NONBLOCK)
-    except Exception:
-        if stdin_r_fd is not None:
-            try:
-                os.close(stdin_r_fd)
-            except OSError:
-                pass
-        if stdin_w_fd is not None:
-            try:
-                os.close(stdin_w_fd)
-            except OSError:
-                pass
-        stdin_r_fd = None
-        stdin_w_fd = None
+    stdin_fifo_path = proj_log_dir / f"stdin_{run_id}.fifo"
 
     try:
-        proc = subprocess.Popen(
-            cmd_args,
-            cwd=str(workdir),
-            env=env,
-            stdin=stdin_r_fd if stdin_r_fd is not None else subprocess.DEVNULL,
-            stdout=log_fd,
-            stderr=log_fd,
-            close_fds=True,
-            preexec_fn=_make_preexec_fn(run_as_user),
-        )
-    except Exception as e:
-        log_fd.write(f"\n[Hub Launch Error]: {e}\n".encode("utf-8"))
-        log_fd.close()
-        if stdin_r_fd is not None:
+        execute_sql("UPDATE runs SET log_path = ? WHERE id = ?", (str(log_path), run_id))
+
+        if project["type"] in ("service", "web") and not is_auxiliary:
+            execute_sql(
+                "UPDATE projects SET desired_state = 'running', health_status = 'starting', updated_at = ? WHERE id = ?",
+                (now, project_id),
+            )
+
+        # Прописываем идентификатор запуска для отлова сирот конкретно этого run_id
+        env["_BEACON_RUN_ID"] = str(run_id)
+        env["_ARUTA_RUN_ID"] = str(run_id)
+        env["_HUB_RUN_ID"] = str(run_id)
+
+        # Оборачиваем запуск в тонкий launcher, сохраняющий код возврата в <run_id>.exit (P1-6)
+        launch_args = [sys.executable, str(_LAUNCHER_PATH), str(exit_path), "--"] + cmd_args
+
+        env_prof = get_environment_profile()
+        ram_limit_mb = int(project.get("ram_limit_mb") or 0)
+        use_systemd_scope = False
+        if (
+            env_prof.get("env_mode") == "systemd_linux"
+            and env_prof.get("has_systemd_run")
+            and env_prof.get("has_cgroups_v2")
+            and ram_limit_mb > 0
+            and not is_auxiliary
+            and os.geteuid() == 0
+        ):
+            systemd_run_bin = shutil.which("systemd-run")
+            if systemd_run_bin and await asyncio.to_thread(_can_use_systemd_run_scope, systemd_run_bin):
+                sr_args, sr_ok = build_systemd_run_args(systemd_run_bin, ram_limit_mb, run_as_user)
+                if sr_ok and sr_args:
+                    launch_args = sr_args + ["--"] + launch_args
+                    use_systemd_scope = True
+
+        if run_as_user and run_as_user != "root" and os.geteuid() == 0:
             try:
-                os.close(stdin_r_fd)
-            except OSError:
+                pw = pwd.getpwnam(run_as_user)
+
+                await asyncio.to_thread(_prepare_workdir_ownership, workdir, pw.pw_uid, pw.pw_gid, exit_path)
+            except (KeyError, OSError):
                 pass
-        if stdin_w_fd is not None:
-            try:
-                os.close(stdin_w_fd)
-            except OSError:
-                pass
+
+        log_fd = open(log_path, "ab", buffering=0)
+        header_line = (
+            f"=== [Beacon Run #{run_id}] Started at {time.strftime('%Y-%m-%d %H:%M:%S')} | "
+            f"Trigger: {trigger} | Cmd: {' '.join(cmd_args)} ===\n"
+        ).encode("utf-8")
+        log_fd.write(header_line)
+
         try:
-            stdin_fifo_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+            if stdin_fifo_path.exists():
+                stdin_fifo_path.unlink()
+            os.mkfifo(stdin_fifo_path, 0o600)
+            stdin_r_fd = os.open(str(stdin_fifo_path), os.O_RDONLY | os.O_NONBLOCK)
+            stdin_w_fd = os.open(str(stdin_fifo_path), os.O_WRONLY | os.O_NONBLOCK)
+            r_flags = fcntl.fcntl(stdin_r_fd, fcntl.F_GETFL)
+            fcntl.fcntl(stdin_r_fd, fcntl.F_SETFL, r_flags & ~os.O_NONBLOCK)
+        except Exception as exc:
+            logger.warning("Не удалось создать stdin FIFO для run_id=%s: %s", run_id, exc)
+            if stdin_r_fd is not None:
+                try:
+                    os.close(stdin_r_fd)
+                except OSError:
+                    pass
+            if stdin_w_fd is not None:
+                try:
+                    os.close(stdin_w_fd)
+                except OSError:
+                    pass
+            stdin_r_fd = None
+            stdin_w_fd = None
+
+        try:
+            proc = subprocess.Popen(
+                launch_args,
+                cwd=str(workdir),
+                env=env,
+                stdin=stdin_r_fd if stdin_r_fd is not None else subprocess.DEVNULL,
+                stdout=log_fd,
+                stderr=log_fd,
+                close_fds=True,
+                preexec_fn=_make_preexec_fn(run_as_user, drop_privileges=not use_systemd_scope),
+            )
+        finally:
+            if log_fd is not None and not log_fd.closed:
+                log_fd.close()
+            if stdin_r_fd is not None:
+                try:
+                    os.close(stdin_r_fd)
+                except OSError:
+                    pass
+                stdin_r_fd = None
+
+        pid = proc.pid
+        try:
+            pgid = os.getpgid(pid)
+        except Exception:
+            pgid = pid
+
+        try:
+            p_info = psutil.Process(pid)
+            proc_create_time = float(p_info.create_time())
+        except Exception:
+            proc_create_time = time.time()
+
+        execute_sql(
+            "UPDATE runs SET pid = ?, pgid = ?, proc_create_time = ? WHERE id = ?",
+            (pid, pgid, proc_create_time, run_id),
+        )
+
+        ACTIVE_RUNS[run_id] = {
+            "run_id": run_id,
+            "project_id": project_id,
+            "project_name": project["name"],
+            "project_type": project["type"],
+            "pid": pid,
+            "pgid": pgid,
+            "proc_create_time": proc_create_time,
+            "started_at": now,
+            "log_path": str(log_path),
+            "exit_path": str(exit_path),
+            "stdin_fifo": str(stdin_fifo_path),
+            "stdin_keepalive_fd": stdin_w_fd,
+            "popen": proc,
+            "rss_mb": 0.0,
+            "cpu_percent": 0.0,
+            "is_deps_install": is_auxiliary,
+            "chain_depth": int(chain_depth),
+            "hc_failures": 0,
+            "last_hc_ts": float(now),
+        }
+
+        return query_one("SELECT * FROM runs WHERE id = ?", (run_id,)) or {"id": run_id, "pid": pid, "pgid": pgid}
+    except Exception as e:
+        if log_fd is not None:
+            try:
+                if not log_fd.closed:
+                    log_fd.write(f"\n[Beacon Launch Error]: {e}\n".encode("utf-8"))
+                    log_fd.close()
+            except OSError:
+                pass
+        for fd_item in (stdin_r_fd, stdin_w_fd):
+            if fd_item is not None:
+                try:
+                    os.close(fd_item)
+                except OSError:
+                    pass
+        for p_item in (stdin_fifo_path, exit_path):
+            try:
+                p_item.unlink(missing_ok=True)
+            except OSError:
+                pass
         execute_sql(
             "UPDATE runs SET status = 'failed', finished_at = ?, exit_code = -1, error_summary = ? WHERE id = ?",
-            (int(time.time()), str(e), run_id),
+            (int(time.time()), str(e)[:300], run_id),
         )
+        if project["type"] in ("service", "web") and not is_auxiliary:
+            execute_sql(
+                "UPDATE projects SET desired_state = ?, health_status = ?, updated_at = ? WHERE id = ?",
+                (prev_desired_state, prev_health_status, int(time.time()), project_id),
+            )
         raise
-    finally:
-        if not log_fd.closed:
-            log_fd.close()
-        if stdin_r_fd is not None:
-            try:
-                os.close(stdin_r_fd)
-            except OSError:
-                pass
-
-    pid = proc.pid
-    try:
-        pgid = os.getpgid(pid)
-    except Exception:
-        pgid = pid
-
-    try:
-        p_info = psutil.Process(pid)
-        proc_create_time = float(p_info.create_time())
-    except Exception:
-        proc_create_time = time.time()
-
-    execute_sql(
-        "UPDATE runs SET pid = ?, pgid = ?, proc_create_time = ? WHERE id = ?",
-        (pid, pgid, proc_create_time, run_id),
-    )
-
-    ACTIVE_RUNS[run_id] = {
-        "run_id": run_id,
-        "project_id": project_id,
-        "project_name": project["name"],
-        "project_type": project["type"],
-        "pid": pid,
-        "pgid": pgid,
-        "proc_create_time": proc_create_time,
-        "started_at": now,
-        "log_path": str(log_path),
-        "stdin_fifo": str(stdin_fifo_path),
-        "stdin_keepalive_fd": stdin_w_fd,
-        "popen": proc,
-        "rss_mb": 0.0,
-        "cpu_percent": 0.0,
-        "is_deps_install": custom_cmd is not None,
-        "hc_failures": 0,
-        "last_hc_ts": float(now),
-    }
-
-    return query_one("SELECT * FROM runs WHERE id = ?", (run_id,)) or {"id": run_id, "pid": pid, "pgid": pgid}
 
 
-def send_stdin_to_run(run_id: int, text: str) -> bool:
+def send_stdin_to_run(run_id: int, text: str, echo_to_log: bool = True) -> bool:
     """
-    Отправляет строку пользовательского ввода в stdin работающего процесса через именованный FIFO
-    и дублирует эхо команды в лог-файл запуска.
+    Отправляет строку пользовательского ввода в stdin работающего процесса через именованный FIFO.
+    Ответы на интерактивные запросы (waiting_input / echo_to_log=False) не дублируются в лог (P2-09).
     """
     row = query_one("SELECT r.*, p.name AS project_name FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.id = ?", (run_id,))
     if not row or row["status"] not in ("running", "waiting_input"):
@@ -786,8 +1156,12 @@ def send_stdin_to_run(run_id: int, text: str) -> bool:
     clean_line = text.rstrip("\r\n")
     try:
         if log_path.exists():
-            with open(log_path, "ab", buffering=0) as lf:
-                lf.write(f"[Ввод в консоль stdin >>>] {clean_line}\n".encode("utf-8"))
+            if not echo_to_log or row["status"] == "waiting_input":
+                with open(log_path, "ab", buffering=0) as lf:
+                    lf.write("[Ввод ответа на запрос stdin >>> (скрыто)]\n".encode("utf-8"))
+            else:
+                with open(log_path, "ab", buffering=0) as lf:
+                    lf.write(f"[Ввод в консоль stdin >>>] {clean_line}\n".encode("utf-8"))
     except OSError:
         pass
 
@@ -816,7 +1190,8 @@ def send_stdin_to_run(run_id: int, text: str) -> bool:
 
 async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str = "") -> bool:
     """
-    Останавливает дерево процессов по PGID + добивает сирот по _HUB_PROJECT_ID и очищает <workdir>/.tmp.
+    Останавливает дерево процессов по PGID + добивает сирот конкретного запуска (_BEACON_RUN_ID),
+    а .tmp чистит только если у проекта нет других активных запусков (P0-3).
     """
     row = query_one("SELECT * FROM runs WHERE id = ?", (run_id,))
     if not row:
@@ -824,7 +1199,7 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
 
     project_id = int(row["project_id"])
     proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
-    if proj and proj["type"] in ("service", "web") and final_status == "stopped":
+    if proj and proj["type"] in ("service", "web") and final_status == "stopped" and not _has_other_active_runs(project_id, exclude_run_id=run_id):
         execute_sql(
             "UPDATE projects SET desired_state = 'stopped', health_status = 'stopped', updated_at = ? WHERE id = ?",
             (int(time.time()), project_id),
@@ -874,17 +1249,22 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
                     popen_obj.poll()
                 _reap_zombies()
 
-    # Дополнительно отлавливаем осиротевшие процессы по метке _HUB_PROJECT_ID в /proc/*/environ
-    kill_orphan_processes_by_project_id(project_id)
-    if proj and proj.get("workdir"):
-        cleanup_project_tmp_dir(proj["workdir"])
+    # Убиваем сирот ТОЛЬКО этого запуска по _BEACON_RUN_ID / _HUB_RUN_ID (P0-3)
+    await asyncio.to_thread(kill_orphan_processes_by_run_id, run_id, project_id)
+    if proj and proj.get("workdir") and not _has_other_active_runs(project_id, exclude_run_id=run_id):
+        await asyncio.to_thread(cleanup_project_tmp_dir, proj["workdir"])
 
     now = int(time.time())
     log_path = row.get("log_path", "")
+    if log_path:
+        try:
+            _exit_file_for_log(log_path, run_id).unlink(missing_ok=True)
+        except OSError:
+            pass
     if log_path and os.path.exists(log_path):
         try:
             with open(log_path, "ab", buffering=0) as f:
-                msg = f"\n=== [Hub Run #{run_id}] Terminated ({final_status}) at {time.strftime('%Y-%m-%d %H:%M:%S')} {reason_note} ===\n"
+                msg = f"\n=== [Beacon Run #{run_id}] Terminated ({final_status}) at {time.strftime('%Y-%m-%d %H:%M:%S')} {reason_note} ===\n"
                 f.write(msg.encode("utf-8"))
         except OSError:
             pass
@@ -902,7 +1282,7 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
 
 
 async def stop_project(project_id: int) -> bool:
-    """Останавливает активный запуск проекта, убивает сирот по _HUB_PROJECT_ID и очищает .tmp."""
+    """Останавливает все активные запуски проекта, убивает сирот по _BEACON_PROJECT_ID и очищает .tmp."""
     now = int(time.time())
     execute_sql(
         "UPDATE projects SET desired_state = 'stopped', health_status = 'stopped', updated_at = ? WHERE id = ?",
@@ -915,20 +1295,19 @@ async def stop_project(project_id: int) -> bool:
     for r in active:
         await stop_run(r["id"], final_status="stopped", reason_note="Остановлено пользователем")
 
-    kill_orphan_processes_by_project_id(project_id)
-    proj = query_one("SELECT workdir FROM projects WHERE id = ?", (project_id,))
-    if proj and proj.get("workdir"):
-        cleanup_project_tmp_dir(proj["workdir"])
+    if not _has_other_active_runs(project_id):
+        await asyncio.to_thread(kill_orphan_processes_by_project_id, project_id)
+        proj = query_one("SELECT workdir FROM projects WHERE id = ?", (project_id,))
+        if proj and proj.get("workdir"):
+            await asyncio.to_thread(cleanup_project_tmp_dir, proj["workdir"])
     return True
 
 
 def recover_running_processes() -> dict[str, int]:
     """
-    КРИТИЧЕСКОЕ ПРАВИЛО #3 (Учёт ECHILD при рестарте панели):
-    При старте Hub выбирает из БД все runs со статусом 'running' или 'waiting_input'.
+    КРИТИЧЕСКОЕ ПРАВИЛО #3 (Учёт ECHILD при рестарте панели) + чтение <run_id>.exit (P1-6):
+    При старте Beacon выбирает из БД все runs со статусом 'running' или 'waiting_input'.
     Проверяет psutil.Process(pid) и abs(proc.create_time() - run.proc_create_time) < 0.5.
-    Если жив — добавляет в ACTIVE_RUNS в режиме psutil-пуллинга (popen=None, без waitpid!).
-    Если мёртв — зачищает возможные осиротевшие подпроцессы по _HUB_PROJECT_ID и переводит run в 'failed'.
     """
     rows = query_all(
         """SELECT r.*, p.name AS project_name, p.type AS project_type
@@ -940,12 +1319,11 @@ def recover_running_processes() -> dict[str, int]:
     marked_dead = 0
     now = int(time.time())
 
+    row_states: list[tuple[dict[str, Any], bool]] = []
+    live_project_ids: set[int] = set()
     for r in rows:
-        run_id = r["id"]
         pid = r.get("pid")
-        pgid = r.get("pgid") or pid
         expected_ctime = r.get("proc_create_time")
-
         is_alive = False
         if pid and expected_ctime is not None:
             try:
@@ -955,6 +1333,16 @@ def recover_running_processes() -> dict[str, int]:
                         is_alive = True
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 is_alive = False
+        row_states.append((r, is_alive))
+        if is_alive:
+            live_project_ids.add(int(r["project_id"]))
+
+    for r, is_alive in row_states:
+        run_id = int(r["id"])
+        pid = r.get("pid")
+        pgid = r.get("pgid") or pid
+        expected_ctime = r.get("proc_create_time")
+        exit_path = _exit_file_for_log(r["log_path"], run_id)
 
         if is_alive:
             fifo_path = LOGS_DIR / r["project_name"] / f"stdin_{run_id}.fifo"
@@ -974,25 +1362,41 @@ def recover_running_processes() -> dict[str, int]:
                 "proc_create_time": float(expected_ctime),
                 "started_at": int(r["started_at"]),
                 "log_path": r["log_path"],
+                "exit_path": str(exit_path),
                 "stdin_fifo": str(fifo_path),
                 "stdin_keepalive_fd": keep_fd,
                 "popen": None,
                 "rss_mb": 0.0,
                 "cpu_percent": 0.0,
-                "is_deps_install": False,
+                "is_deps_install": bool(r.get("is_auxiliary")),
                 "hc_failures": 0,
                 "last_hc_ts": float(now),
             }
             recovered += 1
         else:
             _cleanup_run_fifo(run_id, None, r["project_name"])
-            kill_orphan_processes_by_project_id(int(r["project_id"]))
+            kill_orphan_processes_by_run_id(run_id, int(r["project_id"]))
+            if int(r["project_id"]) not in live_project_ids:
+                kill_orphan_processes_by_project_id(int(r["project_id"]))
+            file_rc = _read_exit_code_file(exit_path)
+            try:
+                exit_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if file_rc is not None:
+                final_status = "success" if file_rc == 0 else "failed"
+                final_rc = file_rc
+                err_msg = "" if file_rc == 0 else f"Процесс завершился во время перезапуска Beacon (код {file_rc})"
+            else:
+                final_status = "failed"
+                final_rc = -1
+                err_msg = "Процесс завершился во время перезапуска Beacon (код возврата неизвестен)"
             execute_sql(
                 """UPDATE runs
-                   SET status = 'failed', exit_code = -1, finished_at = ?,
-                       error_summary = 'Процесс завершился во время перезапуска Hub'
+                   SET status = ?, exit_code = ?, finished_at = ?,
+                       error_summary = ?
                    WHERE id = ?""",
-                (now, run_id),
+                (final_status, final_rc, now, err_msg, run_id),
             )
             execute_sql(
                 "UPDATE pending_asks SET status = 'cancelled' WHERE run_id = ? AND status = 'pending'",
@@ -1007,7 +1411,7 @@ async def watch_processes_loop() -> None:
     """
     Фоновый сторож процессов (каждые 2 секунды):
     - Неблокирующе собирает осиротевших зомби (os.waitpid(-1, os.WNOHANG)).
-    - Проверяет завершение всех ACTIVE_RUNS.
+    - Проверяет завершение всех ACTIVE_RUNS и читает <run_id>.exit для восстановленных запусков (P1-6).
     - За ОДИН проход по psutil.process_iter() считает суммарный RSS и CPU% для всех активных PGID.
     - Проверяет HTTP/TCP Healthchecks для веб-бэкендов и сервисов (3 ошибки подряд -> рестарт).
     - При превышении project.ram_limit_mb убивает группу, ставит killed_oom и шлёт уведомление.
@@ -1019,163 +1423,209 @@ async def watch_processes_loop() -> None:
             now = int(time.time())
             now_f = time.time()
             target_pgids = {int(info["pgid"]) for info in ACTIVE_RUNS.values() if info.get("pgid")}
-            pgid_metrics_map = collect_all_pgid_metrics(target_pgids)
+            pgid_metrics_map = await asyncio.to_thread(collect_all_pgid_metrics, target_pgids) if target_pgids else {}
 
             for run_id, info in list(ACTIVE_RUNS.items()):
-                pid = info["pid"]
-                pgid = info["pgid"]
-                popen_obj: Optional[subprocess.Popen[bytes]] = info.get("popen")
-                project = query_one("SELECT * FROM projects WHERE id = ?", (info["project_id"],))
-                if not project:
-                    mem_info = ACTIVE_RUNS.pop(run_id, None)
-                    _cleanup_run_fifo(run_id, mem_info)
-                    continue
+                try:
+                    pid = info["pid"]
+                    pgid = info["pgid"]
+                    popen_obj: Optional[subprocess.Popen[bytes]] = info.get("popen")
+                    project = query_one("SELECT * FROM projects WHERE id = ?", (info["project_id"],))
+                    if not project:
+                        mem_info = ACTIVE_RUNS.pop(run_id, None)
+                        _cleanup_run_fifo(run_id, mem_info)
+                        continue
 
-                # 1. Проверка завершения процесса
-                exit_code: Optional[int] = info.get("reaped_exit_code")
-                still_alive = False
+                    exit_path = Path(info.get("exit_path") or _exit_file_for_log(info["log_path"], run_id))
 
-                if exit_code is not None:
+                    # 1. Проверка завершения процесса
+                    exit_code: Optional[int] = info.get("reaped_exit_code")
                     still_alive = False
-                elif popen_obj is not None:
-                    rc = popen_obj.poll()
-                    if rc is None:
-                        still_alive = True
-                    else:
-                        exit_code = int(rc)
-                else:
-                    try:
-                        p = psutil.Process(pid)
-                        if (
-                            p.is_running()
-                            and p.status() != "zombie"
-                            and abs(p.create_time() - info["proc_create_time"]) < 0.5
-                        ):
+                    unknown_exit = False
+
+                    if exit_code is not None:
+                        still_alive = False
+                        file_rc = _read_exit_code_file(exit_path)
+                        if file_rc is not None:
+                            exit_code = file_rc
+                    elif popen_obj is not None:
+                        rc = popen_obj.poll()
+                        if rc is None:
                             still_alive = True
                         else:
-                            exit_code = 0
-                    except psutil.NoSuchProcess:
-                        exit_code = 0
-
-                if not still_alive:
-                    leftover = _get_pgid_processes(pgid)
-                    if leftover:
+                            file_rc = _read_exit_code_file(exit_path)
+                            exit_code = file_rc if file_rc is not None else int(rc)
+                    else:
+                        is_dead_recovered = False
                         try:
-                            os.killpg(pgid, signal.SIGTERM)
-                        except Exception:
+                            p = psutil.Process(pid)
+                            if (
+                                p.is_running()
+                                and p.status() != "zombie"
+                                and abs(p.create_time() - info["proc_create_time"]) < 0.5
+                            ):
+                                still_alive = True
+                            else:
+                                is_dead_recovered = True
+                        except psutil.NoSuchProcess:
+                            is_dead_recovered = True
+
+                        if is_dead_recovered:
+                            file_rc = _read_exit_code_file(exit_path)
+                            if file_rc is not None:
+                                exit_code = file_rc
+                            else:
+                                exit_code = -1
+                                unknown_exit = True
+
+                    if not still_alive:
+                        leftover = _get_pgid_processes(pgid)
+                        if leftover:
+                            try:
+                                os.killpg(pgid, signal.SIGTERM)
+                            except OSError as exc:
+                                logger.warning("Не удалось отправить SIGTERM группе PGID=%s (run_id=%s): %s", pgid, run_id, exc)
+                        # Зачищаем только процессы этого run_id, а .tmp — только если нет других активных запусков (P0-3)
+                        await asyncio.to_thread(kill_orphan_processes_by_run_id, run_id, int(project["id"]))
+                        if project.get("workdir") and not _has_other_active_runs(int(project["id"]), exclude_run_id=run_id):
+                            await asyncio.to_thread(cleanup_project_tmp_dir, project["workdir"])
+
+                        mem_info = ACTIVE_RUNS.pop(run_id, None)
+                        _cleanup_run_fifo(run_id, mem_info, project["name"])
+                        try:
+                            exit_path.unlink(missing_ok=True)
+                        except OSError:
                             pass
-                    kill_orphan_processes_by_project_id(int(project["id"]))
-                    cleanup_project_tmp_dir(project["workdir"])
 
-                    mem_info = ACTIVE_RUNS.pop(run_id, None)
-                    _cleanup_run_fifo(run_id, mem_info, project["name"])
-                    code = exit_code if exit_code is not None else 0
-                    final_status = "success" if code == 0 else "failed"
-                    tail = _read_log_tail(info["log_path"], max_lines=15)
-                    err_summary = tail.splitlines()[-1][:200] if (code != 0 and tail) else ""
+                        code = exit_code if exit_code is not None else -1
+                        final_status = "success" if (code == 0 and not unknown_exit) else "failed"
+                        tail = _read_log_tail(info["log_path"], max_lines=15)
+                        if unknown_exit:
+                            err_summary = "код возврата неизвестен"
+                        elif code != 0 and tail:
+                            err_summary = tail.splitlines()[-1][:200]
+                        else:
+                            err_summary = ""
 
-                    try:
-                        with open(info["log_path"], "ab", buffering=0) as f:
-                            f.write(
-                                f"\n=== [Hub Run #{run_id}] Finished with exit_code={code} ({final_status}) at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode(
-                                    "utf-8"
+                        try:
+                            with open(info["log_path"], "ab", buffering=0) as f:
+                                f.write(
+                                    f"\n=== [Beacon Run #{run_id}] Finished with exit_code={code} ({final_status}) at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode(
+                                        "utf-8"
+                                    )
                                 )
-                            )
-                    except OSError:
-                        pass
+                        except OSError:
+                            pass
 
-                    execute_sql(
-                        """UPDATE runs
-                           SET status = ?, finished_at = ?, exit_code = ?, error_summary = ?
-                           WHERE id = ?""",
-                        (final_status, now, code, err_summary, run_id),
-                    )
-                    execute_sql(
-                        "UPDATE pending_asks SET status = 'cancelled' WHERE run_id = ? AND status = 'pending'",
-                        (run_id,),
-                    )
+                        execute_sql(
+                            """UPDATE runs
+                               SET status = ?, finished_at = ?, exit_code = ?, error_summary = ?
+                               WHERE id = ?""",
+                            (final_status, now, code, err_summary, run_id),
+                        )
+                        execute_sql(
+                            "UPDATE pending_asks SET status = 'cancelled' WHERE run_id = ? AND status = 'pending'",
+                            (run_id,),
+                        )
 
-                    if _ON_FINISH_CALLBACK and not info.get("is_deps_install"):
-                        await _ON_FINISH_CALLBACK(project, code, final_status, tail)
-                    continue
+                        if _ON_FINISH_CALLBACK and not info.get("is_deps_install"):
+                            proj_ctx = dict(project)
+                            proj_ctx["_chain_depth"] = int(info.get("chain_depth") or 0)
+                            await _ON_FINISH_CALLBACK(proj_ctx, code, final_status, tail)
+                        continue
 
-                # 2. Метрики RSS и CPU% по всей группе PGID из единого снимка за тик
-                rss_mb, cpu_pct, _ = pgid_metrics_map.get(int(pgid), (0.0, 0.0, 0))
-                info["rss_mb"] = rss_mb
-                info["cpu_percent"] = cpu_pct
+                    # 2. Метрики RSS, CPU% и числа процессов по всей группе PGID из единого снимка за тик
+                    rss_mb, cpu_pct, proc_cnt = pgid_metrics_map.get(int(pgid), (0.0, 0.0, 0))
+                    info["rss_mb"] = rss_mb
+                    info["cpu_percent"] = cpu_pct
+                    info["proc_count"] = proc_cnt
 
-                # 3. Контроль лимита ОЗУ (ram_limit_mb)
-                ram_limit_mb = int(project.get("ram_limit_mb") or 0)
-                if ram_limit_mb > 0 and rss_mb > ram_limit_mb:
-                    oom_msg = f"Превышен лимит памяти PGID: {rss_mb} МБ > {ram_limit_mb} МБ"
-                    await stop_run(run_id, final_status="killed_oom", reason_note=oom_msg)
-                    tail = _read_log_tail(info["log_path"], max_lines=15)
-                    await send_notification(
-                        f"{oom_msg}. Группа процессов PGID={pgid} принудительно остановлена.",
-                        level="oom",
-                        project_name=project["name"],
-                        log_tail=tail,
-                    )
-                    if _ON_FINISH_CALLBACK and not info.get("is_deps_install"):
-                        await _ON_FINISH_CALLBACK(project, -9, "killed_oom", tail)
-                    continue
-
-                # 4. Контроль таймаута для задач (type == 'job')
-                timeout_sec = int(project.get("timeout_sec") or 0)
-                if project["type"] == "job" and timeout_sec > 0 and (now - info["started_at"]) > timeout_sec:
-                    t_msg = f"Превышен таймаут выполнения ({timeout_sec} сек)"
-                    await stop_run(run_id, final_status="timeout", reason_note=t_msg)
-                    tail = _read_log_tail(info["log_path"], max_lines=15)
-                    if int(project.get("notify_on_error", 1)) == 1:
+                    # 3. Контроль лимита ОЗУ (ram_limit_mb)
+                    ram_limit_mb = int(project.get("ram_limit_mb") or 0)
+                    if ram_limit_mb > 0 and rss_mb > ram_limit_mb:
+                        oom_msg = f"Превышен лимит памяти PGID: {rss_mb} МБ > {ram_limit_mb} МБ"
+                        await stop_run(run_id, final_status="killed_oom", reason_note=oom_msg)
+                        tail = _read_log_tail(info["log_path"], max_lines=15)
                         await send_notification(
-                            f"Задача остановлена по таймауту ({timeout_sec} сек).",
-                            level="error",
+                            f"{oom_msg}. Группа процессов PGID={pgid} принудительно остановлена.",
+                            level="oom",
                             project_name=project["name"],
                             log_tail=tail,
                         )
-                    if _ON_FINISH_CALLBACK and not info.get("is_deps_install"):
-                        await _ON_FINISH_CALLBACK(project, -15, "timeout", tail)
-                    continue
+                        if _ON_FINISH_CALLBACK and not info.get("is_deps_install"):
+                            await _ON_FINISH_CALLBACK(project, -9, "killed_oom", tail)
+                        continue
 
-                # 5. HTTP / TCP Healthcheck для веб-бэкендов и сервисов
-                hc_url = str(project.get("healthcheck_url") or "").strip()
-                proj_port = int(project.get("port") or 0)
-                if not info.get("is_deps_install") and (hc_url or (project["type"] == "web" and proj_port > 0)):
-                    hc_interval = max(5, int(project.get("healthcheck_interval_sec") or 30))
-                    last_hc = float(info.get("last_hc_ts") or info["started_at"])
-                    if (now - info["started_at"]) >= 5 and (now_f - last_hc) >= hc_interval:
-                        info["last_hc_ts"] = now_f
-                        hc_ok, hc_detail = await asyncio.to_thread(
-                            check_endpoint_health, hc_url, proj_port, 2.5
-                        )
-                        if hc_ok:
-                            info["hc_failures"] = 0
-                            if project.get("health_status") != "healthy":
+                    # 4. Контроль таймаута для задач (type == 'job')
+                    timeout_sec = int(project.get("timeout_sec") or 0)
+                    if project["type"] == "job" and timeout_sec > 0 and (now - info["started_at"]) > timeout_sec:
+                        t_msg = f"Превышен таймаут выполнения ({timeout_sec} сек)"
+                        await stop_run(run_id, final_status="timeout", reason_note=t_msg)
+                        tail = _read_log_tail(info["log_path"], max_lines=15)
+                        if int(project.get("notify_on_error", 1)) == 1:
+                            await send_notification(
+                                f"Задача остановлена по таймауту ({timeout_sec} сек).",
+                                level="error",
+                                project_name=project["name"],
+                                log_tail=tail,
+                            )
+                        if _ON_FINISH_CALLBACK and not info.get("is_deps_install"):
+                            await _ON_FINISH_CALLBACK(project, -15, "timeout", tail)
+                        continue
+
+                    # 5. HTTP / TCP Healthcheck для веб-бэкендов и сервисов
+                    hc_url = str(project.get("healthcheck_url") or "").strip()
+                    proj_port = int(project.get("port") or 0)
+                    if not info.get("is_deps_install") and (hc_url or (project["type"] == "web" and proj_port > 0)):
+                        hc_interval = max(5, int(project.get("healthcheck_interval_sec") or 30))
+                        last_hc = float(info.get("last_hc_ts") or info["started_at"])
+                        if (now - info["started_at"]) >= 5 and (now_f - last_hc) >= hc_interval:
+                            info["last_hc_ts"] = now_f
+                            hc_ok, hc_detail = await asyncio.to_thread(
+                                check_endpoint_health, hc_url, proj_port, 2.5
+                            )
+                            if hc_ok:
+                                info["hc_failures"] = 0
+                                if project.get("health_status") != "healthy":
+                                    execute_sql(
+                                        "UPDATE projects SET health_status = 'healthy' WHERE id = ?",
+                                        (project["id"],),
+                                    )
+                            else:
+                                fails = int(info.get("hc_failures") or 0) + 1
+                                info["hc_failures"] = fails
                                 execute_sql(
-                                    "UPDATE projects SET health_status = 'healthy' WHERE id = ?",
+                                    "UPDATE projects SET health_status = 'unhealthy' WHERE id = ?",
                                     (project["id"],),
                                 )
-                        else:
-                            fails = int(info.get("hc_failures") or 0) + 1
-                            info["hc_failures"] = fails
-                            execute_sql(
-                                "UPDATE projects SET health_status = 'unhealthy' WHERE id = ?",
-                                (project["id"],),
-                            )
-                            if fails >= 3:
-                                hc_msg = f"Healthcheck не прошёл 3 раза подряд ({hc_detail}) — выполняется перезапуск"
-                                await stop_run(run_id, final_status="failed", reason_note=hc_msg)
-                                tail = _read_log_tail(info["log_path"], max_lines=15)
-                                await send_notification(
-                                    f"Сервис «{project['name']}» завис ({hc_msg}). Выполнен автоматический перезапуск.",
-                                    level="error",
-                                    project_name=project["name"],
-                                    log_tail=tail,
-                                )
-                                await start_project_run(int(project["id"]), trigger="healthcheck")
-                                continue
+                                if fails >= 3:
+                                    hc_msg = f"Healthcheck не прошёл 3 раза подряд ({hc_detail}) — выполняется перезапуск"
+                                    await stop_run(run_id, final_status="failed", reason_note=hc_msg)
+                                    tail = _read_log_tail(info["log_path"], max_lines=15)
+                                    if _ON_HEALTHCHECK_FAIL_CALLBACK is not None:
+                                        await _ON_HEALTHCHECK_FAIL_CALLBACK(project, hc_msg, tail)
+                                    else:
+                                        await send_notification(
+                                            f"Сервис «{project['name']}» завис ({hc_msg}). Выполнен автоматический перезапуск.",
+                                            level="error",
+                                            project_name=project["name"],
+                                            log_tail=tail,
+                                        )
+                                        await start_project_run(int(project["id"]), trigger="healthcheck")
+                                    continue
+                except Exception as exc:
+                    _WATCH_LOOP_STATUS["error_count"] += 1
+                    _WATCH_LOOP_STATUS["last_error"] = str(exc)
+                    _WATCH_LOOP_STATUS["last_error_at"] = time.time()
+                    logger.exception("Ошибка обработки запуска run_id=%s в watch_processes_loop", run_id)
 
-        except Exception:
-            pass
+        except Exception as exc:
+            _WATCH_LOOP_STATUS["error_count"] += 1
+            _WATCH_LOOP_STATUS["last_error"] = str(exc)
+            _WATCH_LOOP_STATUS["last_error_at"] = time.time()
+            logger.exception("Критическая ошибка в тике watch_processes_loop")
+        finally:
+            _WATCH_LOOP_STATUS["last_tick_at"] = time.time()
+            _WATCH_LOOP_STATUS["ticks"] += 1
 
         await asyncio.sleep(2.0)

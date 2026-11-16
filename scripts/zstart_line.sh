@@ -1,17 +1,27 @@
 #!/usr/bin/env bash
-# Идемпотентный запуск Hub для добавления в zstart (Ubuntu chroot на Android)
-HUB_DIR="${HUB_DIR:-/opt/hub}"
-LOG_FILE="${HUB_DIR}/data/logs/hub-daemon.log"
+# Идемпотентный запуск Beacon для добавления в zstart (Ubuntu chroot на Android)
+BEACON_DIR="${BEACON_DIR:-${ARUTA_DIR:-${HUB_DIR:-/opt/beacon}}}"
+BEACON_PORT="${BEACON_PORT:-${ARUTA_PORT:-${HUB_PORT:-8050}}}"
+LOG_FILE="${BEACON_DIR}/data/logs/beacon-daemon.log"
+PID_FILE="${BEACON_DIR}/data/beacon.pid"
 
-mkdir -p "${HUB_DIR}/data/logs"
+mkdir -p "${BEACON_DIR}/data/logs"
 
-if pgrep -f "python.*-m hub" >/dev/null 2>&1; then
+if [ -f "${PID_FILE}" ]; then
+    EXISTING_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
+    if [ -n "${EXISTING_PID}" ] && kill -0 "${EXISTING_PID}" 2>/dev/null; then
+        exit 0
+    fi
+fi
+
+if pgrep -f "python.*-m (beacon|aruta|hub)" >/dev/null 2>&1; then
     exit 0
 fi
 
-cd "${HUB_DIR}" || exit 1
-if [ -x "${HUB_DIR}/.venv/bin/python" ]; then
-    nohup "${HUB_DIR}/.venv/bin/python" -m hub >> "${LOG_FILE}" 2>&1 < /dev/null &
+cd "${BEACON_DIR}" || exit 1
+export BEACON_DIR BEACON_PORT
+if [ -x "${BEACON_DIR}/.venv/bin/python" ]; then
+    nohup "${BEACON_DIR}/.venv/bin/python" -m beacon --port "${BEACON_PORT}" >> "${LOG_FILE}" 2>&1 < /dev/null &
 else
-    nohup python3 -m hub >> "${LOG_FILE}" 2>&1 < /dev/null &
+    nohup python3 -m beacon --port "${BEACON_PORT}" >> "${LOG_FILE}" 2>&1 < /dev/null &
 fi

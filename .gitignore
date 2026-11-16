@@ -2,8 +2,10 @@
 node_modules/
 build/
 dist/
+dist-release/
 coverage/
 .playwright-cli/
+*.tar.gz
 
 # Python virtual environments & bytecode
 .venv/
@@ -15,13 +17,15 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# SQLite databases & runtime locks/IPC
+# SQLite databases & runtime locks/IPC/PIDs
 *.db
 *.db-wal
 *.db-shm
 *.fifo
+*.pid
+*.cmd
 
-# Runtime data (secrets, logs, local DB, initial_password)
+# Runtime data (secrets, logs, backups, generated systemd units, local DB)
 data/*
 !data/.gitkeep
 
@@ -39,4 +43,3 @@ public/assets/aistudio/
 *.log
 .env*
 !.env.example
-

@@ -19,4 +19,6 @@
 - `beacon.secret(name, as_path=False)`
 - `beacon.cookies_expired(secret_name, note="")`
 - `beacon.ask(prompt, timeout=300)`
+- `beacon.ping(token=None)` (Dead Man's Switch)
 - `beacon.state.get(key, default=None)` / `beacon.state.set(key, val)` / `beacon.state.delete(key)`
+

@@ -14,15 +14,16 @@ import {
   Download,
   CornerDownLeft,
   X,
+  BookOpen,
+  Bot,
 } from 'lucide-react';
-import { ProjectItem } from '../types/hub';
-import { WorkspaceSubTab } from './ProjectsWorkspace';
+import { ProjectItem, WorkspaceSubTab } from '../types/hub';
 
 interface CommandPaletteModalProps {
   isOpen: boolean;
   onClose: () => void;
   projects: ProjectItem[];
-  onNavigateTab: (tab: 'dashboard' | 'projects' | 'secrets' | 'settings' | 'acceptance') => void;
+  onNavigateTab: (tab: 'dashboard' | 'projects' | 'secrets' | 'ai_access' | 'settings' | 'acceptance' | 'docs') => void;
   onOpenProject: (project: ProjectItem, subTab?: WorkspaceSubTab) => void;
   onStartProject: (id: number) => Promise<any>;
   onStopProject: (id: number) => Promise<any>;
@@ -96,7 +97,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       {
         id: 'act-test-sigpipe',
         group: 'Быстрые действия',
-        title: 'Проверить выживание процессов при рестарте Hub (Direct FD)',
+        title: 'Проверить выживание процессов при рестарте Beacon (Direct FD)',
         subtitle: 'Перезагружает состояние супервизора без падения дочерних сервисов от SIGPIPE',
         keywords: 'restart survival sigpipe direct fd рестарт проверка',
         icon: <RotateCcw className="w-4 h-4 text-amber-400" />,
@@ -108,9 +109,9 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       {
         id: 'nav-dashboard',
         group: 'Навигация',
-        title: 'Перейти: Дашборд и Реестр проектов',
-        subtitle: 'Метрики CPU/RAM/Диска, профиль среды и управление процессами',
-        keywords: 'dashboard overview дашборд обзор главная',
+        title: 'Перейти: Дашборд, Сеть и Реестр проектов',
+        subtitle: 'Метрики CPU/RAM/Диска, сетевая статистика RX/TX и управление процессами',
+        keywords: 'dashboard overview network дашборд обзор сеть главная',
         icon: <LayoutDashboard className="w-4 h-4 text-slate-300" />,
         action: () => {
           onNavigateTab('dashboard');
@@ -120,8 +121,8 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       {
         id: 'nav-projects',
         group: 'Навигация',
-        title: 'Перейти: Рабочее пространство и Консоль (Projects Workspace)',
-        subtitle: 'Редактор кода, .venv/uv терминал, куки, расписание и живые логи',
+        title: 'Перейти: Проекты и Консоль (Projects Workspace)',
+        subtitle: 'Редактор кода, файловый менеджер, превью сайтов, расписание и живые логи',
         keywords: 'projects workspace code logs terminal код логи терминал',
         icon: <FolderCode className="w-4 h-4 text-slate-300" />,
         action: () => {
@@ -132,7 +133,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       {
         id: 'nav-secrets',
         group: 'Навигация',
-        title: 'Перейти: Центр событий, Куки и Секреты (0600)',
+        title: 'Перейти: Куки и Секреты (0600)',
         subtitle: 'Импорт Cookie-Editor JSON, API-ключи и привязка секретов к проектам',
         keywords: 'secrets cookies ask events куки секреты токены',
         icon: <KeyRound className="w-4 h-4 text-slate-300" />,
@@ -142,11 +143,23 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
         },
       },
       {
+        id: 'nav-ai-access',
+        group: 'Навигация',
+        title: 'Перейти: Доступ ИИ (MCP и /api/v1/)',
+        subtitle: 'Токены для Claude Code / Cursor, очередь подтверждений и аудит ИИ',
+        keywords: 'ai mcp claude cursor токены ии агент',
+        icon: <Bot className="w-4 h-4 text-slate-300" />,
+        action: () => {
+          onNavigateTab('ai_access');
+          onClose();
+        },
+      },
+      {
         id: 'nav-settings',
         group: 'Навигация',
-        title: 'Перейти: Настройки Панели, Пароль и Архив бэкапов',
-        subtitle: 'Смена пароля администратора, системный Telegram-бот, прокси 10808 и Hub Doctor',
-        keywords: 'settings password backup doctor настройки пароль прокси бэкап',
+        title: 'Перейти: Настройки Панели, Пароль, RBAC и Бэкап',
+        subtitle: 'Смена пароля администратора, фильтр подсетей, системный Telegram-бот и бэкап',
+        keywords: 'settings password backup rbac настройки пароль прокси бэкап',
         icon: <Settings className="w-4 h-4 text-slate-300" />,
         action: () => {
           onNavigateTab('settings');
@@ -156,12 +169,24 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       {
         id: 'nav-acceptance',
         group: 'Навигация',
-        title: 'Перейти: Полигон приёмки и Hub Doctor',
+        title: 'Перейти: Полигон приёмки и Beacon Doctor',
         subtitle: 'Автоматический прогон приёмочных проверок и диагностика окружения',
         keywords: 'acceptance tests doctor тесты приёмка диагностика',
         icon: <FlaskConical className="w-4 h-4 text-slate-300" />,
         action: () => {
           onNavigateTab('acceptance');
+          onClose();
+        },
+      },
+      {
+        id: 'nav-docs',
+        group: 'Навигация',
+        title: 'Перейти: Документация и Справочник Beacon',
+        subtitle: 'Подробное руководство по панели, встроенному SDK (import beacon), кукам и MCP с поиском',
+        keywords: 'docs documentation help sdk документация справка руководство',
+        icon: <BookOpen className="w-4 h-4 text-indigo-400" />,
+        action: () => {
+          onNavigateTab('docs');
           onClose();
         },
       },

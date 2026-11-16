@@ -1,5 +1,5 @@
 """
-Адаптер веб-фреймворка для Aruta (Hub):
+Адаптер веб-фреймворка для Beacon:
 Использует штатный FastAPI + Starlette при их наличии в окружении (.venv),
 либо предоставляет 100% совместимый легковесный асинхронный HTTP/SSE сервер на стандартной библиотеке Python 3
 с жёсткими лимитами тела запроса (50 МБ -> 413), числа multipart-частей и числа одновременных соединений.
@@ -215,7 +215,7 @@ except ImportError:
                 raise HTTPException(status_code=404, detail="File not found")
             guessed, _ = mimetypes.guess_type(str(p))
             mtype = media_type or guessed or "application/octet-stream"
-            if mtype.startswith("text/") or mtype in ("application/javascript", "application/json"):
+            if (mtype.startswith("text/") or mtype in ("application/javascript", "application/json")) and "charset=" not in mtype.lower():
                 mtype = f"{mtype}; charset=utf-8"
             super().__init__(content=p.read_bytes(), status_code=status_code, media_type=mtype)
 
@@ -228,6 +228,7 @@ except ImportError:
             media_type: str = "text/event-stream",
         ):
             self.content = content
+            self.body_iterator = content
             self.status_code = int(status_code)
             self.headers = dict(headers or {})
             self.media_type = media_type
@@ -269,7 +270,7 @@ except ImportError:
             return lambda f: self._add_route("DELETE", path, f)
 
     class FastAPI(APIRouter):
-        def __init__(self, title: str = "Aruta", version: str = "2.2.0", **kwargs: Any):
+        def __init__(self, title: str = "Beacon", version: str = "2.2.0", **kwargs: Any):
             super().__init__(prefix="")
             self.title = title
             self.version = version
@@ -295,10 +296,76 @@ except ImportError:
             return _reg
 
 
+def parse_int_param(
+    value: Any,
+    name: str = "value",
+    default: Optional[int] = None,
+    min_val: Optional[int] = None,
+    max_val: Optional[int] = None,
+) -> int:
+    """Безопасное преобразование пользовательского ввода в int с HTTP 400 вместо 500."""
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        if default is not None:
+            val = int(default)
+        else:
+            raise HTTPException(status_code=400, detail=f"Параметр '{name}' обязателен и должен быть целым числом")
+    else:
+        if isinstance(value, bool):
+            raise HTTPException(status_code=400, detail=f"Параметр '{name}' должен быть целым числом")
+        try:
+            val = int(str(value).strip()) if isinstance(value, str) else int(value)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"Параметр '{name}' должен быть целым числом") from exc
+    if min_val is not None and val < min_val:
+        raise HTTPException(status_code=400, detail=f"Параметр '{name}' не может быть меньше {min_val}")
+    if max_val is not None and val > max_val:
+        raise HTTPException(status_code=400, detail=f"Параметр '{name}' не может быть больше {max_val}")
+    return val
+
+
+async def read_json(request: Request, require_dict: bool = True, allow_empty: bool = True) -> Any:
+    """
+    Единый разбор JSON-тела запроса: возвращает dict (или list если require_dict=False),
+    выбрасывая HTTP 400 при битом JSON или неверном типе вместо HTTP 500.
+    """
+    data: Any
+    if hasattr(request, "body"):
+        try:
+            raw = await request.body()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Не удалось прочитать тело запроса") from exc
+        if len(raw) > MAX_REQUEST_BODY_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Превышен максимальный размер тела запроса ({MAX_REQUEST_BODY_BYTES // (1024 * 1024)} МБ)",
+            )
+        if not raw or not raw.strip():
+            if allow_empty:
+                return {} if require_dict else {}
+            raise HTTPException(status_code=400, detail="Пустое JSON-тело запроса")
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Некорректный JSON в теле запроса") from exc
+    else:
+        try:
+            data = await request.json()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Некорректный JSON в теле запроса") from exc
+
+    if data is None and allow_empty:
+        return {} if require_dict else {}
+    if require_dict and not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Тело запроса должно быть JSON-объектом")
+    return data
+
+
 async def run_fallback_http_server(app: Any, host: str = "0.0.0.0", port: int = 8050) -> None:
     """Асинхронный HTTP/1.1 + SSE сервер для работы без внешнего пакета uvicorn."""
-    from hub.auth import resolve_client_ip
-
     conn_sem = asyncio.Semaphore(MAX_CONCURRENT_CONNECTIONS)
 
     for handler in getattr(app, "startup_handlers", []):
@@ -306,9 +373,38 @@ async def run_fallback_http_server(app: Any, host: str = "0.0.0.0", port: int = 
         if inspect.isawaitable(res):
             await res
 
+    def _early_headers(content_len: int) -> str:
+        lines = [
+            "Content-Type: application/json; charset=utf-8",
+            f"Content-Length: {content_len}",
+            "Cache-Control: no-store",
+            "X-Content-Type-Options: nosniff",
+            "Referrer-Policy: no-referrer",
+            "Permissions-Policy: camera=(), microphone=(), geolocation=()",
+            "Connection: close",
+        ]
+        if os.environ.get("BEACON_PREVIEW_MODE") != "1":
+            lines.append("X-Frame-Options: DENY")
+        return "\r\n".join(lines) + "\r\n\r\n"
+
+    async def _send_early_error(writer: asyncio.StreamWriter, status_line: str, payload: dict[str, Any]) -> None:
+        err_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        hdrs = (f"HTTP/1.1 {status_line}\r\n" + _early_headers(len(err_body))).encode("utf-8")
+        try:
+            writer.write(hdrs + err_body)
+            await writer.drain()
+        except OSError:
+            pass
+        finally:
+            try:
+                writer.close()
+            except OSError:
+                pass
+
     async def _dispatch_route(req: Request) -> Any:
+        match_method = "GET" if req.method == "HEAD" else req.method
         for method, pattern, param_names, func in app.routes:
-            if method != req.method:
+            if method != match_method:
                 continue
             m = pattern.match(req.path)
             if m:
@@ -322,12 +418,18 @@ async def run_fallback_http_server(app: Any, host: str = "0.0.0.0", port: int = 
                     elif arg_name in req.path_params:
                         val: Any = req.path_params[arg_name]
                         if param.annotation is int:
-                            val = int(val)
+                            try:
+                                val = int(val)
+                            except (TypeError, ValueError):
+                                return JSONResponse({"detail": f"Некорректный параметр пути '{arg_name}'"}, status_code=400)
                         kwargs[arg_name] = val
                     elif arg_name in req.query_params:
                         val = req.query_params[arg_name]
                         if param.annotation is int:
-                            val = int(val)
+                            try:
+                                val = int(val)
+                            except (TypeError, ValueError):
+                                return JSONResponse({"detail": f"Некорректный параметр запроса '{arg_name}'"}, status_code=400)
                         kwargs[arg_name] = val
                 try:
                     out = func(**kwargs)
@@ -340,7 +442,7 @@ async def run_fallback_http_server(app: Any, host: str = "0.0.0.0", port: int = 
                     return JSONResponse({"detail": he.detail, "error": he.detail}, status_code=he.status_code)
                 except Exception:
                     err_id = secrets.token_hex(4)
-                    print(f"[Aruta Error {err_id}] Необработанное исключение при вызове {req.path}:", flush=True)
+                    print(f"[Beacon Error {err_id}] Необработанное исключение при вызове {req.path}:", flush=True)
                     traceback.print_exc()
                     return JSONResponse(
                         {"detail": f"Внутренняя ошибка сервера (код: {err_id})", "error_id": err_id},
@@ -373,7 +475,7 @@ async def run_fallback_http_server(app: Any, host: str = "0.0.0.0", port: int = 
             try:
                 writer.write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 await writer.drain()
-            except Exception:
+            except OSError:
                 pass
             finally:
                 writer.close()
@@ -409,49 +511,74 @@ async def run_fallback_http_server(app: Any, host: str = "0.0.0.0", port: int = 
                     k, v = line.split(":", 1)
                     headers[k.strip()] = v.strip()
 
-            try:
-                content_length = int(headers.get("Content-Length", headers.get("content-length", "0")) or 0)
-            except ValueError:
-                content_length = 0
+            lower_headers = {k.lower(): v for k, v in headers.items()}
+            transfer_enc = lower_headers.get("transfer-encoding", "").lower()
+            if "chunked" in transfer_enc:
+                await _send_early_error(
+                    writer,
+                    "411 Length Required",
+                    {"detail": "Transfer-Encoding: chunked не поддерживается, укажите Content-Length"},
+                )
+                return
+
+            raw_cl = lower_headers.get("content-length")
+            content_length = 0
+            if raw_cl is not None and raw_cl.strip() != "":
+                try:
+                    content_length = int(raw_cl.strip())
+                except ValueError:
+                    await _send_early_error(writer, "400 Bad Request", {"detail": "Некорректный заголовок Content-Length"})
+                    return
+                if content_length < 0:
+                    await _send_early_error(writer, "400 Bad Request", {"detail": "Отрицательный Content-Length"})
+                    return
 
             # Лимит тела запроса (50 МБ -> 413) ДО чтения тела, проверки подсетей и входа
             if content_length > MAX_REQUEST_BODY_BYTES:
-                err_body = json.dumps(
+                await _send_early_error(
+                    writer,
+                    "413 Payload Too Large",
                     {
                         "detail": f"Превышен максимальный размер тела запроса ({MAX_REQUEST_BODY_BYTES // (1024 * 1024)} МБ)",
                         "max_bytes": MAX_REQUEST_BODY_BYTES,
                     },
-                    ensure_ascii=False,
-                ).encode("utf-8")
-                hdrs = (
-                    "HTTP/1.1 413 Payload Too Large\r\n"
-                    "Content-Type: application/json; charset=utf-8\r\n"
-                    f"Content-Length: {len(err_body)}\r\n"
-                    "X-Frame-Options: DENY\r\n"
-                    "X-Content-Type-Options: nosniff\r\n"
-                    "Referrer-Policy: no-referrer\r\n"
-                    "Connection: close\r\n\r\n"
-                ).encode("utf-8")
-                try:
-                    writer.write(hdrs + err_body)
-                    await writer.drain()
-                except Exception:
-                    pass
-                finally:
-                    writer.close()
+                )
                 return
 
             body = b""
             if content_length > 0:
+                chunks: list[bytes] = []
+                total_read = 0
+                remaining = content_length
                 try:
-                    body = await asyncio.wait_for(reader.readexactly(content_length), timeout=30.0)
-                except Exception:
-                    body = await reader.read(content_length)
+                    while remaining > 0:
+                        to_read = min(65536, remaining)
+                        chunk = await asyncio.wait_for(reader.read(to_read), timeout=30.0)
+                        if not chunk:
+                            break
+                        total_read += len(chunk)
+                        if total_read > MAX_REQUEST_BODY_BYTES:
+                            await _send_early_error(
+                                writer,
+                                "413 Payload Too Large",
+                                {
+                                    "detail": f"Превышен максимальный размер тела запроса ({MAX_REQUEST_BODY_BYTES // (1024 * 1024)} МБ)",
+                                    "max_bytes": MAX_REQUEST_BODY_BYTES,
+                                },
+                            )
+                            return
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    body = b"".join(chunks)
+                except asyncio.TimeoutError:
+                    await _send_early_error(writer, "408 Request Timeout", {"detail": "Таймаут чтения тела запроса"})
+                    return
+                except OSError:
+                    writer.close()
+                    return
 
             peer = writer.get_extra_info("peername")
             direct_host = peer[0] if isinstance(peer, tuple) and peer else "127.0.0.1"
-            fwd_for = headers.get("X-Forwarded-For", headers.get("x-forwarded-for", ""))
-            client_host = resolve_client_ip(direct_host, fwd_for)
 
             req = Request(
                 method=method,
@@ -459,7 +586,7 @@ async def run_fallback_http_server(app: Any, host: str = "0.0.0.0", port: int = 
                 query_string=query_string,
                 headers=headers,
                 body=body,
-                client_host=client_host,
+                client_host=direct_host,
             )
 
             resp = await _handle_request_with_middlewares(req)
@@ -473,6 +600,8 @@ async def run_fallback_http_server(app: Any, host: str = "0.0.0.0", port: int = 
                 401: "Unauthorized",
                 403: "Forbidden",
                 404: "Not Found",
+                409: "Conflict",
+                411: "Length Required",
                 413: "Payload Too Large",
                 429: "Too Many Requests",
                 500: "Internal Server Error",
@@ -504,7 +633,7 @@ async def run_fallback_http_server(app: Any, host: str = "0.0.0.0", port: int = 
                 finally:
                     try:
                         writer.close()
-                    except Exception:
+                    except OSError:
                         pass
                 return
 
@@ -522,17 +651,22 @@ async def run_fallback_http_server(app: Any, host: str = "0.0.0.0", port: int = 
                 hdr_lines.append(f"Set-Cookie: {ck}")
 
             try:
-                writer.write(("\r\n".join(hdr_lines) + "\r\n\r\n").encode("utf-8") + body_bytes)
+                out_bytes = (
+                    ("\r\n".join(hdr_lines) + "\r\n\r\n").encode("utf-8")
+                    if req.method == "HEAD"
+                    else ("\r\n".join(hdr_lines) + "\r\n\r\n").encode("utf-8") + body_bytes
+                )
+                writer.write(out_bytes)
                 await writer.drain()
-            except Exception:
+            except OSError:
                 pass
             finally:
                 try:
                     writer.close()
-                except Exception:
+                except OSError:
                     pass
 
     server = await asyncio.start_server(_handle_client, host=host, port=port)
-    print(f"[Aruta] Сервер запущен на http://{host}:{port} (PID={os.getpid()})", flush=True)
+    print(f"[Beacon] Сервер запущен на http://{host}:{port} (PID={os.getpid()})", flush=True)
     async with server:
         await server.serve_forever()

@@ -1,0 +1,28 @@
+[Unit]
+Description=Beacon Control Panel (Lightweight Operations Console & Containerless PaaS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__BEACON_USER__
+WorkingDirectory=__BEACON_DIR__
+Environment="BEACON_DIR=__BEACON_DIR__"
+Environment="BEACON_PORT=__BEACON_PORT__"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=__PYTHON_EXEC__ -m beacon
+Restart=always
+RestartSec=3
+KillMode=process
+LimitNOFILE=4096
+
+# Systemd Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ReadWritePaths=__BEACON_DIR__/data __BEACON_DIR__/projects
+
+[Install]
+WantedBy=multi-user.target

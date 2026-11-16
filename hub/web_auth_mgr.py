@@ -428,6 +428,52 @@ async def check_android_hardware_guard(
     }
 
 
+def _validate_web_auth_target_url(url_str: str) -> tuple[str, str]:
+    """
+    Проверяет, что целевой URL для HTTP/Cookie-пробы использует схему http/https
+    и не обращается к loopback, link-local (169.254.0.0/16) или метаданным облака (защита от SSRF).
+    """
+    import ipaddress
+
+    clean_url = (url_str or "").strip()
+    if not clean_url:
+        raise ValueError("Укажите целевой URL")
+    if not clean_url.startswith(("http://", "https://")):
+        if "://" in clean_url:
+            raise ValueError("Разрешены только схемы http:// и https://")
+        clean_url = f"https://{clean_url}"
+
+    parsed = urlparse(clean_url)
+    host = (parsed.hostname or "").strip().strip("[]").lower()
+    if not host or host in ("localhost", "localhost.localdomain", "0.0.0.0"):
+        raise ValueError("Обращение к локальным адресам (localhost / loopback) в Web Auth запрещено")
+
+    try:
+        ip_obj = ipaddress.ip_address(host)
+        if ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_unspecified or ip_obj.is_multicast:
+            raise ValueError(f"Обращение к внутреннему адресу {host} запрещено (защита от SSRF)")
+    except ValueError as exc:
+        if "запрещено" in str(exc):
+            raise
+        try:
+            infos = socket.getaddrinfo(host, None)
+            for _, _, _, _, sockaddr in infos:
+                resolved_ip = ipaddress.ip_address(sockaddr[0].split("%", 1)[0])
+                if (
+                    resolved_ip.is_loopback
+                    or resolved_ip.is_link_local
+                    or resolved_ip.is_unspecified
+                    or resolved_ip.is_multicast
+                ):
+                    raise ValueError(f"Домен {host} указывает на внутренний адрес {resolved_ip} (защита от SSRF)")
+        except ValueError:
+            raise
+        except OSError:
+            pass
+
+    return clean_url, host
+
+
 async def start_web_auth_session(
     project_id: int,
     target_url: str,
@@ -435,27 +481,23 @@ async def start_web_auth_session(
     custom_proxy: str = "",
 ) -> dict[str, Any]:
     """
-    Выполняет реальный HTTP-запрос к целевому URL (с учётом прокси) и собирает настоящие Set-Cookie,
-    возвращённые сервером. Никакие фейковые куки или SVG-картинки не генерируются.
+    Выполняет реальный HTTP-запрос к целевому URL (с учётом прокси и защиты от SSRF)
+    и собирает настоящие Set-Cookie, возвращённые сервером.
     """
     proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     if not proj:
         raise ValueError("Проект не найден")
 
-    clean_url = (target_url or "").strip()
-    if not clean_url:
-        raise ValueError("Укажите целевой URL")
-    if not clean_url.startswith(("http://", "https://")):
-        clean_url = f"https://{clean_url}"
-
-    parsed_url = urlparse(clean_url)
-    domain = parsed_url.hostname or "localhost"
+    clean_url, domain = _validate_web_auth_target_url(target_url)
 
     settings = get_all_settings()
     sys_proxy = settings.get("proxy_url", "").strip()
 
     if proxy_mode == "custom" and custom_proxy.strip():
-        active_proxy: Optional[str] = custom_proxy.strip()
+        raw_cp = custom_proxy.strip()
+        if "://" in raw_cp and not raw_cp.startswith(("http://", "https://", "socks5://", "socks5h://")):
+            raise ValueError("Недопустимая схема прокси (разрешены http://, https://, socks5://)")
+        active_proxy: Optional[str] = raw_cp
     elif proxy_mode == "none" or not sys_proxy:
         active_proxy = None
     else:
@@ -472,7 +514,7 @@ async def start_web_auth_session(
         async with httpx.AsyncClient(
             proxy=active_proxy,
             timeout=8.0,
-            follow_redirects=True,
+            follow_redirects=False,
             headers={"User-Agent": ua},
         ) as client:
             resp = await client.get(clean_url)

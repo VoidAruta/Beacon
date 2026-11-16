@@ -255,7 +255,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
             <h2 className="text-base font-bold text-white">Мастер создания проекта (Service / Web API / Job)</h2>
             <p className="text-xs text-slate-400 mt-0.5">
               Изолированный запуск с поддержкой <code className="font-mono text-slate-300">.venv / uv</code>,{' '}
-              <code className="font-mono text-slate-300">hub.state</code> и проверкой портов без Docker
+              <code className="font-mono text-slate-300">beacon.state</code> и проверкой портов без Docker
             </p>
           </div>
           <button
@@ -485,11 +485,11 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
                 }}
                 className="w-full bg-[#0b0f17] border border-slate-700 rounded-lg px-3 py-2.5 text-xs text-white focus:border-indigo-500 focus:outline-none"
               >
-                <option value="python">Python 3 — Стандартный сервис/скрипт (main.py + hub.state)</option>
+                <option value="python">Python 3 — Стандартный сервис/скрипт (main.py + beacon.state)</option>
                 <option value="web">Python Web / API — HTTP-сервер с $PORT и эндпоинтом /health</option>
-                <option value="cookie_parser">Python + Куки/Антибот — поддержка Cookie-Editor и hub.ask()</option>
+                <option value="cookie_parser">Python + Куки/Антибот — поддержка Cookie-Editor и beacon.ask()</option>
                 <option value="tg_bot">Telegram-бот проекта — со своим BOT_TOKEN и прокси 127.0.0.1:10808</option>
-                <option value="node">Node.js — Скрипт/сервис на JavaScript (index.js + SDK hub.js)</option>
+                <option value="node">Node.js — Скрипт/сервис на JavaScript (index.js + SDK beacon.js)</option>
                 <option value="bash">Bash — Системный скрипт командной строки Linux (main.sh)</option>
               </select>
             </div>
@@ -526,7 +526,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
                       checked={autostart}
                       onChange={(e) => setAutostart(e.target.checked)}
                     />
-                    Автостарт при запуске Hub
+                    Автостарт при запуске Beacon
                   </label>
                 </div>
               </div>
@@ -708,36 +708,77 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
             >
               <span className="flex items-center gap-2">
                 <Terminal className="w-3.5 h-3.5 text-slate-400" />
-                Лимит памяти ОЗУ (PGID RSS) и команда запуска
+                Профиль ресурсов ОЗУ (PGID RSS: {ramLimitMb === 0 ? 'Без лимита' : `${ramLimitMb} МБ`}) и команда запуска
               </span>
               {showAdvanced ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
             </button>
 
             {showAdvanced && (
-              <div className="p-4 bg-[#0b0f17]/70 grid grid-cols-1 sm:grid-cols-2 gap-3 border-t border-slate-800">
-                <div>
-                  <label htmlFor="proj-ram-input" className="block text-xs text-slate-300 mb-1">
-                    Лимит ОЗУ группы PGID (МБ, 0 = без лимита)
-                  </label>
-                  <input
-                    id="proj-ram-input"
-                    type="number"
-                    min={0}
-                    value={ramLimitMb}
-                    onChange={(e) => setRamLimitMb(Number(e.target.value))}
-                    className="w-full bg-[#111622] border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
-                  />
-                </div>
+              <div className="p-4 bg-[#0b0f17]/70 space-y-3 border-t border-slate-800">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label htmlFor="proj-ram-input" className="block text-xs text-slate-300 mb-1">
+                      Лимит ОЗУ группы PGID (МБ, 0 = без лимита)
+                    </label>
+                    <input
+                      id="proj-ram-input"
+                      type="number"
+                      min={0}
+                      max={262144}
+                      value={ramLimitMb}
+                      onChange={(e) => setRamLimitMb(Math.max(0, Number(e.target.value)))}
+                      className="w-full bg-[#111622] border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                    />
+                    <div className="mt-1.5 flex flex-wrap gap-1">
+                      {[
+                        { label: '128 МБ', mb: 128 },
+                        { label: '512 МБ', mb: 512 },
+                        { label: '2 ГБ', mb: 2048 },
+                        { label: '8 ГБ', mb: 8192 },
+                        { label: 'Без лимита (0)', mb: 0 },
+                      ].map((p) => (
+                        <button
+                          key={p.mb}
+                          type="button"
+                          onClick={() => setRamLimitMb(p.mb)}
+                          className={`px-2 py-0.5 rounded text-[10px] font-medium border cursor-pointer ${
+                            ramLimitMb === p.mb
+                              ? 'bg-indigo-600/30 text-indigo-200 border-indigo-500/50'
+                              : 'bg-[#111622] text-slate-400 border-slate-800 hover:text-white'
+                          }`}
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
 
-                <div>
-                  <label className="block text-xs text-slate-300 mb-1">Команда запуска (cmd)</label>
-                  <input
-                    type="text"
-                    placeholder="python3 main.py"
-                    value={customCmd}
-                    onChange={(e) => setCustomCmd(e.target.value)}
-                    className="w-full bg-[#111622] border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
-                  />
+                  <div>
+                    <label className="block text-xs text-slate-300 mb-1">Команда запуска (cmd)</label>
+                    <input
+                      type="text"
+                      placeholder="python3 -u main.py"
+                      value={customCmd}
+                      onChange={(e) => setCustomCmd(e.target.value)}
+                      className="w-full bg-[#111622] border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                    />
+                    <div className="mt-1.5 flex flex-wrap gap-1">
+                      {[
+                        { label: 'python3 -u main.py', cmd: 'python3 -u main.py' },
+                        { label: 'uvicorn 4 workers', cmd: 'uvicorn main:app --host 0.0.0.0 --port $PORT --workers 4' },
+                        { label: 'npm start', cmd: 'npm start' },
+                      ].map((c) => (
+                        <button
+                          key={c.label}
+                          type="button"
+                          onClick={() => setCustomCmd(c.cmd)}
+                          className="px-2 py-0.5 rounded text-[10px] font-mono bg-[#111622] hover:bg-slate-800 text-slate-400 hover:text-white border border-slate-800 cursor-pointer"
+                        >
+                          {c.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 </div>
               </div>
             )}

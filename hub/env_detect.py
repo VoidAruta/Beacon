@@ -1,5 +1,5 @@
 """
-Адаптивное определение среды запуска Aruta / Hub (hub/env_detect.py):
+Адаптивное определение среды запуска Beacon (hub/env_detect.py):
 Поддерживает три основных профиля:
 1. android_chroot — Android Linux Chroot / Termux (aarch64, root, aid_inet=3003, датчики батареи, без systemd)
 2. systemd_linux — Полноценный Linux-сервер / VPS / Мини-ПК / Raspberry Pi (systemd + cgroups v2)
@@ -100,7 +100,7 @@ def get_environment_profile() -> dict[str, Any]:
 
 def generate_systemd_unit(base_dir: Path | None = None, port: int = 8050, user: str = "root") -> str:
     """
-    Генерирует защищённый unit-файл systemd (aruta.service / hub.service) для стационарных Linux-серверов
+    Генерирует защищённый unit-файл systemd (beacon.service) для стационарных Linux-серверов
     с опциями hardening: NoNewPrivileges, ProtectSystem=strict, PrivateTmp, ReadWritePaths.
     """
     from hub.config import BASE_DIR
@@ -112,7 +112,7 @@ def generate_systemd_unit(base_dir: Path | None = None, port: int = 8050, user: 
         py_exec = str(venv_py)
 
     return f"""[Unit]
-Description=Beacon / Hub Control Panel (Lightweight Operations Console & Containerless PaaS)
+Description=Beacon Control Panel (Lightweight Operations Console & Containerless PaaS)
 After=network-online.target
 Wants=network-online.target
 
@@ -121,9 +121,7 @@ Type=simple
 User={user}
 WorkingDirectory={resolved_base}
 Environment="BEACON_DIR={resolved_base}"
-Environment="HUB_DIR={resolved_base}"
 Environment="BEACON_PORT={port}"
-Environment="HUB_PORT={port}"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart={py_exec} -m beacon
 Restart=always
@@ -137,7 +135,7 @@ ProtectSystem=strict
 PrivateTmp=yes
 ProtectControlGroups=yes
 ProtectKernelTunables=yes
-ReadWritePaths={resolved_base}/data {resolved_base}/projects {resolved_base}/scripts
+ReadWritePaths={resolved_base}/data {resolved_base}/projects
 
 [Install]
 WantedBy=multi-user.target

@@ -15,7 +15,7 @@ const SAMPLE_COOKIE_EDITOR_JSON = JSON.stringify(
     {
       domain: '.telegram.org',
       name: 'stel_ssid',
-      value: 'hub_refreshed_cookie_99281a',
+      value: 'beacon_refreshed_cookie_99281a',
       path: '/',
       httpOnly: true,
       secure: true,
@@ -92,7 +92,7 @@ export const GlobalAlertBanners: React.FC<GlobalAlertBannersProps> = ({
 
   return (
     <>
-      {/* 1. Жёлтый интерактивный баннер WAITING_INPUT (hub.ask) */}
+      {/* 1. Жёлтый интерактивный баннер WAITING_INPUT (beacon.ask) */}
       {pendingAsks.map((ask) => (
         <div
           key={ask.id}
@@ -137,7 +137,7 @@ export const GlobalAlertBanners: React.FC<GlobalAlertBannersProps> = ({
         </div>
       ))}
 
-      {/* 2. Красный баннер COOKIES_EXPIRED (hub.cookies_expired) */}
+      {/* 2. Красный баннер COOKIES_EXPIRED (beacon.cookies_expired) */}
       {expiredCookies.map((ck) => (
         <div
           key={ck.name}
@@ -203,7 +203,7 @@ export const GlobalAlertBanners: React.FC<GlobalAlertBannersProps> = ({
               <p className="text-xs text-slate-300">
                 Скопируйте JSON-массив из браузерного расширения <strong>Cookie-Editor</strong> (Export → JSON) и
                 вставьте ниже. Файл будет сохранён в{' '}
-                <code className="font-mono text-indigo-300">/opt/hub/data/secrets/{cookieModalTarget}</code> с правами{' '}
+                <code className="font-mono text-indigo-300">data/secrets/{cookieModalTarget}</code> с правами{' '}
                 <code className="font-mono text-emerald-400">0600</code>, а флаг <code className="font-mono">is_expired</code> сбросится в 0.
               </p>
 

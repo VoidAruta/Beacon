@@ -1,25 +1,29 @@
-# Минимальный Dockerfile для запуска Aruta Control Panel в контейнере (опционально)
+# Минимальный Dockerfile для запуска Beacon Control Panel в контейнере (опционально)
 FROM python:3.12-slim-bookworm
 
-WORKDIR /opt/aruta
+WORKDIR /opt/beacon
 
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends git curl ca-certificates sqlite3 && \
     rm -rf /var/lib/apt/lists/* && \
-    useradd --system --create-home --home-dir /home/hub-runner --shell /bin/bash hub-runner
+    useradd --system --create-home --home-dir /home/beacon-runner --shell /usr/sbin/nologin beacon-runner
 
-COPY requirements.txt /opt/aruta/requirements.txt
-RUN pip install --no-cache-dir -r /opt/aruta/requirements.txt
+COPY requirements.txt /opt/beacon/requirements.txt
+RUN pip install --no-cache-dir -r /opt/beacon/requirements.txt
 
-COPY . /opt/aruta
+COPY . /opt/beacon
 
-RUN mkdir -p /opt/aruta/data/secrets /opt/aruta/logs /opt/aruta/projects && \
-    chmod 0700 /opt/aruta/data/secrets && \
-    chown -R hub-runner:hub-runner /opt/aruta/projects /opt/aruta/logs
+RUN mkdir -p /opt/beacon/data/secrets /opt/beacon/data/logs /opt/beacon/data/backups /opt/beacon/data/generated /opt/beacon/projects && \
+    chmod 0700 /opt/beacon/data /opt/beacon/data/secrets /opt/beacon/data/backups && \
+    chown -R beacon-runner:beacon-runner /opt/beacon/projects /opt/beacon/data/logs
 
 ENV PYTHONUNBUFFERED=1
-ENV ARUTA_PORT=8050
+ENV BEACON_DIR=/opt/beacon
+ENV BEACON_PORT=8050
 
 EXPOSE 8050
 
-CMD ["python3", "-m", "aruta", "--port", "8050"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8050/api/auth/me)" && [ "$code" = "200" -o "$code" = "401" ] || exit 1
+
+CMD ["python3", "-m", "beacon", "--port", "8050"]

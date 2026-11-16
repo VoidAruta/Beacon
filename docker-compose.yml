@@ -1,14 +1,15 @@
 services:
-  aruta:
+  beacon:
     build: .
-    container_name: aruta-panel
+    container_name: beacon-panel
     restart: unless-stopped
     ports:
-      - "8050:8050"
+      - "127.0.0.1:8050:8050"
     environment:
-      - ARUTA_PORT=8050
+      - BEACON_DIR=/opt/beacon
+      - BEACON_PORT=8050
+      - BEACON_TRUSTED_PROXIES=127.0.0.1/32
       - PYTHONUNBUFFERED=1
     volumes:
-      - ./data:/opt/aruta/data
-      - ./logs:/opt/aruta/logs
-      - ./projects:/opt/aruta/projects
+      - ./data:/opt/beacon/data
+      - ./projects:/opt/beacon/projects

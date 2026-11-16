@@ -1,18 +1,19 @@
 """
-Адаптивная самодиагностика окружения Hub (`python3 -m hub doctor` и `GET /api/system/doctor`).
+Адаптивная самодиагностика окружения Beacon (`python3 -m beacon doctor` и `GET /api/system/doctor`).
 Одинаково корректно работает в двух средах:
 1. Android Linux Chroot / Termux (aarch64, GID 3003/3004, датчики батареи /sys/class/power_supply/battery)
 2. Полноценный Linux-сервер / VPS / Контейнер (x86_64 / aarch64, systemd или без него, стационарное питание)
 """
 
 import os
+import pwd
 import shutil
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
-from hub.auth import get_internal_token, is_default_password
+from hub.auth import get_internal_token, is_default_password, was_untrusted_proxy_header_seen
 from hub.compat import psutil
 from hub.config import BASE_DIR, DATA_DIR, INTERNAL_TOKEN_PATH, SECRETS_DIR, ensure_directories
 from hub.db import checkpoint_wal, db_session, get_all_settings
@@ -72,7 +73,7 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
             grp_status = "warn"
             grp_summary = (
                 "Среда Android Chroot: в /etc/group не найдены GID 3003/3004. "
-                "При запуске от root Hub автоматически передаёт GID 3003/3004 через os.setgroups."
+                "При запуске от root Beacon автоматически передаёт GID 3003/3004 через os.setgroups."
             )
     else:
         grp_status = "ok"
@@ -90,7 +91,7 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
             "fix_hint": (
                 "groupadd -g 3003 aid_inet && groupadd -g 3004 aid_net_raw"
                 if is_android
-                else "Для автозапуска на Linux с systemd выполните: python3 -m hub systemd"
+                else "Для автозапуска на Linux с systemd выполните: python3 -m beacon systemd"
             ),
             "details": {
                 "env_mode": env_prof["env_mode"],
@@ -268,10 +269,10 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
     checks.append(
         {
             "id": "ram_and_disk_budget",
-            "title": "Бюджет ОЗУ панели Hub (< 80 МБ) и свободное место на диске",
+            "title": "Бюджет ОЗУ панели Beacon (< 80 МБ) и свободное место на диске",
             "status": res_status,
             "summary": (
-                f"Потребление Hub RSS: {hub_rss_mb} МБ (лимит 80 МБ). Свободно на диске: {disk_st['free_mb']} МБ из {disk_st['total_mb']} МБ."
+                f"Потребление Beacon RSS: {hub_rss_mb} МБ (лимит 80 МБ). Свободно на диске: {disk_st['free_mb']} МБ из {disk_st['total_mb']} МБ."
             ),
             "fix_hint": "Используйте кнопку «Очистить кэш pip/uv/npm, .tmp и старые логи» в Настройках при нехватке места.",
             "details": {
@@ -309,8 +310,91 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
             "title": "Датчики питания и термомониторинг (Адаптивный режим)",
             "status": hw_status,
             "summary": hw_summary,
-            "fix_hint": "На смартфонах с root при нагреве >= 47°C Hub автоматически останавливает некритичные проекты.",
+            "fix_hint": "На смартфонах с root при нагреве >= 47°C Beacon автоматически останавливает некритичные проекты.",
             "details": hw,
+        }
+    )
+
+    # 9. Заголовки reverse proxy при пустом trusted_proxies (P0-5)
+    trusted_proxies_val = str(settings.get("trusted_proxies", "") or "").strip()
+    saw_untrusted_fwd = was_untrusted_proxy_header_seen()
+    if saw_untrusted_fwd and not trusted_proxies_val:
+        rp_status = "warn"
+        rp_summary = "Замечены proxy-заголовки (X-Forwarded-For/Forwarded/X-Real-IP/CF-Connecting-IP) от loopback, но trusted_proxies пуст."
+    else:
+        rp_status = "ok"
+        rp_summary = (
+            f"Настроены trusted_proxies: {trusted_proxies_val}"
+            if trusted_proxies_val
+            else "Недоверенных proxy-заголовков на loopback не зафиксировано."
+        )
+    checks.append(
+        {
+            "id": "reverse_proxy_headers",
+            "title": "Обратный прокси и trusted_proxies",
+            "status": rp_status,
+            "summary": rp_summary,
+            "fix_hint": "Если панель работает за nginx/Caddy/cloudflared на localhost, добавьте 127.0.0.1/32 в Настройки -> trusted_proxies.",
+            "details": {
+                "trusted_proxies": trusted_proxies_val,
+                "untrusted_proxy_headers_seen": saw_untrusted_fwd,
+            },
+        }
+    )
+
+    # 10. Пользователь исполнения дочерних процессов (P0-4)
+    run_as_user = str(settings.get("run_as_user", "root") or "root").strip() or "root"
+    user_exists = True
+    if run_as_user != "root":
+        try:
+            pwd.getpwnam(run_as_user)
+        except KeyError:
+            user_exists = False
+    if run_as_user == "root":
+        rau_status = "error"
+        rau_summary = (
+            "run_as_user=root: дочерние проекты запускаются от root и имеют прямой доступ к data/secrets и hub.db."
+        )
+    elif not user_exists:
+        rau_status = "error"
+        rau_summary = f"run_as_user='{run_as_user}' не найден в /etc/passwd — запуск проектов завершится с exit 126."
+    else:
+        rau_status = "ok"
+        rau_summary = f"Дочерние проекты изолированы под непривилегированным пользователем '{run_as_user}'."
+    checks.append(
+        {
+            "id": "run_as_user",
+            "title": "Изоляция дочерних процессов (run_as_user)",
+            "status": rau_status,
+            "summary": rau_summary,
+            "fix_hint": "Создайте системного пользователя: useradd -r -s /usr/sbin/nologin beacon-runner && установите run_as_user=beacon-runner.",
+            "details": {"run_as_user": run_as_user, "exists_in_passwd": user_exists},
+        }
+    )
+
+    # 11. Ограничение RAM через systemd-run --scope / PGID RSS watchdog (P1-8)
+    if env_prof.get("env_mode") == "systemd_linux" and env_prof.get("has_systemd_run") and env_prof.get("has_cgroups_v2"):
+        from hub.process_mgr import check_systemd_run_scope_capable
+
+        sr_ok, sr_msg = check_systemd_run_scope_capable()
+        ram_enf_status = "ok" if sr_ok else "warn"
+        ram_enf_summary = (
+            "systemd-run --scope --property=MemoryMax=... поддерживается ядром (cgroups v2)."
+            if sr_ok
+            else f"systemd-run --scope недоступен ({sr_msg}); используется встроенный сторож PGID RSS."
+        )
+    else:
+        sr_ok, sr_msg = False, "pgid_rss_watchdog"
+        ram_enf_status = "ok"
+        ram_enf_summary = f"Контроль ram_limit_mb выполняется встроенным наблюдателем PGID RSS ({env_prof.get('env_mode')})."
+    checks.append(
+        {
+            "id": "systemd_run_ram_limit",
+            "title": "Ограничение памяти проектов (systemd-run MemoryMax / PGID RSS)",
+            "status": ram_enf_status,
+            "summary": ram_enf_summary,
+            "fix_hint": "Для жёсткого cgroup MemoryMax запустите панель с правами создания transient scope.",
+            "details": {"systemd_scope_ok": sr_ok, "detail": sr_msg},
         }
     )
 
@@ -335,11 +419,11 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
 
 
 def print_doctor_cli(report: dict[str, Any]) -> int:
-    """Форматированный вывод результата `python3 -m hub doctor` в терминал."""
+    """Форматированный вывод результата `python3 -m beacon doctor` в терминал."""
     icons = {"ok": "[ OK ]", "warn": "[WARN]", "error": "[FAIL]"}
     env_label = report.get("env_profile", {}).get("env_label", "Linux")
     print("=" * 78)
-    print(f"  HUB DOCTOR · Самодиагностика окружения [{env_label}] ({report['duration_ms']} мс)")
+    print(f"  BEACON DOCTOR · Самодиагностика окружения [{env_label}] ({report['duration_ms']} мс)")
     print(f"  Рабочая директория: {report['base_dir']}")
     print("=" * 78)
     for chk in report["checks"]:

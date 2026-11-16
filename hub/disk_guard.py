@@ -3,6 +3,7 @@
 и очистка системного кэша pip / npm.
 """
 
+import asyncio
 import os
 import subprocess
 import time
@@ -134,15 +135,47 @@ def rotate_and_prune_logs() -> dict[str, int]:
                 execute_sql("DELETE FROM runs WHERE id = ?", (extra["id"],))
                 deleted_runs += 1
 
-    return {"rotated_files": rotated_files, "deleted_runs": deleted_runs}
+    # 4. Ретенция таблиц аудита, одобрений, опросов и отозванных сессий (P2-08)
+    now_ts = int(time.time())
+    from hub.db import execute_rowcount
+
+    pruned_audit = execute_rowcount("DELETE FROM audit_log WHERE timestamp < ?", (now_ts - 90 * 86400,))
+    pruned_ai_audit = execute_rowcount("DELETE FROM ai_audit_log WHERE timestamp < ?", (now_ts - 30 * 86400,))
+    pruned_approvals = execute_rowcount(
+        "DELETE FROM ai_approvals WHERE status != 'pending' AND created_at < ?",
+        (now_ts - 30 * 86400,),
+    )
+    pruned_asks = execute_rowcount(
+        "DELETE FROM pending_asks WHERE status != 'pending' AND created_at < ?",
+        (now_ts - 7 * 86400,),
+    )
+    pruned_sessions = execute_rowcount("DELETE FROM revoked_sessions WHERE exp < ?", (now_ts,))
+
+    return {
+        "rotated_files": rotated_files,
+        "deleted_runs": deleted_runs,
+        "pruned_audit": pruned_audit,
+        "pruned_ai_audit": pruned_ai_audit,
+        "pruned_approvals": pruned_approvals,
+        "pruned_asks": pruned_asks,
+        "pruned_sessions": pruned_sessions,
+    }
 
 
 async def check_disk_and_maintain() -> None:
-    """Периодическая проверка диска, ротация логов и чекпоинт SQLite WAL."""
+    """Периодическая проверка диска, ротация логов, чекпоинт SQLite WAL и автобэкап (в worker-потоке)."""
     global _LAST_DISK_WARN_TS
-    rotate_and_prune_logs()
-    checkpoint_wal(truncate_threshold_mb=4.0)
-    st = get_disk_status()
+    await asyncio.to_thread(rotate_and_prune_logs)
+    await asyncio.to_thread(checkpoint_wal, 4.0)
+    try:
+        from hub.backup_mgr import run_auto_backup_if_due
+
+        await asyncio.to_thread(run_auto_backup_if_due)
+    except Exception:
+        from hub.log import get_logger
+
+        get_logger("disk_guard").exception("Ошибка выполнения планового автобэкапа")
+    st = await asyncio.to_thread(get_disk_status)
     now = time.time()
     if st["state"] in ("warning", "critical") and (now - _LAST_DISK_WARN_TS > 3600):
         _LAST_DISK_WARN_TS = now

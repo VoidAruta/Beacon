@@ -607,6 +607,28 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
                 placeholder="127.0.0.1, 192.168.1.0/24"
                 className="w-full bg-[#0b0f17] border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white font-mono"
               />
+              <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAllowedIps('127.0.0.1/32,::1/128');
+                    setAllowAnyIp(false);
+                  }}
+                  className="px-2 py-0.5 text-[10px] font-mono bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 rounded cursor-pointer"
+                >
+                  Только localhost
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAllowedIps('127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10');
+                    setAllowAnyIp(false);
+                  }}
+                  className="px-2 py-0.5 text-[10px] font-mono bg-slate-900 hover:bg-slate-800 text-indigo-300 border border-slate-700 rounded cursor-pointer"
+                >
+                  LAN + Tailscale
+                </button>
+              </div>
               {!allowedIps.trim() && (
                 <label className="mt-1.5 flex items-center gap-1.5 text-[11px] text-amber-300 cursor-pointer">
                   <input

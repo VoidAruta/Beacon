@@ -14,12 +14,17 @@ import urllib.request
 from collections import namedtuple
 from typing import Any, Iterator, Optional
 
+from hub.log import get_logger
+
+_compat_logger = get_logger("compat")
+
 # ==============================================================================
 # 1. PSUTIL (нативный пакет или прямое чтение ядра Linux /proc)
 # ==============================================================================
 try:
     import psutil as psutil  # type: ignore
 except ImportError:
+    _compat_logger.warning("Пакет psutil не установлен; используется встроенная эмуляция через /proc")
     pmem = namedtuple("pmem", ["rss", "vms"])
     svmem = namedtuple("svmem", ["total", "available", "percent", "used", "free"])
     sdiskusage = namedtuple("sdiskusage", ["total", "used", "free", "percent"])
@@ -140,6 +145,24 @@ except ImportError:
             st = self._read_stat()
             return int(st[3])
 
+        def environ(self) -> dict[str, str]:
+            try:
+                with open(f"/proc/{self.pid}/environ", "rb") as f:
+                    raw = f.read()
+                out: dict[str, str] = {}
+                for entry in raw.split(b"\x00"):
+                    if not entry or b"=" not in entry:
+                        continue
+                    k, v = entry.split(b"=", 1)
+                    out[k.decode("utf-8", errors="ignore")] = v.decode("utf-8", errors="ignore")
+                return out
+            except FileNotFoundError as e:
+                raise NoSuchProcess(self.pid) from e
+            except PermissionError as e:
+                raise AccessDenied(self.pid) from e
+            except Exception:
+                return {}
+
         def cmdline(self) -> list[str]:
             try:
                 with open(f"/proc/{self.pid}/cmdline", "rb") as f:
@@ -241,6 +264,7 @@ except ImportError:
 try:
     from croniter import croniter as croniter  # type: ignore
 except ImportError:
+    _compat_logger.warning("Пакет croniter не установлен; используется встроенный POSIX-парсер cron")
     class croniter:  # type: ignore
         """Полная реализация 5-польного cron-вычислителя (минута час день месяц день_недели)."""
 
@@ -319,6 +343,7 @@ except ImportError:
 try:
     import httpx as httpx  # type: ignore
 except ImportError:
+    _compat_logger.warning("Пакет httpx не установлен; используется встроенный urllib HTTP-клиент")
     class _FallbackResponse:
         def __init__(self, status_code: int, text: str, headers: dict[str, str]):
             self.status_code = status_code

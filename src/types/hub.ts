@@ -38,8 +38,48 @@ export interface ProxyReachabilityStatus {
   disabled?: boolean;
 }
 
+export interface NetworkInterfaceStat {
+  name: string;
+  rx_mb: number;
+  tx_mb: number;
+  rx_kbps: number;
+  tx_kbps: number;
+  is_tunnel?: boolean;
+}
+
+export interface ActiveWebPortStat {
+  project_id: number;
+  project_name: string;
+  port: number;
+  status: string;
+  endpoint_online: boolean;
+}
+
+export interface NetworkHistoryPoint {
+  ts: number;
+  rx_kbps: number;
+  tx_kbps: number;
+}
+
+export interface NetworkTelemetry {
+  rx_bytes: number;
+  tx_bytes: number;
+  rx_mb: number;
+  tx_mb: number;
+  rx_packets: number;
+  tx_packets: number;
+  rx_kbps: number;
+  tx_kbps: number;
+  tcp_established: number;
+  tcp_listen: number;
+  interfaces: NetworkInterfaceStat[];
+  active_web_ports: ActiveWebPortStat[];
+  history: NetworkHistoryPoint[];
+}
+
 export interface SystemStatus {
   cpu_percent: number;
+  cpu_count?: number;
   ram_total_mb: number;
   ram_used_mb: number;
   ram_available_mb: number;
@@ -59,6 +99,7 @@ export interface SystemStatus {
     can_start_runs: boolean;
     wal_size_kb?: number;
   };
+  network?: NetworkTelemetry;
   proxy_url: string;
   proxy_status?: ProxyReachabilityStatus;
   hardware?: PocoHardwareStatus;
@@ -184,8 +225,8 @@ export interface ProjectItem {
   max_retries: number;
   retry_delay_sec: number;
   webhook_token: string;
-  ping_token?: string;
   webhook_hmac_secret?: string;
+  ping_token?: string;
   autostart: number;
   restart_policy: 'no' | 'on-failure' | 'always';
   backoff_min_sec: number;
@@ -212,6 +253,7 @@ export interface ProjectItem {
   pgid: number | null;
   rss_mb: number;
   cpu_percent: number;
+  proc_count?: number;
   last_run: RunItem | null;
   code_size_bytes: number;
   logs_size_bytes: number;
@@ -248,12 +290,19 @@ export interface NotificationEvent {
 
 export interface DashboardData {
   system: SystemStatus;
+  env_profile?: SystemStatus['env_profile'];
   pending_asks: PendingAsk[];
   expired_cookies: ExpiredCookie[];
   projects: ProjectItem[];
   upcoming_runs: UpcomingRun[];
   recent_errors: RunItem[];
   recent_notifications: NotificationEvent[];
+}
+
+export interface CookieMeta {
+  count: number;
+  domains: string[];
+  earliest_expiry?: number | null;
 }
 
 export interface SecretItem {
@@ -266,6 +315,7 @@ export interface SecretItem {
   masked_value: string;
   size_bytes: number;
   used_by_projects?: string[];
+  cookie_meta?: CookieMeta;
 }
 
 export interface FileTreeNode {
@@ -280,6 +330,7 @@ export interface AuditEntry {
   id: number;
   timestamp: number;
   ip: string;
+  actor?: string;
   action: string;
   details: string;
 }

@@ -22,28 +22,42 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
-      - name: Install frontend dependencies & build static UI into hub/static/
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install frontend dependencies, typecheck & build static UI into hub/static/
         run: |
           npm ci
+          npm run lint
+          npx tsx --test src/utils/hubLogic.test.ts
           npm run build:static
+          test ! -d hub/static/assets/aistudio
 
-      - name: Package standalone release archive (no Node.js required on Android phone)
+      - name: Package standalone release archive (no Node.js required on target host)
         run: |
-          mkdir -p dist-release/hub-server
-          cp -r hub sdk scripts projects requirements.txt README.md LICENSE SECURITY.md CONTRIBUTING.md CHANGELOG.md .gitignore dist-release/hub-server/
-          mkdir -p dist-release/hub-server/data
-          cp data/.gitkeep dist-release/hub-server/data/
-          tar -czf hub-server-aarch64-release.tar.gz -C dist-release hub-server
+          mkdir -p dist-release/beacon-server/data
+          cp -r beacon aruta hub sdk scripts projects docs AGENTS.md requirements.txt README.md LICENSE SECURITY.md CONTRIBUTING.md CHANGELOG.md .gitignore dist-release/beacon-server/
+          cp data/.gitkeep dist-release/beacon-server/data/
+          tar -czf beacon-release.tar.gz -C dist-release beacon-server
+
+      - name: Smoke-test unpacked release tarball
+        run: |
+          mkdir -p /tmp/beacon-release-smoke
+          tar -xzf beacon-release.tar.gz -C /tmp/beacon-release-smoke
+          python3 -m pip install -r /tmp/beacon-release-smoke/beacon-server/requirements.txt --quiet
+          cd /tmp/beacon-release-smoke/beacon-server && BEACON_DIR=/tmp/beacon-release-smoke/beacon-server python3 -m beacon doctor
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hub-server-aarch64-release
-          path: hub-server-aarch64-release.tar.gz
+          name: beacon-release
+          path: beacon-release.tar.gz
 
       - name: Create GitHub Release (on tag push)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: hub-server-aarch64-release.tar.gz
+          files: beacon-release.tar.gz
           generate_release_notes: true

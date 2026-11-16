@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Универсальный установщик Aruta (совместимо с Hub) (Ubuntu/Debian aarch64 & x86_64)
+# Универсальный установщик Beacon Control Panel (Ubuntu/Debian aarch64 & x86_64)
 # Автоматически определяет профиль окружения:
 #   1) Android Chroot / Termux (без systemd, с группами aid_inet 3003 / aid_net_raw 3004)
-#   2) Полноценный Linux VPS / Mini-PC / Raspberry Pi (systemd unit + непривилегированный hub-runner)
+#   2) Полноценный Linux VPS / Mini-PC / Raspberry Pi (systemd unit + непривилегированный beacon-runner)
 # ==============================================================================
 set -euo pipefail
 
-ARUTA_DIR="${ARUTA_DIR:-${HUB_DIR:-/opt/hub}}"
-ARUTA_PORT="${ARUTA_PORT:-${HUB_PORT:-8050}}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BEACON_DIR="${BEACON_DIR:-${ARUTA_DIR:-${HUB_DIR:-$SCRIPT_DIR}}}"
+BEACON_PORT="${BEACON_PORT:-${ARUTA_PORT:-${HUB_PORT:-8050}}}"
 
 echo "================================================================"
-echo "  Установка Aruta Control Panel в ${ARUTA_DIR}"
+echo "  Установка Beacon Control Panel в ${BEACON_DIR}"
 echo "================================================================"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -37,10 +38,10 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq python3 python3-venv python3-pip sqlite3 git curl ca-certificates >/dev/null
 
-# 3. Создание непривилегированного пользователя hub-runner для дочерних проектов
-if ! id -u hub-runner >/dev/null 2>&1; then
-    echo "[*] Создание системного пользователя hub-runner..."
-    useradd --system --create-home --home-dir /home/hub-runner --shell /bin/bash hub-runner || true
+# 3. Создание непривилегированного пользователя beacon-runner для дочерних проектов
+if ! id -u beacon-runner >/dev/null 2>&1; then
+    echo "[*] Создание системного пользователя beacon-runner..."
+    useradd --system --create-home --home-dir /home/beacon-runner --shell /usr/sbin/nologin beacon-runner || true
 fi
 
 # В Android Chroot добавляем пользователя в группы aid_inet (3003) и aid_net_raw (3004) для доступа к сокетам
@@ -48,47 +49,55 @@ if [ "$IS_ANDROID_CHROOT" -eq 1 ]; then
     echo "[*] Обнаружено ядро Android: настройка групп aid_inet (3003) и aid_net_raw (3004)..."
     groupadd -g 3003 -f aid_inet || true
     groupadd -g 3004 -f aid_net_raw || true
-    usermod -aG 3003,3004 hub-runner || true
+    usermod -aG 3003,3004 beacon-runner || true
     usermod -aG 3003,3004 root || true
 fi
 
 # 4. Создание структуры каталогов и прав
-mkdir -p "${ARUTA_DIR}/data/secrets" "${ARUTA_DIR}/logs" "${ARUTA_DIR}/projects/examples" "${ARUTA_DIR}/scripts"
-chmod 0700 "${ARUTA_DIR}/data/secrets"
-chown -R hub-runner:hub-runner "${ARUTA_DIR}/projects" "${ARUTA_DIR}/logs" || true
+mkdir -p \
+    "${BEACON_DIR}/data/secrets" \
+    "${BEACON_DIR}/data/logs" \
+    "${BEACON_DIR}/data/backups" \
+    "${BEACON_DIR}/data/generated" \
+    "${BEACON_DIR}/projects/examples" \
+    "${BEACON_DIR}/scripts"
 
-# 5. Виртуальное окружение Python (.venv) и лёгкие зависимости (только pre-built wheels)
-if [ ! -d "${ARUTA_DIR}/.venv" ]; then
-    echo "[*] Создание виртуального окружения ${ARUTA_DIR}/.venv..."
-    python3 -m venv "${ARUTA_DIR}/.venv"
+chmod 0700 "${BEACON_DIR}/data" "${BEACON_DIR}/data/secrets" "${BEACON_DIR}/data/backups"
+chown -R beacon-runner:beacon-runner "${BEACON_DIR}/projects" "${BEACON_DIR}/data/logs" || true
+
+# 5. Виртуальное окружение Python (.venv) и лёгкие зависимости (только pre-built wheels в приоритете)
+if [ ! -d "${BEACON_DIR}/.venv" ]; then
+    echo "[*] Создание виртуального окружения ${BEACON_DIR}/.venv..."
+    python3 -m venv "${BEACON_DIR}/.venv"
 fi
 
-echo "[*] Установка зависимостей в ${ARUTA_DIR}/.venv..."
-"${ARUTA_DIR}/.venv/bin/pip" install --upgrade pip --quiet
-"${ARUTA_DIR}/.venv/bin/pip" install --only-binary=:all: -r "${ARUTA_DIR}/requirements.txt" --quiet || \
-    "${ARUTA_DIR}/.venv/bin/pip" install -r "${ARUTA_DIR}/requirements.txt" --quiet
+echo "[*] Установка зависимостей в ${BEACON_DIR}/.venv..."
+"${BEACON_DIR}/.venv/bin/pip" install --upgrade pip --quiet
+"${BEACON_DIR}/.venv/bin/pip" install --only-binary=:all: -r "${BEACON_DIR}/requirements.txt" --quiet || \
+    "${BEACON_DIR}/.venv/bin/pip" install -r "${BEACON_DIR}/requirements.txt" --quiet
 
-# 6. Инициализация БД и запуск самодиагностики Doctor
+# 6. Миграция БД и запуск самодиагностики Doctor
 echo "[*] Инициализация базы данных SQLite (WAL) и проверка окружения..."
-cd "${ARUTA_DIR}"
-"${ARUTA_DIR}/.venv/bin/python" -m aruta doctor || true
+cd "${BEACON_DIR}"
+export BEACON_DIR BEACON_PORT
+"${BEACON_DIR}/.venv/bin/python" -m beacon migrate
+"${BEACON_DIR}/.venv/bin/python" -m beacon doctor || true
 
-# 7. Настройка автозапуска (systemd или zstart.sh для Android Chroot)
+# 7. Настройка автозапуска (systemd или zstart_line.sh для Android Chroot)
 if [ "$HAS_SYSTEMD" -eq 1 ]; then
-    echo "[*] Генерация и регистрация службы systemd (aruta.service)..."
-    "${ARUTA_DIR}/.venv/bin/python" -m aruta systemd >/dev/null
-    cp "${ARUTA_DIR}/scripts/aruta.service" /etc/systemd/system/aruta.service
-    cp "${ARUTA_DIR}/scripts/hub.service" /etc/systemd/system/hub.service
+    echo "[*] Генерация и регистрация службы systemd (beacon.service)..."
+    "${BEACON_DIR}/.venv/bin/python" -m beacon systemd >/dev/null
+    cp "${BEACON_DIR}/data/generated/beacon.service" /etc/systemd/system/beacon.service
     systemctl daemon-reload
-    systemctl enable --now aruta.service
-    echo "[+] Служба aruta.service запущена через systemd!"
+    systemctl enable --now beacon.service
+    echo "[+] Служба beacon.service запущена через systemd!"
 else
     echo "[*] Среда без systemd (Android Chroot / контейнер)."
-    echo "    Для автозапуска добавьте строку из ${ARUTA_DIR}/scripts/zstart_line.sh в ваш стартовый скрипт:"
-    cat "${ARUTA_DIR}/scripts/zstart_line.sh" || true
+    echo "    Для автозапуска добавьте строку из ${BEACON_DIR}/scripts/zstart_line.sh в ваш стартовый скрипт:"
+    cat "${BEACON_DIR}/scripts/zstart_line.sh" || true
 fi
 
 echo "================================================================"
-echo "  Установка завершена! Веб-панель: http://127.0.0.1:${ARUTA_PORT}"
+echo "  Установка завершена! Веб-панель: http://127.0.0.1:${BEACON_PORT}"
 echo "  Пароль по умолчанию: admin (смените его сразу в Настройках!)"
 echo "================================================================"

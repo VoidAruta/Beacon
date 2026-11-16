@@ -1,0 +1,492 @@
+import { ProjectItem } from '../../types/hub';
+
+export const DEFAULTS = {
+  POLL_RUNS_MS: 2500,
+  POLL_LOG_MS: 2000,
+  SIDEBAR_MAX_HEIGHT_PX: 640,
+  EDITOR_HEIGHT_NORMAL_PX: 470,
+  EDITOR_HEIGHT_TALL_PX: 660,
+  DEFAULT_RAM_LIMIT_MB: 128,
+  INITIAL_RUNS_LIMIT: 15,
+  RUNS_PAGE_STEP: 15,
+  APPROX_LINE_HEIGHT_PX: 20,
+} as const;
+
+export const LABELS = {
+  workspaceEmptyTitle: 'Рабочая область проектов пуста',
+  workspaceEmptySubtitle:
+    'Создайте новый проект (бота, веб-сервис с портом $PORT или периодическую задачу) либо загрузите готовые эталонные шаблоны в один клик.',
+  dirtyDeployWarning:
+    'Файлы или настройки проекта были изменены после запуска процесса — перезапустите проект, чтобы изменения вступили в силу.',
+  dirtyDeployAction: 'Перезапустить сейчас (Ctrl+Shift+S)',
+  actionsMenuLabel: 'Действия',
+  fuzzyModalTitle: 'Быстрый переход к файлу проекта (Alt+P)',
+  deleteFileModalTitle: 'Подтверждение удаления',
+  dragDropHint: 'Перетащите файлы или .zip сюда для загрузки в выбранную папку',
+} as const;
+
+export type NoticeTone = 'success' | 'error' | 'warning' | 'info';
+
+export function classifyStatusNotice(message: string): NoticeTone {
+  const lower = (message || '').toLowerCase();
+  if (
+    lower.includes('ошибк') ||
+    lower.includes('сбой') ||
+    lower.includes('не удал') ||
+    lower.includes('невалид') ||
+    lower.includes('не найден') ||
+    lower.includes('fail') ||
+    lower.includes('error')
+  ) {
+    return 'error';
+  }
+  if (
+    lower.includes('внимание') ||
+    lower.includes('предупрежд') ||
+    lower.includes('истек') ||
+    lower.includes('ожидает')
+  ) {
+    return 'warning';
+  }
+  if (
+    lower.includes('загрузк') ||
+    lower.includes('сохранение...') ||
+    lower.includes('отправка') ||
+    lower.includes('выполнение') ||
+    lower.includes('проверка...')
+  ) {
+    return 'info';
+  }
+  return 'success';
+}
+
+export function formatShortTime(ts: number | string | null | undefined, locale?: string): string {
+  if (!ts) return '—';
+  try {
+    const ms = typeof ts === 'number' ? (ts < 1e12 ? ts * 1000 : ts) : Date.parse(ts);
+    const d = new Date(ms);
+    if (isNaN(d.getTime())) return String(ts);
+    const resolvedLocale =
+      locale ||
+      (typeof Intl !== 'undefined' ? Intl.DateTimeFormat().resolvedOptions().locale : undefined) ||
+      'ru-RU';
+    return d.toLocaleTimeString(resolvedLocale, {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+  } catch {
+    return String(ts);
+  }
+}
+
+export function formatLiveUptime(startedAtSec: number | null | undefined, nowSec: number): string {
+  if (!startedAtSec || startedAtSec <= 0) return '—';
+  const start = startedAtSec > 1e12 ? Math.floor(startedAtSec / 1000) : Math.floor(startedAtSec);
+  const diff = Math.max(0, Math.floor(nowSec - start));
+  if (diff < 60) return `${diff}с`;
+  const mins = Math.floor(diff / 60);
+  const secs = diff % 60;
+  if (mins < 60) return `${mins}м ${String(secs).padStart(2, '0')}с`;
+  const hours = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  if (hours < 24) return `${hours}ч ${String(remMins).padStart(2, '0')}м`;
+  const days = Math.floor(hours / 24);
+  const remHours = hours % 24;
+  return `${days}д ${remHours}ч ${remMins}м`;
+}
+
+export function getDepsButtonMeta(runtime: string | undefined): {
+  visible: boolean;
+  label: string;
+  busyLabel: string;
+  title: string;
+} {
+  const rt = (runtime || 'python').toLowerCase();
+  if (rt.includes('node') || rt.includes('js') || rt.includes('ts')) {
+    return {
+      visible: true,
+      label: 'npm install',
+      busyLabel: 'npm install...',
+      title: 'Установить пакеты Node.js из package.json (npm ci / npm install)',
+    };
+  }
+  if (rt.includes('bash') || rt.includes('sh') || rt.includes('shell')) {
+    return {
+      visible: false,
+      label: 'Зависимости',
+      busyLabel: 'Проверка...',
+      title: 'Проверить окружение Shell-скрипта',
+    };
+  }
+  return {
+    visible: true,
+    label: '.venv / pip install',
+    busyLabel: 'Установка .venv...',
+    title: 'Создать изолированный .venv и установить зависимости из requirements.txt через uv / pip',
+  };
+}
+
+export function generateBeaconFileTemplate(
+  targetPath: string,
+  project?: Partial<ProjectItem> | null
+): string {
+  const lower = (targetPath || '').toLowerCase();
+  const baseName = lower.split('/').pop() || lower;
+  const projName = project?.name || 'my-service';
+  const projType = project?.type || 'service';
+  const projRuntime = project?.runtime || 'python';
+  const projCmd = project?.cmd || 'python3 main.py';
+
+  if (baseName === 'requirements.txt') {
+    return [
+      '# Зависимости Python-проекта (устанавливаются в изолированный .venv)',
+      'httpx>=0.27.0',
+      'pyyaml>=6.0.1',
+      '',
+    ].join('\n');
+  }
+
+  if (baseName === 'project.yaml' || baseName === 'project.yml') {
+    return [
+      `# Декларативный манифест проекта Beacon`,
+      `name: ${projName}`,
+      `type: ${projType}`,
+      `runtime: ${projRuntime}`,
+      `cmd: ${projCmd}`,
+      `autostart: ${project?.autostart ? 'true' : 'false'}`,
+      `restart_policy: ${project?.restart_policy || 'on-failure'}`,
+      `ram_limit_mb: ${project?.ram_limit_mb ?? DEFAULTS.DEFAULT_RAM_LIMIT_MB}`,
+      ...(projType === 'web'
+        ? [`port: ${project?.port || 8080}`, `healthcheck_url: http://127.0.0.1:${project?.port || 8080}/health`]
+        : []),
+      ...(projType === 'job'
+        ? [
+            `schedule_type: ${project?.schedule_type || 'cron'}`,
+            `schedule_expr: "${project?.schedule_expr || '*/15 * * * *'}"`,
+          ]
+        : []),
+      '',
+    ].join('\n');
+  }
+
+  if (baseName === 'package.json') {
+    return JSON.stringify(
+      {
+        name: projName,
+        version: '1.0.0',
+        private: true,
+        scripts: {
+          start: 'node index.js',
+        },
+        dependencies: {},
+      },
+      null,
+      2
+    ) + '\n';
+  }
+
+  if (lower.endsWith('.py')) {
+    return [
+      '# -*- coding: utf-8 -*-',
+      'import beacon',
+      '',
+      'def main() -> None:',
+      `    print("Старт проекта ${projName}...", flush=True)`,
+      '    # Чтение и сохранение состояния в SQLite:',
+      '    runs = int(beacon.state.get("runs_count", 0) or 0) + 1',
+      '    beacon.state.set("runs_count", runs)',
+      '    beacon.ping()',
+      '',
+      'if __name__ == "__main__":',
+      '    main()',
+      '',
+    ].join('\n');
+  }
+
+  if (lower.endsWith('.js') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) {
+    return [
+      "const beacon = require('beacon');",
+      '',
+      'async function main() {',
+      `  console.log('Старт проекта ${projName}...');`,
+      "  const runs = Number((await beacon.state.get('runs_count', 0)) || 0) + 1;",
+      "  await beacon.state.set('runs_count', runs);",
+      '  await beacon.ping();',
+      '}',
+      '',
+      'main().catch((err) => {',
+      '  console.error(err);',
+      '  process.exit(1);',
+      '});',
+      '',
+    ].join('\n');
+  }
+
+  if (lower.endsWith('.sh') || lower.endsWith('.bash')) {
+    return [
+      '#!/usr/bin/env bash',
+      'set -euo pipefail',
+      '',
+      `echo "Запуск скрипта ${projName}..."`,
+      '',
+    ].join('\n');
+  }
+
+  if (lower.endsWith('.json')) {
+    return '{\n  \n}\n';
+  }
+
+  return '';
+}
+
+export interface SdkSnippetItem {
+  id: string;
+  label: string;
+  badgeColor: string;
+  description: string;
+  code: string;
+}
+
+export function getRuntimeSdkSnippets(
+  runtime: string | undefined,
+  projectName: string,
+  cookieSecretName: string
+): SdkSnippetItem[] {
+  const rt = (runtime || 'python').toLowerCase();
+  const secCookie = cookieSecretName || `${projectName}_cookies`;
+
+  if (rt.includes('node') || rt.includes('js') || rt.includes('ts')) {
+    return [
+      {
+        id: 'notify',
+        label: '+ beacon.notify()',
+        badgeColor: 'text-sky-300 border-sky-800/60',
+        description: 'Отправить уведомление в Telegram и журнал панели',
+        code: [
+          "const beacon = require('beacon');",
+          "// Отправка уведомления ('info' | 'warn' | 'error'):",
+          `await beacon.notify('Задача в ${projectName} успешно выполнена!', 'info');`,
+        ].join('\n'),
+      },
+      {
+        id: 'ask',
+        label: '+ beacon.ask("2FA")',
+        badgeColor: 'text-amber-300 border-amber-800/60',
+        description: 'Запросить 2FA-код или капчу в панели и в Telegram',
+        code: [
+          "const beacon = require('beacon');",
+          '// Ожидание интерактивного ответа от оператора (таймаут 300с):',
+          "const code = await beacon.ask('Введите 2FA-код из SMS:', 300);",
+          "console.log('Получен код:', code);",
+        ].join('\n'),
+      },
+      {
+        id: 'state',
+        label: '+ beacon.state.get/set',
+        badgeColor: 'text-indigo-300 border-indigo-800/60',
+        description: 'Чтение и запись постоянного состояния (KV)',
+        code: [
+          "const beacon = require('beacon');",
+          '// Постоянное состояние проекта (переживает перезапуски):',
+          "const count = Number((await beacon.state.get('processed_count', 0)) || 0);",
+          "await beacon.state.set('processed_count', count + 1);",
+        ].join('\n'),
+      },
+      {
+        id: 'secret',
+        label: '+ beacon.secret("cookies")',
+        badgeColor: 'text-emerald-300 border-emerald-800/60',
+        description: 'Чтение кук или API-ключа из сейфа 0600',
+        code: [
+          "const beacon = require('beacon');",
+          '// Чтение защищённого секрета или JSON кук из сейфа:',
+          `const rawCookies = await beacon.secret('${secCookie}');`,
+          "const cookies = typeof rawCookies === 'string' && rawCookies ? JSON.parse(rawCookies) : (rawCookies || []);",
+        ].join('\n'),
+      },
+      {
+        id: 'cookies_expired',
+        label: '+ beacon.cookies_expired()',
+        badgeColor: 'text-rose-300 border-rose-800/60',
+        description: 'Сигнал о протухших куках (вызывает баннер в панели)',
+        code: [
+          "const beacon = require('beacon');",
+          '// Пометить куки как истекшие и уведомить администратора:',
+          `await beacon.cookies_expired('${secCookie}', 'Сессия истекла (HTTP 401), обновите Cookie-Editor JSON');`,
+        ].join('\n'),
+      },
+      {
+        id: 'ping',
+        label: '+ beacon.ping()',
+        badgeColor: 'text-cyan-300 border-cyan-800/60',
+        description: "Dead Man's Switch (пульс живучести)",
+        code: [
+          "const beacon = require('beacon');",
+          "// Отправка пульса Dead Man's Switch:",
+          'await beacon.ping();',
+        ].join('\n'),
+      },
+    ];
+  }
+
+  return [
+    {
+      id: 'notify',
+      label: '+ beacon.notify()',
+      badgeColor: 'text-sky-300 border-sky-800/60',
+      description: 'Отправить уведомление в Telegram и журнал панели',
+      code: [
+        'import beacon',
+        '# Отправка уведомления в Telegram и панель (level="info" | "warn" | "error"):',
+        `beacon.notify("Задача в ${projectName} успешно выполнена!", level="info")`,
+      ].join('\n'),
+    },
+    {
+      id: 'ask',
+      label: '+ beacon.ask("2FA код")',
+      badgeColor: 'text-amber-300 border-amber-800/60',
+      description: 'Запросить 2FA-код или капчу в веб-панели и Telegram',
+      code: [
+        'import beacon',
+        '# Запрос 2FA/капчи в веб-панель и Telegram (таймаут 300с):',
+        'code = beacon.ask("Введите код подтверждения из SMS:", timeout=300)',
+        'print("Получен код:", code, flush=True)',
+      ].join('\n'),
+    },
+    {
+      id: 'state',
+      label: '+ beacon.state.get/set',
+      badgeColor: 'text-indigo-300 border-indigo-800/60',
+      description: 'Чтение и запись постоянного состояния (KV)',
+      code: [
+        'import beacon',
+        '# Чтение и запись постоянного состояния (переживает рестарты):',
+        'count = int(beacon.state.get("processed_count", 0) or 0)',
+        'beacon.state.set("processed_count", count + 1)',
+      ].join('\n'),
+    },
+    {
+      id: 'secret',
+      label: '+ beacon.secret("cookies")',
+      badgeColor: 'text-emerald-300 border-emerald-800/60',
+      description: 'Чтение кук или API-ключа из сейфа 0600',
+      code: [
+        'import beacon, json',
+        '# Чтение кук из защищённого хранилища (0600):',
+        `raw_cookies = beacon.secret("${secCookie}")`,
+        'cookies = json.loads(raw_cookies) if isinstance(raw_cookies, str) and raw_cookies else (raw_cookies or [])',
+      ].join('\n'),
+    },
+    {
+      id: 'cookies_expired',
+      label: '+ beacon.cookies_expired()',
+      badgeColor: 'text-rose-300 border-rose-800/60',
+      description: 'Сигнал об истечении кук (вызовет тревогу в панели)',
+      code: [
+        'import beacon',
+        '# Сигнал об истечении кук (вызовет тревогу в панели и Telegram):',
+        `beacon.cookies_expired("${secCookie}", "Требуется свежий экспорт Cookie-Editor")`,
+      ].join('\n'),
+    },
+    {
+      id: 'ping',
+      label: '+ beacon.ping()',
+      badgeColor: 'text-cyan-300 border-cyan-800/60',
+      description: "Сигнал Dead Man's Switch",
+      code: [
+        'import beacon',
+        "# Сигнал Dead Man's Switch (использует BEACON_PING_TOKEN):",
+        'beacon.ping()',
+      ].join('\n'),
+    },
+  ];
+}
+
+export interface SdkCompletionItem {
+  label: string;
+  insertSuffix: string;
+  detail: string;
+}
+
+export const BEACON_SDK_COMPLETIONS: readonly SdkCompletionItem[] = [
+  {
+    label: 'beacon.notify(text, level="info")',
+    insertSuffix: 'notify("Сообщение", level="info")',
+    detail: 'Уведомление в Telegram и журнал панели',
+  },
+  {
+    label: 'beacon.ask(prompt, timeout=300)',
+    insertSuffix: 'ask("Введите 2FA-код:", timeout=300)',
+    detail: 'Интерактивный запрос ввода 2FA / капчи',
+  },
+  {
+    label: 'beacon.secret(name, as_path=False)',
+    insertSuffix: 'secret("my_secret")',
+    detail: 'Чтение секрета или кук из хранилища 0600',
+  },
+  {
+    label: 'beacon.cookies_expired(secret_name, note="")',
+    insertSuffix: 'cookies_expired("cookies_name", "Сессия истекла")',
+    detail: 'Пометить куки проекта как истекшие',
+  },
+  {
+    label: 'beacon.ping()',
+    insertSuffix: 'ping()',
+    detail: "Отправить пульс Dead Man's Switch",
+  },
+  {
+    label: 'beacon.state.get(key, default=None)',
+    insertSuffix: 'state.get("key", 0)',
+    detail: 'Прочитать значение из KV-хранилища проекта',
+  },
+  {
+    label: 'beacon.state.set(key, value)',
+    insertSuffix: 'state.set("key", 1)',
+    detail: 'Сохранить значение в KV-хранилище проекта',
+  },
+  {
+    label: 'beacon.state.delete(key)',
+    insertSuffix: 'state.delete("key")',
+    detail: 'Удалить ключ из KV-хранилища проекта',
+  },
+] as const;
+
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function findNextInCode(
+  source: string,
+  query: string,
+  startPos: number,
+  caseSensitive: boolean = false
+): { index: number; length: number } | null {
+  if (!query || !source) return null;
+  const hay = caseSensitive ? source : source.toLowerCase();
+  const needle = caseSensitive ? query : query.toLowerCase();
+  const safeStart = Math.max(0, Math.min(source.length, startPos));
+  let idx = hay.indexOf(needle, safeStart);
+  if (idx === -1 && safeStart > 0) {
+    idx = hay.indexOf(needle, 0);
+  }
+  if (idx === -1) return null;
+  return { index: idx, length: query.length };
+}
+
+export function findAndReplaceInCode(
+  source: string,
+  query: string,
+  replacement: string,
+  caseSensitive: boolean = false
+): { output: string; count: number } {
+  if (!query || !source) return { output: source, count: 0 };
+  const flags = caseSensitive ? 'g' : 'gi';
+  const re = new RegExp(escapeRegExp(query), flags);
+  const matches = source.match(re);
+  if (!matches || matches.length === 0) {
+    return { output: source, count: 0 };
+  }
+  const output = source.replace(re, () => replacement);
+  return { output, count: matches.length };
+}

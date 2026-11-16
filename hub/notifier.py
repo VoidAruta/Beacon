@@ -121,7 +121,7 @@ async def send_notification(
         "crash": "🚨 [CRASH]",
         "oom": "💥 [OOM KILLED]",
     }
-    prefix = prefix_map.get(level, "ℹ️ [ARUTA]")
+    prefix = prefix_map.get(level, "ℹ️ [BEACON]")
     proj_tag = f" Проект: {project_name}" if project_name else ""
     full_text = f"{prefix}{proj_tag}\n{text}"
     if log_tail:
@@ -150,7 +150,7 @@ async def send_notification(
                 resp = await client.post(
                     target,
                     content=full_text.encode("utf-8"),
-                    headers={"Title": f"Hub {project_name or 'Alert'}", "Priority": "high" if level in ("error", "crash", "oom") else "default"},
+                    headers={"Title": f"Beacon {project_name or 'Alert'}", "Priority": "high" if level in ("error", "crash", "oom") else "default"},
                 )
                 ok = 200 <= resp.status_code < 300
                 _record_notification_event("ntfy", target, full_text, level, ntfy_proxy, ok, f"HTTP {resp.status_code}")
@@ -164,7 +164,7 @@ async def send_notification(
     if webhook_url:
         wh_proxy = proxy_default if cfg.get("webhook_use_proxy", "0") == "1" else None
         payload = {
-            "source": "hub",
+            "source": "beacon",
             "level": level,
             "project": project_name,
             "text": text,

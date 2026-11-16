@@ -15,6 +15,7 @@ import {
   PauseCircle,
   PlayCircle,
   ShieldAlert,
+  BookOpen,
 } from 'lucide-react';
 import { DashboardData, ProjectItem, SecretItem, WorkspaceSubTab } from './types/hub';
 import { GlobalAlertBanners } from './components/GlobalAlertBanners';
@@ -23,41 +24,62 @@ import { ProjectsWorkspace } from './components/ProjectsWorkspace';
 import { SecretsView } from './components/SecretsView';
 import { SettingsAndAcceptanceView } from './components/SettingsAndAcceptanceView';
 import { AiAccessView } from './components/AiAccessView';
+import { DocumentationView } from './components/DocumentationView';
 import { CreateProjectModal } from './components/CreateProjectModal';
 import { CommandPaletteModal } from './components/CommandPaletteModal';
 
-type NavTab = 'dashboard' | 'projects' | 'secrets' | 'ai_access' | 'settings' | 'acceptance';
+type NavTab = 'dashboard' | 'projects' | 'secrets' | 'ai_access' | 'settings' | 'acceptance' | 'docs';
 
 const TAB_META: Record<NavTab, { title: string; subtitle: string }> = {
   dashboard: {
-    title: 'Обзор и Проекты',
-    subtitle: 'Мониторинг ресурсов, постоянные программы 24/7, веб-сервисы и периодические задачи',
+    title: 'Обзор, Сеть и Проекты',
+    subtitle: 'Мониторинг ресурсов и сетевой нагрузки RX/TX, постоянные сервисы 24/7, веб-сайты и задачи Cron',
   },
   projects: {
     title: 'Проекты, Код и Расписание',
     subtitle: 'Редактор файлов, project.yaml, индивидуальные куки, защита от crash-loop и живые логи',
   },
   secrets: {
-    title: 'Куки проектов и Секреты',
-    subtitle: 'Импорт куки Cookie-Editor для скриптов и безопасное хранение API-ключей (права 0600)',
+    title: 'Куки проектов и Секреты (0600)',
+    subtitle: 'Импорт куки Cookie-Editor с инспектором доменов, хранение API-ключей и привязка доступа по проектам',
   },
   ai_access: {
     title: 'Доступ ИИ (MCP и /api/v1/)',
-    subtitle: 'Подключение Claude Code / Cursor / OpenCode, токены с правами, очередь подтверждений с diff и Kill-Switch',
+    subtitle: 'Подключение Claude Code / Cursor / Windsurf, токены с правами, очередь подтверждений с diff и Kill-Switch',
   },
   settings: {
     title: 'Настройки Панели, Безопасность и Пользователи',
     subtitle: 'Смена пароля администратора, фильтр подсетей и Tailscale, роли RBAC, Telegram-бот и бэкап',
   },
   acceptance: {
-    title: 'Тестовый полигон и Aruta Doctor',
+    title: 'Тестовый полигон и Beacon Doctor',
     subtitle: 'Автономный прогон 6 проверок супервизора, диагностика среды и просмотр исходников',
+  },
+  docs: {
+    title: 'Документация и Справочник Beacon',
+    subtitle: 'Полное руководство по проектам, встроенному SDK (import beacon), кукам, супервизору и MCP с поиском',
   },
 };
 
+let previewSessionToken = '';
+try {
+  previewSessionToken = sessionStorage.getItem('beacon_preview_session') || '';
+} catch {
+  // ignore storage errors in restricted iframes
+}
+
 async function safeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  const res = await fetch(input, init);
   const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.pathname : input.url;
+  let finalInit = init;
+  if (urlStr.startsWith('/api/') && previewSessionToken) {
+    const headers = new Headers(init?.headers || {});
+    if (!headers.has('X-Beacon-Session')) {
+      headers.set('X-Beacon-Session', previewSessionToken);
+    }
+    finalInit = { ...init, headers };
+  }
+
+  const res = await fetch(input, finalInit);
   const contentType = (res.headers.get('content-type') || '').toLowerCase();
 
   if (urlStr.startsWith('/api/') && contentType.includes('text/html')) {
@@ -93,7 +115,25 @@ async function safeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
       };
     }
     try {
-      return JSON.parse(trimmed);
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === 'object') {
+        if (typeof parsed.session_token === 'string' && parsed.session_token) {
+          previewSessionToken = parsed.session_token;
+          try {
+            sessionStorage.setItem('beacon_preview_session', previewSessionToken);
+          } catch {
+            // ignore
+          }
+        } else if (urlStr === '/api/auth/logout') {
+          previewSessionToken = '';
+          try {
+            sessionStorage.removeItem('beacon_preview_session');
+          } catch {
+            // ignore
+          }
+        }
+      }
+      return parsed;
     } catch {
       return {
         __invalid_json: true,
@@ -109,7 +149,6 @@ export function App() {
   const [authenticated, setAuthenticated] = useState<boolean>(false);
   const [authChecking, setAuthChecking] = useState<boolean>(true);
   const [csrfToken, setCsrfToken] = useState<string>('');
-  const [sessionToken, setSessionToken] = useState<string>('');
   const [userRole, setUserRole] = useState<string>('admin');
   const [username, setUsername] = useState<string>('admin');
   const [isDefaultPassword, setIsDefaultPassword] = useState<boolean>(false);
@@ -140,35 +179,27 @@ export function App() {
         headers.set('Content-Type', 'application/json; charset=utf-8');
       }
       if (csrfToken) headers.set('X-CSRF-Token', csrfToken);
-      if (sessionToken) {
-        headers.set('X-Aruta-Session', sessionToken);
-        headers.set('X-Hub-Session', sessionToken);
-      }
       return safeFetch(path, {
         ...options,
         headers,
         credentials: 'same-origin',
       });
     },
-    [csrfToken, sessionToken]
+    [csrfToken]
   );
 
   const loadAllData = useCallback(
-    async (overrideCsrf?: string, overrideSession?: string) => {
+    async (overrideCsrf?: string) => {
       try {
         const hdrs: Record<string, string> = { Accept: 'application/json' };
         if (overrideCsrf || csrfToken) hdrs['X-CSRF-Token'] = overrideCsrf || csrfToken;
-        if (overrideSession || sessionToken) {
-          hdrs['X-Aruta-Session'] = overrideSession || sessionToken;
-          hdrs['X-Hub-Session'] = overrideSession || sessionToken;
-        }
 
-        const [dRes, pRes, sRes] = await Promise.all([
-          safeFetch('/api/dashboard', { headers: hdrs }),
-          safeFetch('/api/projects', { headers: hdrs }),
-          safeFetch('/api/secrets', { headers: hdrs }),
+        const [dRes, sRes] = await Promise.all([
+          safeFetch('/api/dashboard', { headers: hdrs, credentials: 'same-origin' }),
+          safeFetch('/api/secrets', { headers: hdrs, credentials: 'same-origin' }),
         ]);
 
+        let projectsUpdated = false;
         if (dRes.ok) {
           const dData = await dRes.json();
           if (dData && typeof dData === 'object' && 'system' in dData) {
@@ -176,16 +207,28 @@ export function App() {
             if (typeof dData.system?.is_default_password === 'boolean') {
               setIsDefaultPassword(dData.system.is_default_password);
             }
+            if (Array.isArray(dData.projects)) {
+              const pList = dData.projects as ProjectItem[];
+              setProjects(pList);
+              setSelectedProject((prev) => {
+                if (!prev) return pList[0] || null;
+                return pList.find((x: ProjectItem) => x.id === prev.id) || pList[0] || null;
+              });
+              projectsUpdated = true;
+            }
           }
         }
-        if (pRes.ok) {
-          const pData = await pRes.json();
-          if (Array.isArray(pData)) {
-            setProjects(pData as ProjectItem[]);
-            setSelectedProject((prev) => {
-              if (!prev) return pData[0] || null;
-              return pData.find((x: ProjectItem) => x.id === prev.id) || pData[0] || null;
-            });
+        if (!projectsUpdated) {
+          const pRes = await safeFetch('/api/projects', { headers: hdrs, credentials: 'same-origin' });
+          if (pRes.ok) {
+            const pData = await pRes.json();
+            if (Array.isArray(pData)) {
+              setProjects(pData as ProjectItem[]);
+              setSelectedProject((prev) => {
+                if (!prev) return pData[0] || null;
+                return pData.find((x: ProjectItem) => x.id === prev.id) || pData[0] || null;
+              });
+            }
           }
         }
         if (sRes.ok) {
@@ -198,75 +241,55 @@ export function App() {
         // ignore transient network errors
       }
     },
-    [csrfToken, sessionToken]
+    [csrfToken]
   );
 
   useEffect(() => {
     const initAuth = async () => {
       try {
-        const storedSession = sessionStorage.getItem('aruta_session_token') || sessionStorage.getItem('hub_session_token') || '';
-        const storedCsrf = sessionStorage.getItem('aruta_csrf_token') || sessionStorage.getItem('hub_csrf_token') || '';
-        const hasCookie = typeof document !== 'undefined' && document.cookie.includes('csrf_token=');
-
         for (let attempt = 0; attempt < 6; attempt++) {
-          if (storedSession || hasCookie) {
-            const hdrs: Record<string, string> = { Accept: 'application/json' };
-            if (storedSession) {
-              hdrs['X-Aruta-Session'] = storedSession;
-              hdrs['X-Hub-Session'] = storedSession;
-            }
-            if (storedCsrf) hdrs['X-CSRF-Token'] = storedCsrf;
-
-            const res = await safeFetch('/api/auth/me', {
-              headers: hdrs,
-              credentials: 'same-origin',
-            });
-            const data = await res.json();
-            if (data && !data.__html_fallback) {
-              if (res.ok && data.authenticated) {
-                const cToken = data.csrf_token || storedCsrf;
-                const sToken = data.session_token || storedSession;
-                setAuthenticated(true);
-                setCsrfToken(cToken);
-                setSessionToken(sToken);
-                setUserRole(data.role || 'admin');
-                setUsername(data.username || 'admin');
-                setIsDefaultPassword(Boolean(data.is_default_password));
-                sessionStorage.setItem('aruta_session_token', sToken);
-                sessionStorage.setItem('aruta_csrf_token', cToken);
-                await loadAllData(cToken, sToken);
-                break;
-              }
-            } else {
-              await new Promise((r) => setTimeout(r, 600));
-              continue;
-            }
-          }
-
-          // Вход с дефолтным паролем 'admin' (если ещё не изменён владельцем)
-          const loginRes = await safeFetch('/api/auth/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-            body: JSON.stringify({ username: 'admin', password: 'admin' }),
+          const res = await safeFetch('/api/auth/me', {
+            headers: { Accept: 'application/json' },
             credentials: 'same-origin',
           });
-          const loginData = await loginRes.json();
-          if (loginData && loginData.__html_fallback) {
+          const data = await res.json();
+          if (data && data.__html_fallback) {
             await new Promise((r) => setTimeout(r, 600));
             continue;
           }
-          if (loginRes.ok && loginData && loginData.authenticated) {
-            const cToken = loginData.csrf_token || '';
-            const sToken = loginData.session_token || '';
+          if (res.ok && data.authenticated) {
+            const cToken = data.csrf_token || '';
             setAuthenticated(true);
             setCsrfToken(cToken);
-            setSessionToken(sToken);
-            setUserRole(loginData.role || 'admin');
-            setUsername(loginData.username || 'admin');
-            setIsDefaultPassword(Boolean(loginData.is_default_password));
-            sessionStorage.setItem('aruta_session_token', sToken);
-            sessionStorage.setItem('aruta_csrf_token', cToken);
-            await loadAllData(cToken, sToken);
+            setUserRole(data.role || 'admin');
+            setUsername(data.username || 'admin');
+            setIsDefaultPassword(Boolean(data.is_default_password));
+            await loadAllData(cToken);
+            break;
+          }
+
+          // Вход с дефолтным паролем 'admin' (если ещё не изменён владельцем)
+          if (data?.is_default_password) {
+            const loginRes = await safeFetch('/api/auth/login', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+              body: JSON.stringify({ username: 'admin', password: 'admin' }),
+              credentials: 'same-origin',
+            });
+            const loginData = await loginRes.json();
+            if (loginData && loginData.__html_fallback) {
+              await new Promise((r) => setTimeout(r, 600));
+              continue;
+            }
+            if (loginRes.ok && loginData && loginData.authenticated) {
+              const cToken = loginData.csrf_token || '';
+              setAuthenticated(true);
+              setCsrfToken(cToken);
+              setUserRole(loginData.role || 'admin');
+              setUsername(loginData.username || 'admin');
+              setIsDefaultPassword(Boolean(loginData.is_default_password));
+              await loadAllData(cToken);
+            }
           }
           break;
         }
@@ -294,21 +317,18 @@ export function App() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ username: loginUsername.trim() || 'admin', password: loginPassword }),
+      credentials: 'same-origin',
     });
     if (res.ok) {
       const data = await res.json();
       if (data && data.authenticated) {
         const cToken = data.csrf_token || '';
-        const sToken = data.session_token || '';
         setAuthenticated(true);
         setCsrfToken(cToken);
-        setSessionToken(sToken);
         setUserRole(data.role || 'admin');
         setUsername(data.username || 'admin');
         setIsDefaultPassword(Boolean(data.is_default_password));
-        sessionStorage.setItem('aruta_session_token', sToken);
-        sessionStorage.setItem('aruta_csrf_token', cToken);
-        await loadAllData(cToken, sToken);
+        await loadAllData(cToken);
       } else {
         setLoginError(data?.detail || 'Ошибка авторизации');
       }
@@ -326,10 +346,13 @@ export function App() {
       body: JSON.stringify({ new_password: quickPwInput }),
     });
     if (res.ok) {
+      const data = await res.json().catch(() => ({}));
+      const nextCsrf = data?.csrf_token || csrfToken;
+      if (data?.csrf_token) setCsrfToken(data.csrf_token);
       setIsDefaultPassword(false);
       setQuickPwInput('');
       setQuickPwMsg('');
-      await loadAllData();
+      await loadAllData(nextCsrf);
     } else {
       const err = await res.json().catch(() => ({}));
       setQuickPwMsg(err.detail || 'Не удалось сменить пароль (минимум 8 символов)');
@@ -338,22 +361,25 @@ export function App() {
 
   const handleToggleAiPauseHeader = async () => {
     const currentlyPaused = Boolean(dashboard?.system?.ai_access_paused);
-    await apiFetch('/api/ai/config', {
-      method: 'PUT',
+    const res = await apiFetch('/api/ai/pause', {
+      method: 'POST',
       body: JSON.stringify({ paused: !currentlyPaused }),
     });
-    await loadAllData();
+    if (res.ok) {
+      await loadAllData();
+    }
   };
 
   const handleLogout = async () => {
     await apiFetch('/api/auth/logout', { method: 'POST' });
-    sessionStorage.removeItem('aruta_session_token');
-    sessionStorage.removeItem('aruta_csrf_token');
-    sessionStorage.removeItem('hub_session_token');
-    sessionStorage.removeItem('hub_csrf_token');
+    previewSessionToken = '';
+    try {
+      sessionStorage.removeItem('beacon_preview_session');
+    } catch {
+      // ignore
+    }
     setAuthenticated(false);
     setCsrfToken('');
-    setSessionToken('');
   };
 
   const handleStartProject = async (id: number, params?: Record<string, string>) => {
@@ -472,8 +498,9 @@ export function App() {
     return updated;
   };
 
-  const handleDeleteProject = async (id: number) => {
-    await apiFetch(`/api/projects/${id}`, { method: 'DELETE' });
+  const handleDeleteProject = async (id: number, deleteFiles: boolean = false) => {
+    const query = deleteFiles ? '?delete_files=true' : '';
+    await apiFetch(`/api/projects/${id}${query}`, { method: 'DELETE' });
     await loadAllData();
     setActiveTab('dashboard');
   };
@@ -542,7 +569,7 @@ export function App() {
   const handleExpireCookie = async (name: string) => {
     await apiFetch(`/api/secrets/${encodeURIComponent(name)}/expire`, {
       method: 'POST',
-      body: JSON.stringify({ note: 'Вызван сигнал aruta.cookies_expired()' }),
+      body: JSON.stringify({ note: 'Вызван сигнал beacon.cookies_expired()' }),
     });
     await loadAllData();
   };
@@ -554,9 +581,40 @@ export function App() {
 
   useEffect(() => {
     const onGlobalKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setCommandPaletteOpen((prev) => !prev);
+        return;
+      }
+
+      if (e.key === 'Escape') {
+        setCommandPaletteOpen((prev) => (prev ? false : prev));
+        setCreateModalOpen((prev) => (prev ? false : prev));
+        return;
+      }
+
+      if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+        const codeMap: Record<string, NavTab> = {
+          Digit1: 'dashboard',
+          Digit2: 'projects',
+          Digit3: 'secrets',
+          Digit4: 'ai_access',
+          Digit5: 'settings',
+          Digit6: 'acceptance',
+          Digit7: 'docs',
+          '1': 'dashboard',
+          '2': 'projects',
+          '3': 'secrets',
+          '4': 'ai_access',
+          '5': 'settings',
+          '6': 'acceptance',
+          '7': 'docs',
+        };
+        const targetTab = codeMap[e.code] || codeMap[e.key];
+        if (targetTab) {
+          e.preventDefault();
+          setActiveTab(targetTab);
+        }
       }
     };
     window.addEventListener('keydown', onGlobalKeyDown);
@@ -627,11 +685,11 @@ export function App() {
 
           <form onSubmit={handleLogin} className="mt-5 space-y-4">
             <div>
-              <label htmlFor="aruta-login-username" className="block text-xs text-slate-300 mb-1">
+              <label htmlFor="beacon-login-username" className="block text-xs text-slate-300 mb-1">
                 Имя пользователя
               </label>
               <input
-                id="aruta-login-username"
+                id="beacon-login-username"
                 type="text"
                 placeholder="admin"
                 value={loginUsername}
@@ -641,11 +699,11 @@ export function App() {
             </div>
 
             <div>
-              <label htmlFor="aruta-login-password" className="block text-xs text-slate-300 mb-1">
+              <label htmlFor="beacon-login-password" className="block text-xs text-slate-300 mb-1">
                 Пароль (по умолчанию <code className="font-mono text-indigo-300">admin</code>, меняется в разделе «Настройки»)
               </label>
               <input
-                id="aruta-login-password"
+                id="beacon-login-password"
                 type="password"
                 placeholder="Введите пароль..."
                 value={loginPassword}
@@ -677,7 +735,7 @@ export function App() {
   const pendingAiApprovalsCount = dashboard?.system?.pending_ai_approvals_count || 0;
 
   return (
-    <div className="min-h-screen bg-[#0b0f17] text-slate-100 flex flex-col pb-16 lg:pb-0">
+    <div className="min-h-screen lg:h-screen lg:overflow-hidden bg-[#0b0f17] text-slate-100 flex flex-col pb-16 lg:pb-0">
       {/* Постоянный жёлтый баннер при использовании пароля по умолчанию 'admin' (Фаза A.1(в)) */}
       {isDefaultPassword && (
         <div
@@ -744,6 +802,35 @@ export function App() {
         </div>
       )}
 
+      {/* Красный баннер при запуске проектов от имени root */}
+      {dashboard?.system?.run_as_user === 'root' && (
+        <div
+          role="region"
+          aria-label="Предупреждение о запуске проектов от root"
+          className="bg-red-950/90 border-b border-red-500/50 px-4 py-2 text-xs text-red-100"
+        >
+          <div className="max-w-[1440px] mx-auto flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <ShieldAlert className="w-4 h-4 text-red-400 shrink-0" />
+              <span>
+                <strong className="text-red-300">ERROR: Проекты запускаются от root!</strong> Для изоляции процессов создайте непривилегированного пользователя{' '}
+                <code className="font-mono bg-slate-950/80 px-1.5 py-0.5 rounded text-red-200">
+                  useradd -r -s /usr/sbin/nologin beacon-runner
+                </code>{' '}
+                и выберите его в Настройках.
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setActiveTab('settings')}
+              className="text-red-200 hover:text-white underline cursor-pointer shrink-0"
+            >
+              Переключить в Настройках
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Глобальные тревожные баннеры (WAITING_INPUT и COOKIES_EXPIRED) */}
       <GlobalAlertBanners
         pendingAsks={dashboard?.pending_asks || []}
@@ -752,14 +839,14 @@ export function App() {
         onImportCookieJson={(name, json) => handleImportCookieJson(name, json)}
       />
 
-      <div className="flex-1 flex">
-        {/* Боковая панель Aruta Operations Console */}
+      <div className="flex-1 flex min-h-0">
+        {/* Боковая панель Beacon Control Panel */}
         <aside
           aria-label="Основная навигация"
-          className="hidden lg:flex w-68 shrink-0 bg-[#111622] border-r border-slate-800/90 flex-col justify-between p-4"
+          className="hidden lg:flex w-68 shrink-0 bg-[#111622] border-r border-slate-800/90 flex-col justify-between p-3.5 h-full overflow-y-auto"
         >
-          <div className="space-y-5">
-            <div className="px-2 pt-1 flex items-center justify-between border-b border-slate-800/80 pb-3.5">
+          <div className="space-y-3.5">
+            <div className="px-2 pt-0.5 flex items-center justify-between border-b border-slate-800/80 pb-2.5">
               <div className="min-w-0">
                 <div className="text-base font-bold tracking-tight text-white">Beacon Control Panel</div>
                 <div className="text-[11px] text-slate-400 truncate" title={envLabel}>
@@ -773,7 +860,7 @@ export function App() {
             <button
               type="button"
               onClick={() => setCommandPaletteOpen(true)}
-              className="w-full flex items-center justify-between gap-2 px-3 py-2 bg-[#0b0f17] hover:bg-slate-900 border border-slate-800 rounded-lg text-xs text-slate-300 transition-colors cursor-pointer"
+              className="w-full flex items-center justify-between gap-2 px-3 py-1.5 bg-[#0b0f17] hover:bg-slate-900 border border-slate-800 rounded-lg text-xs text-slate-300 transition-colors cursor-pointer"
             >
               <span className="inline-flex items-center gap-2">
                 <Search className="w-3.5 h-3.5 text-indigo-400" />
@@ -784,88 +871,101 @@ export function App() {
               </kbd>
             </button>
 
-            <nav className="space-y-1.5">
+            <nav className="space-y-1">
               <button
                 type="button"
                 onClick={() => setActiveTab('dashboard')}
-                className={`w-full flex items-start gap-3 px-3 py-2.5 rounded-xl text-left transition-colors cursor-pointer ${
+                title="Перейти на Дашборд (Alt+1)"
+                className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'dashboard'
                     ? 'bg-indigo-600 text-white'
                     : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
                 }`}
               >
-                <LayoutDashboard className="w-4 h-4 mt-0.5 shrink-0" />
-                <div>
-                  <div className="text-xs font-semibold">Дашборд и Реестр</div>
-                  <div
-                    className={`text-[11px] leading-snug mt-0.5 ${
-                      activeTab === 'dashboard' ? 'text-indigo-100' : 'text-slate-400'
-                    }`}
-                  >
-                    Services 24/7, Web API (:PORT), Jobs
+                <div className="flex items-start gap-2.5 min-w-0">
+                  <LayoutDashboard className="w-4 h-4 mt-0.5 shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold">Дашборд и Реестр</div>
+                    <div
+                      className={`text-[11px] leading-snug mt-0.5 truncate ${
+                        activeTab === 'dashboard' ? 'text-indigo-100' : 'text-slate-400'
+                      }`}
+                    >
+                      Services 24/7, Web API (:PORT), Jobs
+                    </div>
                   </div>
                 </div>
+                <kbd className="text-[10px] font-mono opacity-60 shrink-0 mt-0.5">Alt+1</kbd>
               </button>
 
               <button
                 type="button"
                 onClick={() => setActiveTab('projects')}
-                className={`w-full flex items-start gap-3 px-3 py-2.5 rounded-xl text-left transition-colors cursor-pointer ${
+                title="Перейти в Проекты и Консоль (Alt+2)"
+                className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'projects'
                     ? 'bg-indigo-600 text-white'
                     : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
                 }`}
               >
-                <FolderCode className="w-4 h-4 mt-0.5 shrink-0" />
-                <div>
-                  <div className="text-xs font-semibold">Проекты и Консоль</div>
-                  <div
-                    className={`text-[11px] leading-snug mt-0.5 ${
-                      activeTab === 'projects' ? 'text-indigo-100' : 'text-slate-400'
-                    }`}
-                  >
-                    Код, project.yaml, живые логи, stdin
+                <div className="flex items-start gap-2.5 min-w-0">
+                  <FolderCode className="w-4 h-4 mt-0.5 shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold">Проекты и Консоль</div>
+                    <div
+                      className={`text-[11px] leading-snug mt-0.5 truncate ${
+                        activeTab === 'projects' ? 'text-indigo-100' : 'text-slate-400'
+                      }`}
+                    >
+                      Код, project.yaml, живые логи, stdin
+                    </div>
                   </div>
                 </div>
+                <kbd className="text-[10px] font-mono opacity-60 shrink-0 mt-0.5">Alt+2</kbd>
               </button>
 
               <button
                 type="button"
                 onClick={() => setActiveTab('secrets')}
-                className={`w-full flex items-start gap-3 px-3 py-2.5 rounded-xl text-left transition-colors cursor-pointer ${
+                title="Перейти в Куки и Секреты (Alt+3)"
+                className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'secrets'
                     ? 'bg-indigo-600 text-white'
                     : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
                 }`}
               >
-                <KeyRound className="w-4 h-4 mt-0.5 shrink-0" />
-                <div>
-                  <div className="text-xs font-semibold">Куки и Секреты (0600)</div>
-                  <div
-                    className={`text-[11px] leading-snug mt-0.5 ${
-                      activeTab === 'secrets' ? 'text-indigo-100' : 'text-slate-400'
-                    }`}
-                  >
-                    Изоляция секретов и Cookie-Editor
+                <div className="flex items-start gap-2.5 min-w-0">
+                  <KeyRound className="w-4 h-4 mt-0.5 shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold">Куки и Секреты (0600)</div>
+                    <div
+                      className={`text-[11px] leading-snug mt-0.5 truncate ${
+                        activeTab === 'secrets' ? 'text-indigo-100' : 'text-slate-400'
+                      }`}
+                    >
+                      Изоляция секретов и Cookie-Editor
+                    </div>
                   </div>
                 </div>
+                <kbd className="text-[10px] font-mono opacity-60 shrink-0 mt-0.5">Alt+3</kbd>
               </button>
 
               <button
                 type="button"
                 onClick={() => setActiveTab('ai_access')}
-                className={`w-full flex items-start justify-between gap-2 px-3 py-2.5 rounded-xl text-left transition-colors cursor-pointer ${
+                title="Перейти в Доступ ИИ (Alt+4)"
+                className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'ai_access'
                     ? 'bg-indigo-600 text-white'
                     : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
                 }`}
               >
-                <div className="flex items-start gap-3">
+                <div className="flex items-start gap-2.5 min-w-0">
                   <Bot className="w-4 h-4 mt-0.5 shrink-0" />
-                  <div>
+                  <div className="min-w-0">
                     <div className="text-xs font-semibold">Доступ ИИ (MCP)</div>
                     <div
-                      className={`text-[11px] leading-snug mt-0.5 ${
+                      className={`text-[11px] leading-snug mt-0.5 truncate ${
                         activeTab === 'ai_access' ? 'text-indigo-100' : 'text-slate-400'
                       }`}
                     >
@@ -873,61 +973,99 @@ export function App() {
                     </div>
                   </div>
                 </div>
-                {pendingAiApprovalsCount > 0 && (
-                  <span className="px-1.5 py-0.5 text-[10px] font-mono font-bold bg-amber-500 text-slate-950 rounded-full">
-                    {pendingAiApprovalsCount}
-                  </span>
-                )}
+                <div className="flex items-center gap-1.5 shrink-0 mt-0.5">
+                  {pendingAiApprovalsCount > 0 && (
+                    <span className="px-1.5 py-0.5 text-[10px] font-mono font-bold bg-amber-500 text-slate-950 rounded-full">
+                      {pendingAiApprovalsCount}
+                    </span>
+                  )}
+                  <kbd className="text-[10px] font-mono opacity-60">Alt+4</kbd>
+                </div>
               </button>
 
               <button
                 type="button"
                 onClick={() => setActiveTab('settings')}
-                className={`w-full flex items-start gap-3 px-3 py-2.5 rounded-xl text-left transition-colors cursor-pointer ${
+                title="Перейти в Настройки (Alt+5)"
+                className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'settings'
                     ? 'bg-indigo-600 text-white'
                     : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
                 }`}
               >
-                <Settings className="w-4 h-4 mt-0.5 shrink-0" />
-                <div>
-                  <div className="text-xs font-semibold">Настройки, Пароль и RBAC</div>
-                  <div
-                    className={`text-[11px] leading-snug mt-0.5 ${
-                      activeTab === 'settings' ? 'text-indigo-100' : 'text-slate-400'
-                    }`}
-                  >
-                    Смена пароля, Tailscale, роли, бэкап
+                <div className="flex items-start gap-2.5 min-w-0">
+                  <Settings className="w-4 h-4 mt-0.5 shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold">Настройки, Пароль и RBAC</div>
+                    <div
+                      className={`text-[11px] leading-snug mt-0.5 truncate ${
+                        activeTab === 'settings' ? 'text-indigo-100' : 'text-slate-400'
+                      }`}
+                    >
+                      Смена пароля, Tailscale, роли, бэкап
+                    </div>
                   </div>
                 </div>
+                <kbd className="text-[10px] font-mono opacity-60 shrink-0 mt-0.5">Alt+5</kbd>
               </button>
 
               <button
                 type="button"
                 onClick={() => setActiveTab('acceptance')}
-                className={`w-full flex items-start gap-3 px-3 py-2.5 rounded-xl text-left transition-colors cursor-pointer ${
+                title="Перейти в Приёмку и Doctor (Alt+6)"
+                className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'acceptance'
                     ? 'bg-indigo-600 text-white'
                     : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
                 }`}
               >
-                <FlaskConical className="w-4 h-4 mt-0.5 shrink-0" />
-                <div>
-                  <div className="text-xs font-semibold">Приёмка и Doctor</div>
-                  <div
-                    className={`text-[11px] leading-snug mt-0.5 ${
-                      activeTab === 'acceptance' ? 'text-indigo-100' : 'text-slate-400'
-                    }`}
-                  >
-                    Автотесты ТЗ и диагностика среды
+                <div className="flex items-start gap-2.5 min-w-0">
+                  <FlaskConical className="w-4 h-4 mt-0.5 shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold">Приёмка и Doctor</div>
+                    <div
+                      className={`text-[11px] leading-snug mt-0.5 truncate ${
+                        activeTab === 'acceptance' ? 'text-indigo-100' : 'text-slate-400'
+                      }`}
+                    >
+                      Автотесты ТЗ и диагностика среды
+                    </div>
                   </div>
                 </div>
+                <kbd className="text-[10px] font-mono opacity-60 shrink-0 mt-0.5">Alt+6</kbd>
               </button>
             </nav>
           </div>
 
-          <div className="pt-4 border-t border-slate-800 space-y-2">
-            <div className="px-2 flex items-center justify-between text-[11px] font-mono text-slate-400">
+          <div className="pt-2.5 border-t border-slate-800 space-y-1.5 mt-2">
+            {/* Вкладка документации в левом нижнем углу меню */}
+            <button
+              type="button"
+              onClick={() => setActiveTab('docs')}
+              title="Открыть Документацию по панели (Alt+7)"
+              className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
+                activeTab === 'docs'
+                  ? 'bg-indigo-600 text-white'
+                  : 'bg-slate-900/90 text-slate-200 hover:bg-slate-800 hover:text-white border border-indigo-500/30'
+              }`}
+            >
+              <div className="flex items-start gap-2.5 min-w-0">
+                <BookOpen className={`w-4 h-4 mt-0.5 shrink-0 ${activeTab === 'docs' ? 'text-white' : 'text-indigo-400'}`} />
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold">Документация по панели</div>
+                  <div
+                    className={`text-[11px] leading-snug mt-0.5 truncate ${
+                      activeTab === 'docs' ? 'text-indigo-100' : 'text-slate-400'
+                    }`}
+                  >
+                    Разделы, SDK, примеры и поиск
+                  </div>
+                </div>
+              </div>
+              <kbd className="text-[10px] font-mono opacity-60 shrink-0 mt-0.5">Alt+7</kbd>
+            </button>
+
+            <div className="px-2 pt-0.5 flex items-center justify-between text-[11px] font-mono text-slate-400">
               <span className="truncate">
                 {username} ({userRole})
               </span>
@@ -945,7 +1083,7 @@ export function App() {
         </aside>
 
         {/* Основная рабочая область */}
-        <div className="flex-1 flex flex-col min-w-0">
+        <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-y-auto">
           <header className="flex items-center justify-between gap-4 px-4 sm:px-6 py-3.5 border-b border-slate-800/90 bg-[#0b0f17]">
             <div className="min-w-0">
               <h1 className="text-base font-bold tracking-tight text-white truncate">{currentMeta.title}</h1>
@@ -963,7 +1101,7 @@ export function App() {
                       </span>
                     </>
                   )}
-                  <span>Aruta {dashboard.system.hub_rss_mb} МБ</span>
+                  <span>Beacon {dashboard.system.hub_rss_mb} МБ</span>
                   <span className="text-slate-600" aria-hidden="true">
                     ·
                   </span>
@@ -1016,7 +1154,7 @@ export function App() {
             </div>
           </header>
 
-          <main className="flex-1 p-4 sm:p-6 max-w-[1440px] w-full mx-auto">
+          <main className="flex-1 p-3.5 sm:p-5 max-w-[1920px] w-full mx-auto">
             {activeTab === 'dashboard' && (
               <DashboardView
                 data={dashboard}
@@ -1043,6 +1181,7 @@ export function App() {
               <ProjectsWorkspace
                 projects={projects}
                 secrets={secrets}
+                system={dashboard?.system || null}
                 selectedProject={selectedProject}
                 initialSubTab={workspaceSubTab}
                 onSelectProject={setSelectedProject}
@@ -1055,6 +1194,7 @@ export function App() {
                 onDeleteProject={handleDeleteProject}
                 onCloneProject={handleCloneProject}
                 onRefreshAll={() => loadAllData()}
+                onOpenSecretsVault={() => setActiveTab('secrets')}
                 apiFetch={apiFetch}
               />
             )}
@@ -1069,6 +1209,7 @@ export function App() {
                 onImportCookieJson={handleImportCookieJson}
                 onExpireCookie={handleExpireCookie}
                 onDeleteSecret={handleDeleteSecret}
+                onUpdateProject={handleUpdateProject}
               />
             )}
 
@@ -1076,6 +1217,9 @@ export function App() {
               <AiAccessView
                 projects={projects}
                 apiFetch={apiFetch}
+                aiAccessPaused={Boolean(dashboard?.system?.ai_access_paused)}
+                isDefaultPassword={isDefaultPassword}
+                userRole={userRole}
                 onRefreshDashboard={() => loadAllData()}
                 onOpenSettingsTab={() => setActiveTab('settings')}
               />
@@ -1086,6 +1230,9 @@ export function App() {
                 mode={activeTab}
                 projects={projects}
                 apiFetch={apiFetch}
+                isDefaultPassword={isDefaultPassword}
+                currentUsername={username}
+                onCsrfUpdate={(token) => setCsrfToken(token)}
                 onRefreshDashboard={() => loadAllData()}
                 onStartProject={handleStartProject}
                 onOpenProjectWorkspace={(p, tab = 'editor') => {
@@ -1095,6 +1242,10 @@ export function App() {
                 }}
               />
             )}
+
+            {activeTab === 'docs' && (
+              <DocumentationView onNavigateTab={(tab) => setActiveTab(tab)} />
+            )}
           </main>
         </div>
       </div>
@@ -1102,7 +1253,7 @@ export function App() {
       {/* Нижний таб-бар только на мобильных экранах (< lg) */}
       <nav
         aria-label="Мобильная навигация"
-        className="lg:hidden fixed bottom-0 inset-x-0 z-40 h-14 bg-[#111622] border-t border-slate-800 grid grid-cols-6"
+        className="lg:hidden fixed bottom-0 inset-x-0 z-40 h-14 bg-[#111622] border-t border-slate-800 grid grid-cols-7"
       >
         <button
           type="button"
@@ -1163,6 +1314,16 @@ export function App() {
         >
           <CheckSquare className="w-4 h-4" />
           Doctor
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab('docs')}
+          className={`flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium ${
+            activeTab === 'docs' ? 'text-indigo-400' : 'text-slate-400'
+          }`}
+        >
+          <BookOpen className="w-4 h-4" />
+          Справка
         </button>
       </nav>
 
