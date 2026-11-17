@@ -2341,7 +2341,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
               )}
 
               {/* Выпадающее меню второстепенных операций «⋮ Действия» (#7) */}
-              <div className="relative">
+              <div ref={actionsMenuRef} className="relative">
                 <button
                   type="button"
                   onClick={() => setActionsMenuOpen((v) => !v)}
@@ -2391,7 +2391,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                       type="button"
                       onClick={() => {
                         setActionsMenuOpen(false);
-                        handleExportProjectArchive();
+                        handleDownloadProjectOrFolderZip('');
                       }}
                       className="w-full px-3 py-2 text-left text-slate-200 hover:bg-[#111622] hover:text-white flex items-center gap-2 cursor-pointer"
                     >
@@ -3314,16 +3314,16 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                           onDragOver={(e) => {
                             e.preventDefault();
                             e.stopPropagation();
-                            if (!isDraggingFilesOver) setIsDraggingFilesOver(true);
+                            if (!explorerDragOver) setExplorerDragOver(true);
                           }}
                           onDragLeave={(e) => {
                             e.preventDefault();
                             e.stopPropagation();
-                            setIsDraggingFilesOver(false);
+                            setExplorerDragOver(false);
                           }}
                           onDrop={handleExplorerDrop}
                           className={`${explorerColCls} border-b lg:border-b-0 lg:border-r border-[#1e2638] bg-[#0b0f17]/75 p-3 flex flex-col justify-between gap-2.5 min-h-0 transition-colors ${
-                            isDraggingFilesOver ? 'ring-2 ring-inset ring-indigo-500 bg-indigo-950/25' : ''
+                            explorerDragOver ? 'ring-2 ring-inset ring-indigo-500 bg-indigo-950/25' : ''
                           }`}
                         >
                           <div className="space-y-2 flex flex-col flex-1 min-h-0">
@@ -3355,7 +3355,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                               />
                             </div>
 
-                            {isDraggingFilesOver && (
+                            {explorerDragOver && (
                               <div className="p-2.5 rounded-lg border border-dashed border-indigo-400 bg-indigo-950/60 text-[11px] font-mono text-indigo-200 text-center">
                                 Отпустите файлы или .zip для загрузки в{' '}
                                 <strong>{selectedDir ? `${selectedDir}/` : '/ (корень)'}</strong>
@@ -3833,7 +3833,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                               {isProjectCurrentlyRunning && activeFilePath && (
                                 <button
                                   type="button"
-                                  onClick={() => handleSaveFile(undefined, true)}
+                                  onClick={() => handleSaveFile(undefined, undefined, true)}
                                   disabled={savingFileBusy || Boolean(procActionBusy)}
                                   className="px-2.5 py-1.5 text-xs font-semibold text-amber-200 bg-amber-950/60 hover:bg-amber-900/70 border border-amber-700/60 disabled:opacity-40 rounded-lg inline-flex items-center gap-1 cursor-pointer"
                                   title="Сохранить файл и сразу перезапустить работающий процесс (Ctrl+Shift+S)"
@@ -3953,7 +3953,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                             onChange={(nextVal) => updateEditorContent(nextVal)}
                             onCursorChange={(ta) => updateCursorMetrics(ta)}
                             onSave={() => handleSaveFile()}
-                            onSaveAndRestart={() => handleSaveFile(undefined, true)}
+                            onSaveAndRestart={() => handleSaveFile(undefined, undefined, true)}
                             onOpenFind={() => setShowFindBar(true)}
                             onCloseActiveTab={() => {
                               if (activeFilePath) handleCloseTab(activeFilePath);

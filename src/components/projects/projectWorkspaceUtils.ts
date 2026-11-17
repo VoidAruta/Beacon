@@ -1,18 +1,64 @@
 import { ProjectItem } from '../../types/hub';
+import { getRunStatusBadge } from '../../utils/hubLogic';
+
+export function statusBadge(status: string | undefined): {
+  label: string;
+  cls: string;
+  colorClass: string;
+  dotClass: string;
+} {
+  const b = getRunStatusBadge(status || 'stopped');
+  return {
+    label: b.label,
+    cls: b.colorClass,
+    colorClass: b.colorClass,
+    dotClass: b.dotClass,
+  };
+}
 
 export const DEFAULTS = {
   POLL_RUNS_MS: 2500,
   POLL_LOG_MS: 2000,
+  STATUS_CLEAR_MS: 2800,
   SIDEBAR_MAX_HEIGHT_PX: 640,
   EDITOR_HEIGHT_NORMAL_PX: 470,
   EDITOR_HEIGHT_TALL_PX: 660,
   DEFAULT_RAM_LIMIT_MB: 128,
+  RAM_LIMIT_MB: 128,
+  TIMEOUT_SEC: 0,
+  HEALTHCHECK_INTERVAL_SEC: 30,
+  MIN_UPTIME_SEC: 10,
+  MAX_RESTARTS: 5,
+  RESTART_DELAY_SEC: 3,
+  BACKOFF_MIN_SEC: 2,
+  BACKOFF_MAX_SEC: 300,
+  MAX_RETRIES: 2,
+  RETRY_DELAY_SEC: 30,
+  HEARTBEAT_INTERVAL_SEC: 0,
+  HEARTBEAT_GRACE_SEC: 60,
+  SCHED_EVERY_MIN: 15,
+  SCHED_EVERY_HOUR: 1,
+  SCHED_DAILY_TIME: '09:00',
+  SCHED_INTERVAL_SEC: 300,
   INITIAL_RUNS_LIMIT: 15,
   RUNS_PAGE_STEP: 15,
+  RUNS_PAGE_SIZE: 15,
   APPROX_LINE_HEIGHT_PX: 20,
 } as const;
 
 export const LABELS = {
+  LOADING: 'Загрузка файла...',
+  SAVING: 'Сохранение...',
+  SAVED: 'Сохранено ✓',
+  startNowBtn: 'Запустить сейчас',
+  stopBtn: 'Остановить',
+  restartBtn: 'Рестарт',
+  healthProbeBtn: 'Проверить /health',
+  moreActionsBtn: 'Действия',
+  saveFileBtn: 'Сохранить (Ctrl+S)',
+  saveConfigBtn: 'Сохранить настройки',
+  saveCookiesBtn: 'Сохранить и привязать куки к проекту',
+  saveTelegramProxyBtn: 'Сохранить Telegram и Прокси в ENV',
   workspaceEmptyTitle: 'Рабочая область проектов пуста',
   workspaceEmptySubtitle:
     'Создайте новый проект (бота, веб-сервис с портом $PORT или периодическую задачу) либо загрузите готовые эталонные шаблоны в один клик.',
@@ -44,7 +90,8 @@ export function classifyStatusNotice(message: string): NoticeTone {
     lower.includes('внимание') ||
     lower.includes('предупрежд') ||
     lower.includes('истек') ||
-    lower.includes('ожидает')
+    lower.includes('ожидает') ||
+    lower.includes('требуется перезапуск')
   ) {
     return 'warning';
   }
@@ -80,23 +127,42 @@ export function formatShortTime(ts: number | string | null | undefined, locale?:
   }
 }
 
-export function formatLiveUptime(startedAtSec: number | null | undefined, nowSec: number): string {
-  if (!startedAtSec || startedAtSec <= 0) return '—';
-  const start = startedAtSec > 1e12 ? Math.floor(startedAtSec / 1000) : Math.floor(startedAtSec);
-  const diff = Math.max(0, Math.floor(nowSec - start));
+export function formatLiveUptime(
+  startedAtRaw: number | string | null | undefined,
+  nowRaw: number = Date.now()
+): string {
+  if (!startedAtRaw) return '';
+  let startMs = 0;
+  if (typeof startedAtRaw === 'number') {
+    startMs = startedAtRaw < 1e12 ? startedAtRaw * 1000 : startedAtRaw;
+  } else {
+    const parsed = Date.parse(startedAtRaw);
+    if (!isNaN(parsed)) {
+      startMs = parsed;
+    } else {
+      const asNum = Number(startedAtRaw);
+      if (!isNaN(asNum) && asNum > 0) {
+        startMs = asNum < 1e12 ? asNum * 1000 : asNum;
+      }
+    }
+  }
+  if (!startMs || startMs <= 0) return '';
+  const nowMs = nowRaw < 1e12 ? nowRaw * 1000 : nowRaw;
+  const diff = Math.max(0, Math.floor((nowMs - startMs) / 1000));
   if (diff < 60) return `${diff}с`;
   const mins = Math.floor(diff / 60);
   const secs = diff % 60;
-  if (mins < 60) return `${mins}м ${String(secs).padStart(2, '0')}с`;
+  if (mins < 60) return `${mins}м ${secs}с`;
   const hours = Math.floor(mins / 60);
   const remMins = mins % 60;
-  if (hours < 24) return `${hours}ч ${String(remMins).padStart(2, '0')}м`;
+  if (hours < 24) return `${hours}ч ${remMins}м`;
   const days = Math.floor(hours / 24);
   const remHours = hours % 24;
   return `${days}д ${remHours}ч ${remMins}м`;
 }
 
 export function getDepsButtonMeta(runtime: string | undefined): {
+  show: boolean;
   visible: boolean;
   label: string;
   busyLabel: string;
@@ -105,6 +171,7 @@ export function getDepsButtonMeta(runtime: string | undefined): {
   const rt = (runtime || 'python').toLowerCase();
   if (rt.includes('node') || rt.includes('js') || rt.includes('ts')) {
     return {
+      show: true,
       visible: true,
       label: 'npm install',
       busyLabel: 'npm install...',
@@ -113,6 +180,7 @@ export function getDepsButtonMeta(runtime: string | undefined): {
   }
   if (rt.includes('bash') || rt.includes('sh') || rt.includes('shell')) {
     return {
+      show: false,
       visible: false,
       label: 'Зависимости',
       busyLabel: 'Проверка...',
@@ -120,6 +188,7 @@ export function getDepsButtonMeta(runtime: string | undefined): {
     };
   }
   return {
+    show: true,
     visible: true,
     label: '.venv / pip install',
     busyLabel: 'Установка .venv...',
@@ -129,10 +198,12 @@ export function getDepsButtonMeta(runtime: string | undefined): {
 
 export function generateBeaconFileTemplate(
   targetPath: string,
-  project?: Partial<ProjectItem> | null
+  projectOrName?: Partial<ProjectItem> | string | null
 ): string {
   const lower = (targetPath || '').toLowerCase();
   const baseName = lower.split('/').pop() || lower;
+  const project: Partial<ProjectItem> | null =
+    typeof projectOrName === 'string' ? { name: projectOrName } : projectOrName || null;
   const projName = project?.name || 'my-service';
   const projType = project?.type || 'service';
   const projRuntime = project?.runtime || 'python';
@@ -171,19 +242,21 @@ export function generateBeaconFileTemplate(
   }
 
   if (baseName === 'package.json') {
-    return JSON.stringify(
-      {
-        name: projName,
-        version: '1.0.0',
-        private: true,
-        scripts: {
-          start: 'node index.js',
+    return (
+      JSON.stringify(
+        {
+          name: projName,
+          version: '1.0.0',
+          private: true,
+          scripts: {
+            start: 'node index.js',
+          },
+          dependencies: {},
         },
-        dependencies: {},
-      },
-      null,
-      2
-    ) + '\n';
+        null,
+        2
+      ) + '\n'
+    );
   }
 
   if (lower.endsWith('.py')) {
@@ -243,6 +316,7 @@ export function generateBeaconFileTemplate(
 export interface SdkSnippetItem {
   id: string;
   label: string;
+  colorCls: string;
   badgeColor: string;
   description: string;
   code: string;
@@ -250,28 +324,30 @@ export interface SdkSnippetItem {
 
 export function getRuntimeSdkSnippets(
   runtime: string | undefined,
-  projectName: string,
-  cookieSecretName: string
+  cookieSecretOrProjName: string,
+  optionalCookieSecret?: string
 ): SdkSnippetItem[] {
   const rt = (runtime || 'python').toLowerCase();
-  const secCookie = cookieSecretName || `${projectName}_cookies`;
+  const secCookie = optionalCookieSecret || cookieSecretOrProjName || 'project_cookies';
 
   if (rt.includes('node') || rt.includes('js') || rt.includes('ts')) {
     return [
       {
         id: 'notify',
         label: '+ beacon.notify()',
+        colorCls: 'text-sky-300 border-sky-800/60',
         badgeColor: 'text-sky-300 border-sky-800/60',
         description: 'Отправить уведомление в Telegram и журнал панели',
         code: [
           "const beacon = require('beacon');",
           "// Отправка уведомления ('info' | 'warn' | 'error'):",
-          `await beacon.notify('Задача в ${projectName} успешно выполнена!', 'info');`,
+          "await beacon.notify('Задача успешно выполнена!', 'info');",
         ].join('\n'),
       },
       {
         id: 'ask',
         label: '+ beacon.ask("2FA")',
+        colorCls: 'text-amber-300 border-amber-800/60',
         badgeColor: 'text-amber-300 border-amber-800/60',
         description: 'Запросить 2FA-код или капчу в панели и в Telegram',
         code: [
@@ -284,6 +360,7 @@ export function getRuntimeSdkSnippets(
       {
         id: 'state',
         label: '+ beacon.state.get/set',
+        colorCls: 'text-indigo-300 border-indigo-800/60',
         badgeColor: 'text-indigo-300 border-indigo-800/60',
         description: 'Чтение и запись постоянного состояния (KV)',
         code: [
@@ -296,6 +373,7 @@ export function getRuntimeSdkSnippets(
       {
         id: 'secret',
         label: '+ beacon.secret("cookies")',
+        colorCls: 'text-emerald-300 border-emerald-800/60',
         badgeColor: 'text-emerald-300 border-emerald-800/60',
         description: 'Чтение кук или API-ключа из сейфа 0600',
         code: [
@@ -308,6 +386,7 @@ export function getRuntimeSdkSnippets(
       {
         id: 'cookies_expired',
         label: '+ beacon.cookies_expired()',
+        colorCls: 'text-rose-300 border-rose-800/60',
         badgeColor: 'text-rose-300 border-rose-800/60',
         description: 'Сигнал о протухших куках (вызывает баннер в панели)',
         code: [
@@ -319,6 +398,7 @@ export function getRuntimeSdkSnippets(
       {
         id: 'ping',
         label: '+ beacon.ping()',
+        colorCls: 'text-cyan-300 border-cyan-800/60',
         badgeColor: 'text-cyan-300 border-cyan-800/60',
         description: "Dead Man's Switch (пульс живучести)",
         code: [
@@ -334,22 +414,24 @@ export function getRuntimeSdkSnippets(
     {
       id: 'notify',
       label: '+ beacon.notify()',
+      colorCls: 'text-sky-300 border-sky-800/60',
       badgeColor: 'text-sky-300 border-sky-800/60',
       description: 'Отправить уведомление в Telegram и журнал панели',
       code: [
         'import beacon',
         '# Отправка уведомления в Telegram и панель (level="info" | "warn" | "error"):',
-        `beacon.notify("Задача в ${projectName} успешно выполнена!", level="info")`,
+        'beacon.notify("Задача успешно выполнена!", level="info")',
       ].join('\n'),
     },
     {
       id: 'ask',
       label: '+ beacon.ask("2FA код")',
+      colorCls: 'text-amber-300 border-amber-800/60',
       badgeColor: 'text-amber-300 border-amber-800/60',
       description: 'Запросить 2FA-код или капчу в веб-панели и Telegram',
       code: [
         'import beacon',
-        '# Запрос 2FA/капчи в веб-панель и Telegram (таймаут 300с):',
+        '# Запрос 2FA/капчи в веб-панели и Telegram (таймаут 300с):',
         'code = beacon.ask("Введите код подтверждения из SMS:", timeout=300)',
         'print("Получен код:", code, flush=True)',
       ].join('\n'),
@@ -357,6 +439,7 @@ export function getRuntimeSdkSnippets(
     {
       id: 'state',
       label: '+ beacon.state.get/set',
+      colorCls: 'text-indigo-300 border-indigo-800/60',
       badgeColor: 'text-indigo-300 border-indigo-800/60',
       description: 'Чтение и запись постоянного состояния (KV)',
       code: [
@@ -369,6 +452,7 @@ export function getRuntimeSdkSnippets(
     {
       id: 'secret',
       label: '+ beacon.secret("cookies")',
+      colorCls: 'text-emerald-300 border-emerald-800/60',
       badgeColor: 'text-emerald-300 border-emerald-800/60',
       description: 'Чтение кук или API-ключа из сейфа 0600',
       code: [
@@ -381,6 +465,7 @@ export function getRuntimeSdkSnippets(
     {
       id: 'cookies_expired',
       label: '+ beacon.cookies_expired()',
+      colorCls: 'text-rose-300 border-rose-800/60',
       badgeColor: 'text-rose-300 border-rose-800/60',
       description: 'Сигнал об истечении кук (вызовет тревогу в панели)',
       code: [
@@ -392,6 +477,7 @@ export function getRuntimeSdkSnippets(
     {
       id: 'ping',
       label: '+ beacon.ping()',
+      colorCls: 'text-cyan-300 border-cyan-800/60',
       badgeColor: 'text-cyan-300 border-cyan-800/60',
       description: "Сигнал Dead Man's Switch",
       code: [
@@ -461,8 +547,8 @@ export function findNextInCode(
   query: string,
   startPos: number,
   caseSensitive: boolean = false
-): { index: number; length: number } | null {
-  if (!query || !source) return null;
+): number {
+  if (!query || !source) return -1;
   const hay = caseSensitive ? source : source.toLowerCase();
   const needle = caseSensitive ? query : query.toLowerCase();
   const safeStart = Math.max(0, Math.min(source.length, startPos));
@@ -470,8 +556,7 @@ export function findNextInCode(
   if (idx === -1 && safeStart > 0) {
     idx = hay.indexOf(needle, 0);
   }
-  if (idx === -1) return null;
-  return { index: idx, length: query.length };
+  return idx;
 }
 
 export function findAndReplaceInCode(
@@ -479,14 +564,166 @@ export function findAndReplaceInCode(
   query: string,
   replacement: string,
   caseSensitive: boolean = false
-): { output: string; count: number } {
-  if (!query || !source) return { output: source, count: 0 };
+): { nextText: string; nextContent: string; output: string; count: number } {
+  if (!query || !source) {
+    return { nextText: source, nextContent: source, output: source, count: 0 };
+  }
   const flags = caseSensitive ? 'g' : 'gi';
   const re = new RegExp(escapeRegExp(query), flags);
   const matches = source.match(re);
   if (!matches || matches.length === 0) {
-    return { output: source, count: 0 };
+    return { nextText: source, nextContent: source, output: source, count: 0 };
   }
   const output = source.replace(re, () => replacement);
-  return { output, count: matches.length };
+  return { nextText: output, nextContent: output, output, count: matches.length };
+}
+
+export interface FileTreeNode {
+  name: string;
+  path: string;
+  is_dir?: boolean;
+  type?: 'file' | 'dir' | 'directory';
+  size?: number;
+  children?: FileTreeNode[];
+}
+
+export interface FlatFileEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size: number;
+  depth?: number;
+}
+
+export type FlatFileTreeRow = FlatFileEntry;
+
+export function flattenFileTree(
+  nodes: FileTreeNode[] | undefined | null,
+  expandedDirs: Set<string> | Record<string, boolean> = new Set(),
+  depth: number = 0
+): FlatFileEntry[] {
+  if (!Array.isArray(nodes) || nodes.length === 0) return [];
+
+  const sorted = [...nodes].sort((a, b) => {
+    const aDir = Boolean(a.is_dir || a.type === 'dir' || a.type === 'directory');
+    const bDir = Boolean(b.is_dir || b.type === 'dir' || b.type === 'directory');
+    if (aDir !== bDir) return aDir ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  const rows: FlatFileEntry[] = [];
+  for (const node of sorted) {
+    const isDir = Boolean(node.is_dir || node.type === 'dir' || node.type === 'directory');
+    rows.push({
+      name: node.name,
+      path: node.path,
+      depth,
+      is_dir: isDir,
+      size: Number(node.size || 0),
+    });
+    if (isDir && Array.isArray(node.children) && node.children.length > 0) {
+      rows.push(...flattenFileTree(node.children, expandedDirs, depth + 1));
+    }
+  }
+  return rows;
+}
+
+export function getFileLanguageMeta(filePath: string): {
+  label: string;
+  badgeCls: string;
+  badgeClass: string;
+  language: string;
+  tabSize: number;
+} {
+  const lower = (filePath || '').toLowerCase();
+  const baseName = lower.split('/').pop() || lower;
+
+  if (lower.endsWith('.py')) {
+    const cls = 'bg-sky-500/15 text-sky-300 border-sky-500/30';
+    return {
+      label: 'Python',
+      badgeCls: cls,
+      badgeClass: cls,
+      language: 'python',
+      tabSize: 4,
+    };
+  }
+  if (lower.endsWith('.ts') || lower.endsWith('.tsx')) {
+    const cls = 'bg-blue-500/15 text-blue-300 border-blue-500/30';
+    return {
+      label: 'TypeScript',
+      badgeCls: cls,
+      badgeClass: cls,
+      language: 'typescript',
+      tabSize: 2,
+    };
+  }
+  if (lower.endsWith('.js') || lower.endsWith('.jsx') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) {
+    const cls = 'bg-amber-500/15 text-amber-300 border-amber-500/30';
+    return {
+      label: 'JavaScript',
+      badgeCls: cls,
+      badgeClass: cls,
+      language: 'javascript',
+      tabSize: 2,
+    };
+  }
+  if (lower.endsWith('.json')) {
+    const cls = 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30';
+    return {
+      label: 'JSON',
+      badgeCls: cls,
+      badgeClass: cls,
+      language: 'json',
+      tabSize: 2,
+    };
+  }
+  if (lower.endsWith('.yaml') || lower.endsWith('.yml')) {
+    const cls = 'bg-purple-500/15 text-purple-300 border-purple-500/30';
+    return {
+      label: 'YAML',
+      badgeCls: cls,
+      badgeClass: cls,
+      language: 'yaml',
+      tabSize: 2,
+    };
+  }
+  if (lower.endsWith('.sh') || lower.endsWith('.bash')) {
+    const cls = 'bg-lime-500/15 text-lime-300 border-lime-500/30';
+    return {
+      label: 'Shell',
+      badgeCls: cls,
+      badgeClass: cls,
+      language: 'shell',
+      tabSize: 2,
+    };
+  }
+  if (lower.endsWith('.md')) {
+    const cls = 'bg-slate-700/60 text-slate-300 border-slate-600';
+    return {
+      label: 'Markdown',
+      badgeCls: cls,
+      badgeClass: cls,
+      language: 'markdown',
+      tabSize: 2,
+    };
+  }
+  if (baseName === 'requirements.txt' || lower.endsWith('.txt') || lower.endsWith('.log')) {
+    const cls = 'bg-slate-800 text-slate-300 border-slate-700';
+    return {
+      label: baseName === 'requirements.txt' ? 'Pip Deps' : 'Text',
+      badgeCls: cls,
+      badgeClass: cls,
+      language: 'plaintext',
+      tabSize: 2,
+    };
+  }
+  const cls = 'bg-slate-800 text-slate-400 border-slate-700';
+  return {
+    label: 'File',
+    badgeCls: cls,
+    badgeClass: cls,
+    language: 'plaintext',
+    tabSize: 2,
+  };
 }

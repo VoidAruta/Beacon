@@ -22,13 +22,16 @@ import {
 } from './projectWorkspaceUtils';
 
 export const StatusNoticeBanner: React.FC<{
-  message: string;
+  text?: string;
+  message?: string;
   toneOverride?: NoticeTone;
+  compact?: boolean;
   inline?: boolean;
   onDismiss?: () => void;
-}> = React.memo(({ message, toneOverride, inline = false, onDismiss }) => {
-  if (!message) return null;
-  const tone = toneOverride || classifyStatusNotice(message);
+}> = React.memo(({ text, message, toneOverride, compact = false, inline = false, onDismiss }) => {
+  const msg = text || message || '';
+  if (!msg) return null;
+  const tone = toneOverride || classifyStatusNotice(msg);
 
   const toneStyles: Record<
     NoticeTone,
@@ -59,11 +62,14 @@ export const StatusNoticeBanner: React.FC<{
   const st = toneStyles[tone];
   const IconComp = st.Icon;
 
-  if (inline) {
+  if (inline || compact) {
     return (
-      <span className={`inline-flex items-center gap-1.5 text-[11px] font-mono ${st.text}`}>
+      <span
+        role={tone === 'error' ? 'alert' : 'status'}
+        className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded border text-[11px] font-mono ${st.box}`}
+      >
         <IconComp className="w-3.5 h-3.5 shrink-0" />
-        <span>{message}</span>
+        <span>{msg}</span>
       </span>
     );
   }
@@ -75,7 +81,7 @@ export const StatusNoticeBanner: React.FC<{
     >
       <div className="flex items-center gap-2 min-w-0">
         <IconComp className="w-4 h-4 shrink-0" />
-        <span className="break-words">{message}</span>
+        <span className="break-words">{msg}</span>
       </div>
       {onDismiss && (
         <button
@@ -92,12 +98,15 @@ export const StatusNoticeBanner: React.FC<{
 });
 
 export const DirtyDeployBanner: React.FC<{
-  visible: boolean;
-  restarting: boolean;
+  reason?: string;
+  visible?: boolean;
+  busy?: boolean;
+  restarting?: boolean;
   onRestartNow: () => void;
   onDismiss: () => void;
-}> = React.memo(({ visible, restarting, onRestartNow, onDismiss }) => {
-  if (!visible) return null;
+}> = React.memo(({ reason, visible = true, busy = false, restarting = false, onRestartNow, onDismiss }) => {
+  if (!visible && !reason) return null;
+  const isBusy = busy || restarting;
   return (
     <div
       role="status"
@@ -106,18 +115,21 @@ export const DirtyDeployBanner: React.FC<{
       <div className="flex items-center gap-2 text-amber-100">
         <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
         <span>
-          <strong className="text-amber-300">Код или настройки обновлены:</strong> {LABELS.dirtyDeployWarning}
+          <strong className="text-amber-300">
+            {reason ? `${reason}:` : 'Код или настройки обновлены:'}
+          </strong>{' '}
+          {LABELS.dirtyDeployWarning}
         </span>
       </div>
       <div className="flex items-center gap-2 shrink-0">
         <button
           type="button"
-          disabled={restarting}
+          disabled={isBusy}
           onClick={onRestartNow}
           className="px-3 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-semibold inline-flex items-center gap-1.5 cursor-pointer"
         >
-          <RotateCcw className={`w-3.5 h-3.5 ${restarting ? 'animate-spin' : ''}`} />
-          <span>{restarting ? 'Перезапуск...' : LABELS.dirtyDeployAction}</span>
+          <RotateCcw className={`w-3.5 h-3.5 ${isBusy ? 'animate-spin' : ''}`} />
+          <span>{isBusy ? 'Перезапуск...' : LABELS.dirtyDeployAction}</span>
         </button>
         <button
           type="button"
@@ -133,20 +145,36 @@ export const DirtyDeployBanner: React.FC<{
 });
 
 export const DeleteEntryConfirmModal: React.FC<{
-  open: boolean;
-  path: string;
-  isDir: boolean;
-  isLastFile: boolean;
-  isEntrypoint: boolean;
+  entry?: { path: string; isDir: boolean } | null;
+  projectName?: string;
+  open?: boolean;
+  path?: string;
+  isDir?: boolean;
+  isLastFile?: boolean;
+  isEntrypoint?: boolean;
   busy: boolean;
   onCancel: () => void;
   onConfirm: () => void;
-}> = ({ open, path, isDir, isLastFile, isEntrypoint, busy, onCancel, onConfirm }) => {
+}> = ({
+  entry,
+  projectName,
+  open,
+  path,
+  isDir,
+  isLastFile = false,
+  isEntrypoint = false,
+  busy,
+  onCancel,
+  onConfirm,
+}) => {
+  const resolvedOpen = entry ? Boolean(entry.path) : Boolean(open && path);
+  const resolvedPath = entry?.path || path || '';
+  const resolvedIsDir = entry ? entry.isDir : Boolean(isDir);
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const cancelBtnRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
-    if (!open) return;
+    if (!resolvedOpen) return;
     cancelBtnRef.current?.focus();
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -172,15 +200,22 @@ export const DeleteEntryConfirmModal: React.FC<{
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [open, onCancel]);
+  }, [resolvedOpen, onCancel]);
 
-  if (!open || !path) return null;
+  if (!resolvedOpen || !resolvedPath) return null;
+
+  const looksLikeEntrypoint =
+    isEntrypoint ||
+    resolvedPath === 'main.py' ||
+    resolvedPath === 'bot.py' ||
+    resolvedPath === 'index.js' ||
+    resolvedPath === 'project.yaml';
 
   return (
     <div
       role="dialog"
       aria-modal="true"
-      aria-label={`${LABELS.deleteFileModalTitle}: ${path}`}
+      aria-label={`${LABELS.deleteFileModalTitle}: ${resolvedPath}`}
       className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-xs flex items-center justify-center p-4"
       onClick={onCancel}
     >
@@ -190,32 +225,37 @@ export const DeleteEntryConfirmModal: React.FC<{
         className="bg-[#111622] border border-rose-500/60 rounded-xl max-w-md w-full p-5 space-y-4 shadow-2xl"
       >
         <div className="flex items-center gap-2.5 text-rose-300">
-          {isDir ? <Folder className="w-5 h-5 shrink-0 text-amber-400" /> : <Trash2 className="w-5 h-5 shrink-0" />}
+          {resolvedIsDir ? (
+            <Folder className="w-5 h-5 shrink-0 text-amber-400" />
+          ) : (
+            <Trash2 className="w-5 h-5 shrink-0" />
+          )}
           <h3 className="text-sm font-bold text-white">
-            Удалить {isDir ? 'папку со всем содержимым' : 'файл'} «{path}»?
+            Удалить {resolvedIsDir ? 'папку со всем содержимым' : 'файл'} «{resolvedPath}»
+            {projectName ? ` из проекта «${projectName}»` : ''}?
           </h3>
         </div>
 
         <p className="text-xs text-slate-300 leading-relaxed">
-          {isDir
-            ? `Папка «${path}/» и все вложенные в неё файлы будут безвозвратно удалены с диска сервера.`
-            : `Файл «${path}» будет безвозвратно удалён из рабочей папки проекта на диске.`}
+          {resolvedIsDir
+            ? `Папка «${resolvedPath}/» и все вложенные в неё файлы будут безвозвратно удалены с диска сервера.`
+            : `Файл «${resolvedPath}» будет безвозвратно удалён из рабочей папки проекта на диске.`}
         </p>
 
-        {(isLastFile || isEntrypoint || isDir) && (
+        {(isLastFile || looksLikeEntrypoint || resolvedIsDir) && (
           <div className="p-3 rounded-lg bg-rose-950/50 border border-rose-700/60 text-xs text-rose-200 space-y-1">
-            {isEntrypoint && (
+            {looksLikeEntrypoint && !resolvedIsDir && (
               <div>
-                ⚠️ <strong>Внимание:</strong> этот файл указан в команде запуска проекта! Его удаление приведёт к сбою
-                при следующем старте.
+                ⚠️ <strong>Внимание:</strong> это ключевой файл проекта! Его удаление может привести к сбою при следующем
+                старте.
               </div>
             )}
-            {isLastFile && !isDir && (
+            {isLastFile && !resolvedIsDir && (
               <div>
                 ⚠️ <strong>Это единственный файл в проекте.</strong>
               </div>
             )}
-            {isDir && (
+            {resolvedIsDir && (
               <div>
                 ⚠️ <strong>Рекурсивное удаление каталога:</strong> убедитесь, что внутри нет важных данных или баз SQLite.
               </div>
@@ -240,7 +280,7 @@ export const DeleteEntryConfirmModal: React.FC<{
             className="px-3.5 py-1.5 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-500 disabled:opacity-50 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
           >
             <Trash2 className="w-3.5 h-3.5" />
-            <span>{busy ? 'Удаление...' : isDir ? 'Удалить папку' : 'Удалить файл'}</span>
+            <span>{busy ? 'Удаление...' : resolvedIsDir ? 'Удалить папку' : 'Удалить файл'}</span>
           </button>
         </div>
       </div>
@@ -250,11 +290,12 @@ export const DeleteEntryConfirmModal: React.FC<{
 
 export const FuzzyFileModal: React.FC<{
   open: boolean;
+  projectName?: string;
   files: Array<{ path: string; name: string; size: number; is_dir: boolean }>;
   activeFilePath: string;
   onSelectFile: (path: string) => void;
   onClose: () => void;
-}> = ({ open, files, activeFilePath, onSelectFile, onClose }) => {
+}> = ({ open, projectName, files, activeFilePath, onSelectFile, onClose }) => {
   const [query, setQuery] = useState('');
   const [selectedIdx, setSelectedIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -317,7 +358,7 @@ export const FuzzyFileModal: React.FC<{
                 onClose();
               }
             }}
-            placeholder="Введите имя или путь файла (↑↓ выбор, Enter открыть, Esc закрыть)..."
+            placeholder={`Быстрый поиск файла${projectName ? ` в «${projectName}»` : ''} (↑↓ выбор, Enter открыть, Esc закрыть)...`}
             className="w-full bg-transparent text-xs font-mono text-white outline-none"
           />
           <button
@@ -385,9 +426,25 @@ const TOKEN_RE_BY_EXT: Record<string, RegExp> = {
   sh: /(#.*$)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|(\$[a-zA-Z_][a-zA-Z0-9_]*|\$\{[^}]+\})|\b(if|then|else|elif|fi|for|in|do|done|while|case|esac|function|return|exit|set|export|local|echo|cd)\b|\b(\d+)\b/gm,
 };
 
+function resolveExtFromPathOrLang(filePath?: string, extProp?: string, langLabel?: string): string {
+  if (extProp) return extProp.replace(/^\./, '').toLowerCase();
+  const lower = (filePath || '').toLowerCase();
+  if (lower.endsWith('.py')) return 'py';
+  if (lower.endsWith('.js') || lower.endsWith('.mjs') || lower.endsWith('.cjs') || lower.endsWith('.ts') || lower.endsWith('.tsx')) return 'js';
+  if (lower.endsWith('.yaml') || lower.endsWith('.yml')) return 'yaml';
+  if (lower.endsWith('.json')) return 'json';
+  if (lower.endsWith('.sh') || lower.endsWith('.bash')) return 'sh';
+  const lbl = (langLabel || '').toLowerCase();
+  if (lbl.includes('python')) return 'py';
+  if (lbl.includes('js') || lbl.includes('ts') || lbl.includes('node') || lbl.includes('javascript') || lbl.includes('typescript')) return 'js';
+  if (lbl.includes('yaml')) return 'yaml';
+  if (lbl.includes('json')) return 'json';
+  if (lbl.includes('shell') || lbl.includes('bash')) return 'sh';
+  return 'txt';
+}
+
 function buildHighlightedHtml(code: string, ext: string): string {
   if (!code) return '';
-  // Для очень больших файлов (> 80 КБ) рендерим экранированный текст без regex-нагрузки на RPi
   if (code.length > 80000) {
     return escapeHtml(code);
   }
@@ -467,21 +524,24 @@ function buildHighlightedHtml(code: string, ext: string): string {
 
 export interface SyntaxCodeEditorProps {
   textareaRef: React.RefObject<HTMLTextAreaElement | null>;
-  gutterRef: React.RefObject<HTMLDivElement | null>;
+  gutterRef: React.RefObject<HTMLElement | null>;
   value: string;
-  ext: string;
+  filePath?: string;
+  langLabel?: string;
+  ext?: string;
   tabSize: number;
   wordWrap: boolean;
   viewportHeightCls: string;
+  cursorLine?: number;
   onChange: (nextVal: string) => void;
-  onCursorChange: (pos: { line: number; col: number }) => void;
+  onCursorChange: (ta: HTMLTextAreaElement) => void;
   onSave: () => void;
   onSaveAndRestart: () => void;
-  onStartProject: () => void;
+  onStartProject?: () => void;
   onOpenFind: () => void;
-  onOpenFuzzy: () => void;
+  onOpenFuzzy?: () => void;
   onCloseActiveTab: () => void;
-  onEscape: () => void;
+  onEscape?: () => void;
 }
 
 export const SyntaxCodeEditor: React.FC<SyntaxCodeEditorProps> = React.memo(
@@ -489,6 +549,8 @@ export const SyntaxCodeEditor: React.FC<SyntaxCodeEditorProps> = React.memo(
     textareaRef,
     gutterRef,
     value,
+    filePath,
+    langLabel,
     ext,
     tabSize,
     wordWrap,
@@ -507,9 +569,14 @@ export const SyntaxCodeEditor: React.FC<SyntaxCodeEditorProps> = React.memo(
     const [sdkSuggestPrefix, setSdkSuggestPrefix] = useState<string | null>(null);
     const [sdkSelectedIdx, setSdkSelectedIdx] = useState(0);
 
+    const resolvedExt = useMemo(
+      () => resolveExtFromPathOrLang(filePath, ext, langLabel),
+      [filePath, ext, langLabel]
+    );
+
     const lineCount = useMemo(() => Math.max(1, value.split('\n').length), [value]);
 
-    // Единая строка номеров строк вместо тысяч отдельных <div> (не тормозит на больших файлах!)
+    // Единый текстовый узел номеров строк в <pre> вместо тысяч отдельных <div> (Audit #8)
     const lineNumbersText = useMemo(() => {
       const nums: number[] = new Array(lineCount);
       for (let i = 0; i < lineCount; i++) {
@@ -518,7 +585,10 @@ export const SyntaxCodeEditor: React.FC<SyntaxCodeEditorProps> = React.memo(
       return nums.join('\n');
     }, [lineCount]);
 
-    const highlightedHtml = useMemo(() => buildHighlightedHtml(value, ext), [value, ext]);
+    const highlightedHtml = useMemo(
+      () => buildHighlightedHtml(value, resolvedExt),
+      [value, resolvedExt]
+    );
 
     const matchingCompletions = useMemo(() => {
       if (sdkSuggestPrefix === null) return [];
@@ -527,14 +597,11 @@ export const SyntaxCodeEditor: React.FC<SyntaxCodeEditorProps> = React.memo(
     }, [sdkSuggestPrefix]);
 
     const updateMetricsAndAutocomplete = (ta: HTMLTextAreaElement) => {
+      onCursorChange(ta);
       const pos = ta.selectionStart || 0;
       const before = ta.value.slice(0, pos);
       const lines = before.split('\n');
       const curLineText = lines[lines.length - 1] || '';
-      onCursorChange({
-        line: lines.length,
-        col: curLineText.length + 1,
-      });
 
       const m = curLineText.match(/\bbeacon\.([a-zA-Z0-9_.]*)$/);
       if (m) {
@@ -575,14 +642,14 @@ export const SyntaxCodeEditor: React.FC<SyntaxCodeEditorProps> = React.memo(
 
     return (
       <div className={`relative flex bg-[#070b14] overflow-hidden ${viewportHeightCls}`}>
-        {/* Оптимизированная колонка номеров строк (один текстовый узел вместо тысяч div) */}
-        <div
-          ref={gutterRef}
+        {/* Оптимизированная колонка номеров строк (один <pre> вместо тысяч <div>) */}
+        <pre
+          ref={gutterRef as React.RefObject<HTMLPreElement | null>}
           aria-hidden="true"
-          className="select-none h-full py-4 px-2.5 bg-[#090d18] border-r border-[#1e2638]/80 text-right font-mono text-xs leading-relaxed text-slate-500 overflow-hidden shrink-0 min-w-[48px] tabular-nums"
+          className="select-none h-full m-0 py-4 px-2.5 bg-[#090d18] border-r border-[#1e2638]/80 text-right font-mono text-xs leading-relaxed text-slate-500 overflow-hidden shrink-0 min-w-[48px] tabular-nums"
         >
-          <pre className="font-mono text-xs leading-relaxed m-0">{lineNumbersText}</pre>
-        </div>
+          {lineNumbersText}
+        </pre>
 
         {/* Основной контейнер редактора со слоем подсветки синтаксиса */}
         <div className="relative flex-1 h-full overflow-hidden">
@@ -611,7 +678,6 @@ export const SyntaxCodeEditor: React.FC<SyntaxCodeEditorProps> = React.memo(
             }}
             onScroll={handleScrollSync}
             onKeyDown={(e) => {
-              // Навигация по всплывающему списку автодополнения beacon.*
               if (matchingCompletions.length > 0) {
                 if (e.key === 'ArrowDown') {
                   e.preventDefault();
@@ -647,20 +713,20 @@ export const SyntaxCodeEditor: React.FC<SyntaxCodeEditorProps> = React.memo(
                 onSave();
                 return;
               }
-              // Ctrl+Enter -> Запустить проект
-              if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+              // Ctrl+Enter -> Запустить/перезапустить проект
+              if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && onStartProject) {
                 e.preventDefault();
                 onStartProject();
                 return;
               }
               // Alt+P или Ctrl+P -> Быстрый переход к файлу проекта
-              if ((e.altKey || e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'p') {
+              if ((e.altKey || e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'p' && onOpenFuzzy) {
                 e.preventDefault();
                 onOpenFuzzy();
                 return;
               }
               // Alt+W -> Закрыть текущую вкладку файла (не закрывает вкладку браузера!)
-              if (e.altKey && e.key.toLowerCase() === 'w') {
+              if (e.altKey && !e.ctrlKey && !e.metaKey && (e.key.toLowerCase() === 'w' || e.code === 'KeyW')) {
                 e.preventDefault();
                 onCloseActiveTab();
                 return;
@@ -671,12 +737,11 @@ export const SyntaxCodeEditor: React.FC<SyntaxCodeEditorProps> = React.memo(
                 onOpenFind();
                 return;
               }
-              if (e.key === 'Escape') {
+              if (e.key === 'Escape' && onEscape) {
                 onEscape();
                 return;
               }
 
-              // Вставка парных скобок/кавычек или отступа Tab
               if (e.key === 'Tab') {
                 e.preventDefault();
                 const ta = e.currentTarget;
