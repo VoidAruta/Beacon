@@ -356,36 +356,89 @@ def check_endpoint_health(
         return False, "healthcheck_connection_failed"
 
 
-def build_install_deps_command(workdir: Path, runtime: str) -> list[str]:
+def build_install_deps_command(
+    workdir: Path,
+    runtime: str,
+    project_type: str = "service",
+    port: int = 0,
+) -> list[str]:
     """
-    Формирует argv-команду изолированной установки зависимостей проекта (P1-10):
-    - Для Node.js: npm ci (если есть package-lock.json) или npm install без маскировки кода ошибки (без || echo).
-    - Для Python: uv venv / python3 -m venv .venv + установка из requirements.txt.
+    Формирует argv-команду подготовки окружения, установки зависимостей и проверки проекта
+    с адаптацией под runtime (python / node / bash) и тип проекта (service / web / job):
+    - Для Bash / Shell: выставляет chmod +x на *.sh и проверяет синтаксис через bash -n.
+    - Для Node.js: npm ci / npm install + проверка синтаксиса JS (node --check) и порта для web.
+    - Для Python: uv venv / python3 -m venv .venv + pip install -r requirements.txt + py_compile.
     """
-    if runtime == "node" or ((workdir / "package.json").exists() and not (workdir / "requirements.txt").exists()):
+    rt = (runtime or "python").strip().lower()
+    ptype = (project_type or "service").strip().lower()
+
+    if rt in ("bash", "sh", "shell"):
+        script = (
+            "set -e; "
+            f'echo "[env:{ptype}] Подготовка Shell-скриптов и проверка синтаксиса (bash -n)..."; '
+            "chmod +x *.sh 2>/dev/null || true; "
+            "checked=0; "
+            "for f in *.sh; do "
+            '  if [ -f "$f" ]; then '
+            '    bash -n "$f" 2>&1 && echo "[shell-ok] Синтаксис и права +x проверены: $f"; '
+            "    checked=$((checked + 1)); "
+            "  fi; "
+            "done; "
+            'if [ "$checked" -eq 0 ]; then echo "[shell-info] .sh файлы в корне не найдены, окружение Bash готово."; fi; '
+            f'echo "[env:{ptype}] Готово ($(bash --version | head -n 1))."'
+        )
+        return ["/bin/bash", "-c", script]
+
+    if rt == "node" or ((workdir / "package.json").exists() and not (workdir / "requirements.txt").exists()):
         npm_subcmd = (
             "npm ci --no-audit --no-fund 2>&1"
             if (workdir / "package-lock.json").exists() or (workdir / "npm-shrinkwrap.json").exists()
             else "npm install --no-audit --no-fund 2>&1"
         )
+        web_note = (
+            f'echo "[web-check] Веб-проект настроен на порт PORT={port or 8080}."; '
+            if ptype == "web"
+            else f'echo "[{ptype}-check] Проверка синтаксиса JS-скриптов..."; '
+        )
         script = (
             "set -e; "
-            'echo "[deps] Установка npm-пакетов в локальный node_modules..."; '
-            f"{npm_subcmd}"
+            'if [ ! -f package.json ]; then echo "[deps] Файл package.json не найден — инициализируем npm init -y..."; npm init -y >/dev/null 2>&1 || true; fi; '
+            f'echo "[deps:{ptype}] Установка npm-пакетов в локальный node_modules..."; '
+            f"{npm_subcmd}; "
+            f"{web_note}"
+            'for jf in *.js; do [ -f "$jf" ] && node --check "$jf" 2>&1 && echo "[node-ok] Синтаксис проверен: $jf"; done; '
+            'echo "[deps] Окружение Node.js готово ($(node -v 2>&1))."'
         )
         return ["/bin/bash", "-c", script]
+
+    type_post_check = ""
+    if ptype == "web":
+        type_post_check = (
+            f'echo "[web-env] Проверка синтаксиса Python и готовности веб-сервиса (PORT={port or 8080})..."; '
+            'for pf in *.py; do [ -f "$pf" ] && (.venv/bin/python -m py_compile "$pf" 2>&1 || python3 -m py_compile "$pf" 2>&1) && echo "[py-ok] Модуль проверен: $pf"; done; '
+        )
+    elif ptype == "job":
+        type_post_check = (
+            'echo "[job-env] Проверка синтаксиса скрипта задачи (py_compile перед запуском по расписанию)..."; '
+            'for pf in *.py; do [ -f "$pf" ] && (.venv/bin/python -m py_compile "$pf" 2>&1 || python3 -m py_compile "$pf" 2>&1) && echo "[job-ok] Скрипт проверен: $pf"; done; '
+        )
+    else:
+        type_post_check = (
+            'echo "[service-env] Проверка синтаксиса постоянного 24/7 сервиса..."; '
+            'for pf in *.py; do [ -f "$pf" ] && (.venv/bin/python -m py_compile "$pf" 2>&1 || python3 -m py_compile "$pf" 2>&1) && echo "[service-ok] Демон проверен: $pf"; done; '
+        )
 
     script = (
         "set -e; "
         "if command -v uv >/dev/null 2>&1; then "
-        '  echo "[deps] Обнаружен пакетный менеджер uv — создаём изолированное окружение .venv..."; '
+        f'  echo "[deps:{ptype}] Обнаружен пакетный менеджер uv — создаём изолированное окружение .venv..."; '
         "  if [ ! -x .venv/bin/python ]; then uv venv .venv 2>&1; fi; "
         "  if [ -f requirements.txt ]; then "
         '    echo "[deps] Установка зависимостей через uv pip install -r requirements.txt..."; '
         "    uv pip install --python .venv/bin/python -r requirements.txt 2>&1; "
         "  fi; "
         "else "
-        '  echo "[deps] Настройка изолированного Python окружения .venv..."; '
+        f'  echo "[deps:{ptype}] Настройка изолированного Python окружения .venv..."; '
         "  if [ ! -x .venv/bin/python ]; then "
         "    python3 -m venv .venv 2>&1 || python3 -m venv --without-pip .venv 2>&1; "
         "  fi; "
@@ -403,6 +456,7 @@ def build_install_deps_command(workdir: Path, runtime: str) -> list[str]:
         "    fi; "
         "  fi; "
         "fi; "
+        f"{type_post_check}"
         'echo "[deps] Окружение .venv готово ($(.venv/bin/python --version 2>&1 || python3 --version))."'
     )
     return ["/bin/bash", "-c", script]

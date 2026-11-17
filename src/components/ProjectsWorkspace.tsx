@@ -74,6 +74,7 @@ import {
   FuzzyFileModal,
   SyntaxCodeEditor,
 } from './projects/ProjectWorkspaceModals';
+import { useI18n } from '../utils/i18n';
 
 interface ProjectsWorkspaceProps {
   projects: ProjectItem[];
@@ -129,6 +130,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   onOpenSecretsVault,
   apiFetch,
 }) => {
+  const { lang, t } = useI18n();
   const [subTab, setSubTab] = useState<WorkspaceSubTab>(initialSubTab);
 
   // Адаптивная компоновка рабочей области (экономия места на экране: консоль логов сбоку по умолчанию)
@@ -616,10 +618,20 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     if (!activeProj || venvSetupRunning) return;
     setVenvSetupRunning(true);
     setBottomConsoleTab('logs');
+    const currentMeta = getDepsButtonMeta(
+      cfgRuntime || activeProj.runtime,
+      cfgType || activeProj.type,
+      cfgCommand || activeProj.cmd,
+      files.map((f) => f.path),
+      lang
+    );
     try {
       const res = await apiFetch(`/api/projects/${activeProj.id}/install_deps`, {
         method: 'POST',
-        body: JSON.stringify({}),
+        body: JSON.stringify({
+          runtime: currentMeta.effectiveRuntime,
+          type: currentMeta.effectiveType,
+        }),
       });
       const data = await res.json();
       if (res.ok && data.run) {
@@ -627,7 +639,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
         setSelectedRunId(data.run.id);
         onRefreshAll();
       } else {
-        setCliOutput(`[ОШИБКА] ${data.detail || 'Не удалось запустить установку зависимостей'}`);
+        setCliOutput(`[ОШИБКА] ${data.detail || 'Не удалось запустить подготовку окружения'}`);
       }
     } catch (e: any) {
       setCliOutput(`[ОШИБКА] ${e?.message || 'Сбой запроса'}`);
@@ -1935,7 +1947,13 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     activeRamLimit > 0 ? Math.min(100, Math.round((activeRamUsed / activeRamLimit) * 100)) : 0;
   const activeCpuPct = Number(activeProj.cpu_percent || 0);
   const activeProcCount = Number(activeProj.proc_count || (activeProj.pid ? 1 : 0));
-  const depsMeta = getDepsButtonMeta(activeProj.runtime);
+  const depsMeta = getDepsButtonMeta(
+    cfgRuntime || activeProj.runtime,
+    cfgType || activeProj.type,
+    cfgCommand || activeProj.cmd,
+    files.map((f) => f.path),
+    lang
+  );
   const activeRunItem =
     runs.find((r) => r.status === 'running' || r.status === 'waiting_input') || runs[0] || null;
   const isProjectCurrentlyRunning =
@@ -2329,14 +2347,15 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
 
               {depsMeta.show && (
                 <button
+                  id="project-deps-action-btn"
                   type="button"
                   disabled={venvSetupRunning}
                   onClick={handleQuickSetupVenv}
-                  className="px-2.5 py-1.5 text-xs font-semibold text-indigo-200 bg-indigo-950/50 hover:bg-indigo-900/60 border border-indigo-800/60 rounded-lg inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  className={`px-2.5 py-1.5 text-left text-xs font-semibold border rounded-lg inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50 ${depsMeta.colorCls}`}
                   title={depsMeta.title}
                 >
-                  <Package className="w-3.5 h-3.5 text-indigo-400" />
-                  {venvSetupRunning ? 'Установка...' : depsMeta.label}
+                  <Package className="w-3.5 h-3.5 shrink-0" />
+                  <span>{venvSetupRunning ? depsMeta.busyLabel : depsMeta.label}</span>
                 </button>
               )}
 
@@ -2432,11 +2451,32 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
             </div>
           </div>
 
-          {/* Ряд 2: Живая телеметрия процесса, аптайм (#18) и ресурсы группы PGID */}
+          {/* Ряд 2: Живая телеметрия процесса, быстрый выбор среды (Runtime), аптайм (#18) и ресурсы группы PGID */}
           <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs font-mono text-slate-300 tabular-nums pt-1.5 border-t border-[#1e2638]/60">
             <span className={activeTypeMeta.color}>{activeTypeMeta.label}</span>
             <span className="text-slate-600">·</span>
-            <span>{activeProj.runtime}</span>
+            <select
+              aria-label={t('Среда выполнения проекта (Runtime)', 'Project Runtime Environment')}
+              value={cfgRuntime || activeProj.runtime || 'python'}
+              onChange={async (e) => {
+                const nextRt = e.target.value;
+                setCfgRuntime(nextRt);
+                try {
+                  await onUpdateProject(activeProj.id, { runtime: nextRt });
+                } catch {
+                  // ignore transient error
+                }
+              }}
+              className="bg-[#0b0f17] border border-[#1e2638] hover:border-indigo-500/60 rounded px-1.5 py-0.5 text-xs font-mono text-indigo-200 cursor-pointer outline-none"
+              title={t(
+                'Быстрое переключение среды выполнения (меняет кнопку зависимостей, сниппеты SDK и окружение запуска)',
+                'Quickly switch project runtime (adapts dependency button, SDK snippets, and execution environment)'
+              )}
+            >
+              <option value="python">python (.venv)</option>
+              <option value="node">node (npm)</option>
+              <option value="bash">bash (.sh)</option>
+            </select>
             <span className="text-slate-600">·</span>
             <code className="text-slate-300 bg-[#0b0f17] px-1.5 py-0.5 rounded border border-[#1e2638] truncate max-w-md" title={activeProj.cmd}>
               {activeProj.cmd}
@@ -2938,12 +2978,24 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                 {bottomConsoleTab === 'shell' && (
                   <div className="p-3.5 space-y-3 bg-[#070b14] flex-1 overflow-y-auto">
                     <form onSubmit={handleExecCommand} className="flex items-center gap-2">
-                      <span className="text-xs font-mono text-emerald-400 shrink-0">.venv $</span>
+                      <span className="text-xs font-mono text-emerald-400 shrink-0">
+                        {depsMeta.effectiveRuntime === 'node'
+                          ? 'node_modules $'
+                          : depsMeta.effectiveRuntime === 'bash'
+                          ? 'bash $'
+                          : '.venv $'}
+                      </span>
                       <input
                         type="text"
                         value={cliCommand}
                         onChange={(e) => setCliCommand(e.target.value)}
-                        placeholder="pip install ..., python3 -m ..., git status"
+                        placeholder={
+                          depsMeta.effectiveRuntime === 'node'
+                            ? 'npm install ..., node index.js, git status'
+                            : depsMeta.effectiveRuntime === 'bash'
+                            ? 'chmod +x *.sh, bash -n run.sh, git status'
+                            : 'pip install ..., python3 -m ..., git status'
+                        }
                         className="flex-1 bg-[#111622] border border-[#1e2638] rounded-lg px-2.5 py-1.5 text-xs font-mono text-white min-w-0"
                       />
                       <button
@@ -5273,17 +5325,46 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                         Командная строка в изолированном окружении ({activeProj.workdir})
                       </h3>
                       <p className="text-xs text-slate-400">
-                        Команды выполняются с автоматически подключённым <code className="text-indigo-300">.venv/bin</code> в PATH
+                        {depsMeta.effectiveRuntime === 'node' ? (
+                          <>
+                            Команды выполняются с автоматически подключённым{' '}
+                            <code className="text-emerald-300">node_modules/.bin</code> в PATH
+                          </>
+                        ) : depsMeta.effectiveRuntime === 'bash' ? (
+                          <>
+                            Команды выполняются в изолированной рабочей папке Shell-проекта
+                          </>
+                        ) : (
+                          <>
+                            Команды выполняются с автоматически подключённым{' '}
+                            <code className="text-indigo-300">.venv/bin</code> в PATH
+                          </>
+                        )}
                       </p>
                     </div>
 
                     <div className="flex flex-wrap items-center gap-1.5">
-                      {[
-                        { label: 'pip install -r requirements.txt', cmd: 'pip install -r requirements.txt' },
-                        { label: 'git status', cmd: 'git status' },
-                        { label: 'git pull', cmd: 'git pull' },
-                        { label: 'ls -la', cmd: 'ls -la' },
-                      ].map((btn) => (
+                      {(depsMeta.effectiveRuntime === 'node'
+                        ? [
+                            { label: 'npm install', cmd: 'npm install' },
+                            { label: 'node -v && npm -v', cmd: 'node -v && npm -v' },
+                            { label: 'git status', cmd: 'git status' },
+                            { label: 'ls -la', cmd: 'ls -la' },
+                          ]
+                        : depsMeta.effectiveRuntime === 'bash'
+                        ? [
+                            { label: 'chmod +x *.sh && bash -n', cmd: 'chmod +x *.sh 2>/dev/null; for f in *.sh; do [ -f "$f" ] && bash -n "$f" && echo "OK: $f"; done' },
+                            { label: 'git status', cmd: 'git status' },
+                            { label: 'git pull', cmd: 'git pull' },
+                            { label: 'ls -la', cmd: 'ls -la' },
+                          ]
+                        : [
+                            { label: 'pip install -r requirements.txt', cmd: 'pip install -r requirements.txt' },
+                            { label: 'git status', cmd: 'git status' },
+                            { label: 'git pull', cmd: 'git pull' },
+                            { label: 'ls -la', cmd: 'ls -la' },
+                          ]
+                      ).map((btn) => (
                         <button
                           key={btn.label}
                           type="button"

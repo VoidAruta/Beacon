@@ -161,38 +161,154 @@ export function formatLiveUptime(
   return `${days}д ${remHours}ч ${remMins}м`;
 }
 
-export function getDepsButtonMeta(runtime: string | undefined): {
+export function getDepsButtonMeta(
+  runtime: string | undefined,
+  projectType?: string,
+  cmd?: string,
+  filePaths?: string[],
+  lang: 'ru' | 'en' = 'ru'
+): {
   show: boolean;
   visible: boolean;
+  effectiveRuntime: 'python' | 'node' | 'bash';
+  effectiveType: 'service' | 'web' | 'job';
   label: string;
   busyLabel: string;
   title: string;
+  colorCls: string;
 } {
-  const rt = (runtime || 'python').toLowerCase();
-  if (rt.includes('node') || rt.includes('js') || rt.includes('ts')) {
+  const rawRt = (runtime || '').toLowerCase().trim();
+  const rawCmd = (cmd || '').toLowerCase().trim();
+  const filesLower = (filePaths || []).map((f) => f.toLowerCase());
+  const hasPackageJson = filesLower.some((f) => f.endsWith('package.json'));
+  const hasRequirementsTxt = filesLower.some((f) => f.endsWith('requirements.txt'));
+  const hasOnlyShell =
+    filesLower.length > 0 &&
+    filesLower.some((f) => f.endsWith('.sh')) &&
+    !filesLower.some((f) => f.endsWith('.py') || f.endsWith('.js') || f.endsWith('.ts'));
+
+  let effectiveRuntime: 'python' | 'node' | 'bash' = 'python';
+  if (
+    rawRt.includes('node') ||
+    rawRt.includes('js') ||
+    rawRt.includes('ts') ||
+    rawCmd.startsWith('node ') ||
+    rawCmd.startsWith('npm ') ||
+    rawCmd.startsWith('npx ') ||
+    (hasPackageJson && !hasRequirementsTxt)
+  ) {
+    effectiveRuntime = 'node';
+  } else if (
+    rawRt.includes('bash') ||
+    rawRt.includes('sh') ||
+    rawRt.includes('shell') ||
+    rawCmd.startsWith('bash ') ||
+    rawCmd.startsWith('sh ') ||
+    hasOnlyShell
+  ) {
+    effectiveRuntime = 'bash';
+  }
+
+  const pType: 'service' | 'web' | 'job' =
+    projectType === 'web' ? 'web' : projectType === 'job' ? 'job' : 'service';
+  const hasExplicitType = Boolean(projectType);
+
+  if (effectiveRuntime === 'node') {
+    const label = !hasExplicitType
+      ? 'npm install'
+      : pType === 'web'
+      ? lang === 'en'
+        ? 'npm install (Web API)'
+        : 'npm install (Web API)'
+      : pType === 'job'
+      ? lang === 'en'
+        ? 'npm + Check Job'
+        : 'npm + Проверка Job'
+      : lang === 'en'
+      ? 'npm install (24/7)'
+      : 'npm install (24/7)';
     return {
       show: true,
       visible: true,
-      label: 'npm install',
+      effectiveRuntime: 'node',
+      effectiveType: pType,
+      label,
       busyLabel: 'npm install...',
-      title: 'Установить пакеты Node.js из package.json (npm ci / npm install)',
+      title:
+        lang === 'en'
+          ? `Install Node.js packages (npm ci / install) and verify ${pType.toUpperCase()} JS syntax`
+          : `Установить пакеты Node.js из package.json (npm ci / install) и проверить синтаксис (${pType.toUpperCase()})`,
+      colorCls:
+        'text-emerald-200 bg-emerald-950/50 hover:bg-emerald-900/60 border-emerald-800/60',
     };
   }
-  if (rt.includes('bash') || rt.includes('sh') || rt.includes('shell')) {
+
+  if (effectiveRuntime === 'bash') {
+    const label =
+      pType === 'web'
+        ? 'chmod +x / bash -n (Web)'
+        : pType === 'job'
+        ? 'chmod +x / bash -n (Job)'
+        : 'chmod +x / bash -n';
     return {
-      show: false,
-      visible: false,
-      label: 'Зависимости',
-      busyLabel: 'Проверка...',
-      title: 'Проверить окружение Shell-скрипта',
+      // При вызове без projectType сохраняем обратную совместимость, а в шапке проекта (с projectType) показываем кнопку проверки .sh
+      show: hasExplicitType,
+      visible: hasExplicitType,
+      effectiveRuntime: 'bash',
+      effectiveType: pType,
+      label,
+      busyLabel: lang === 'en' ? 'Checking .sh...' : 'Проверка .sh...',
+      title:
+        lang === 'en'
+          ? 'Set executable permissions (chmod +x *.sh) and verify Bash syntax (bash -n)'
+          : 'Выставить права запуска (chmod +x *.sh) и проверить синтаксис Shell-скриптов (bash -n)',
+      colorCls:
+        'text-amber-200 bg-amber-950/50 hover:bg-amber-900/60 border-amber-800/60',
     };
   }
+
+  // Python: адаптируем под тип проекта (Service 24/7, Web API :PORT, Scheduled Job)
+  const pyLabel = !hasExplicitType
+    ? '.venv / pip install'
+    : pType === 'web'
+    ? lang === 'en'
+      ? '.venv + pip (Web API)'
+      : '.venv + pip (Web API)'
+    : pType === 'job'
+    ? lang === 'en'
+      ? '.venv + Check Job'
+      : '.venv + Проверка Job'
+    : lang === 'en'
+    ? '.venv / pip (24/7)'
+    : '.venv / pip (24/7)';
+
+  const pyTitle =
+    pType === 'web'
+      ? lang === 'en'
+        ? 'Create isolated .venv, install requirements.txt, and verify Web API syntax & $PORT readiness'
+        : 'Создать .venv, установить requirements.txt и проверить синтаксис Web-сервиса + готовность порта $PORT'
+      : pType === 'job'
+      ? lang === 'en'
+        ? 'Create isolated .venv, install requirements.txt, and validate Job script syntax (py_compile) before cron run'
+        : 'Создать .venv, установить пакеты из requirements.txt и проверить синтаксис скрипта задачи (py_compile) перед Cron-запуском'
+      : lang === 'en'
+      ? 'Create isolated .venv, install requirements.txt via uv/pip, and verify 24/7 Service entrypoint'
+      : 'Создать изолированный .venv, установить зависимости из requirements.txt через uv / pip и проверить демон 24/7';
+
   return {
     show: true,
     visible: true,
-    label: '.venv / pip install',
-    busyLabel: 'Установка .venv...',
-    title: 'Создать изолированный .venv и установить зависимости из requirements.txt через uv / pip',
+    effectiveRuntime: 'python',
+    effectiveType: pType,
+    label: pyLabel,
+    busyLabel: lang === 'en' ? 'Setting up .venv...' : 'Установка .venv...',
+    title: pyTitle,
+    colorCls:
+      pType === 'web'
+        ? 'text-cyan-200 bg-cyan-950/50 hover:bg-cyan-900/60 border-cyan-800/60'
+        : pType === 'job'
+        ? 'text-violet-200 bg-violet-950/50 hover:bg-violet-900/60 border-violet-800/60'
+        : 'text-indigo-200 bg-indigo-950/50 hover:bg-indigo-900/60 border-indigo-800/60',
   };
 }
 

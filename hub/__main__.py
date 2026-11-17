@@ -89,11 +89,9 @@ def _attach_security_headers(response: Any, path: str = "", is_https: bool = Fal
     headers_to_apply = dict(_SECURITY_HEADERS)
     if os.environ.get("BEACON_PREVIEW_MODE") != "1":
         headers_to_apply["X-Frame-Options"] = "DENY"
-    if (
-        path.startswith("/api/")
-        or path in ("/", "/index.html")
-        or os.environ.get("BEACON_PREVIEW_MODE") == "1"
-    ):
+    if path.startswith("/api/"):
+        headers_to_apply["Cache-Control"] = "no-store"
+    elif path in ("/", "/index.html") or os.environ.get("BEACON_PREVIEW_MODE") == "1":
         headers_to_apply["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     if is_https:
         headers_to_apply["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
@@ -122,6 +120,7 @@ _RBAC_ALLOWLIST: dict[str, tuple[tuple[str, re.Pattern[str]], ...]] = {
         ("GET", re.compile(r"^/api/runs/\d+/stream$")),
         ("GET", re.compile(r"^/api/auth/me$")),
         ("GET", re.compile(r"^/api/system/health$")),
+        ("GET", re.compile(r"^/api/system/update_status$")),
         ("POST", re.compile(r"^/api/auth/logout$")),
         ("POST", re.compile(r"^/api/auth/stream_ticket$")),
     ),

@@ -21,6 +21,7 @@ import {
   CheckSquare,
   X,
 } from 'lucide-react';
+import { useI18n } from '../utils/i18n';
 
 interface DocumentationViewProps {
   onNavigateTab?: (tab: 'dashboard' | 'projects' | 'secrets' | 'ai_access' | 'settings' | 'acceptance') => void;
@@ -478,9 +479,36 @@ sudo systemctl status beacon`,
     ],
   },
   {
+    id: 'update-and-i18n',
+    category: 'Администрирование',
+    title: '9. Обновление панели в 2 клика (Self-Update), Мультиязычность (RU/EN) и Окружение',
+    summary:
+      'Как обновлять Beacon из Git-репозитория в пару кликов с автоматическим бэкапом без остановки запущенных проектов, переключать язык RU/EN и проверять окружение по типу проекта.',
+    keywords: ['обновление', 'self-update', 'git pull', 'update', 'язык', 'ru', 'en', 'мультиязычность', 'i18n', 'venv', 'npm', 'bash'],
+    relatedTab: { tab: 'projects', label: 'Открыть Проекты и Консоль' },
+    bullets: [
+      {
+        title: 'Обновление панели в 2 клика (кнопка «v2.2 / Обновить» в верхней шапке)',
+        text: 'Нажмите на кнопку версии «v2.2 / Обновить» в правом верхнем углу панели: Шаг 1 проверяет наличие свежих коммитов в Git-репозитории (git fetch), а Шаг 2 создаёт резервный архив в data/backups/, выполняет git pull --ff-only, применяет миграции SQLite и переподхватывает работающие проекты без их остановки.',
+      },
+      {
+        title: 'Переключение языка интерфейса (RU / EN)',
+        text: 'Кнопка RU | EN в верхней панели мгновенно переключает язык навигации, шапки, модального окна обновления и кнопок управления проектами между русским и английским (выбор сохраняется в браузере).',
+      },
+      {
+        title: 'Умная кнопка окружения и быстрый переключатель стека (python / node / bash)',
+        text: 'В шапке каждого проекта кнопка подготовки окружения автоматически меняет название, цвет и действие в зависимости от типа проекта (Service 24/7, Web/API с портом или Job по расписанию) и выбранного стека: .venv + pip + py_compile для Python, npm install + node --check для Node.js и chmod +x + bash -n для Bash-скриптов.',
+      },
+      {
+        title: 'Безопасность данных при обновлении',
+        text: 'Все пользовательские проекты (projects/), база данных (data/beacon.db) и секреты (data/secrets/) исключены из перезаписи Git, поэтому обновление затрагивает только код самой панели.',
+      },
+    ],
+  },
+  {
     id: 'faq-troubleshooting',
     category: 'Справка',
-    title: '9. Частые вопросы и устранение неполадок (FAQ)',
+    title: '10. Частые вопросы и устранение неполадок (FAQ)',
     summary:
       'Быстрые решения типичных ситуаций: почему не читается секрет, как освободить место на диске, что делать при Safe Mode и как проверить сервер.',
     keywords: ['faq', 'ошибки', 'проблемы', 'safe mode', 'диск', 'doctor', 'порт занят', 'зависимости'],
@@ -509,6 +537,7 @@ sudo systemctl status beacon`,
 const CATEGORIES = ['Все разделы', 'Основы', 'Проекты', 'Разработка', 'Безопасность', 'Надёжность', 'Производительность', 'ИИ и Автоматизация', 'Администрирование', 'Справка'];
 
 export const DocumentationView: React.FC<DocumentationViewProps> = ({ onNavigateTab }) => {
+  const { t } = useI18n();
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('Все разделы');
   const [activeSectionId, setActiveSectionId] = useState<string>('quickstart');
@@ -567,10 +596,13 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({ onNavigate
               </div>
               <div>
                 <h2 className="text-base sm:text-lg font-bold text-white">
-                  Документация и справочник панели Beacon
+                  {t('Документация и справочник панели Beacon', 'Beacon Control Panel Documentation & Reference')}
                 </h2>
                 <p className="text-xs text-slate-400">
-                  Подробное руководство по настройке проектов, встроенному SDK (<code className="font-mono text-indigo-300">import beacon</code>), секретам 0600, MCP-агентам и эксплуатации
+                  {t(
+                    'Подробное руководство по настройке проектов, встроенному SDK (import beacon), секретам 0600, MCP-агентам и обновлению в 2 клика',
+                    'Complete guide to project configuration, built-in SDK (import beacon), 0600 secrets, MCP agents, and 2-click self-update'
+                  )}
                 </p>
               </div>
             </div>
@@ -583,15 +615,15 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({ onNavigate
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Поиск по разделам, командам, SDK, ошибкам..."
-              aria-label="Поиск по документации"
+              placeholder={t('Поиск по разделам, командам, SDK, ошибкам...', 'Search sections, commands, SDK, errors...')}
+              aria-label={t('Поиск по документации', 'Search documentation')}
               className="w-full bg-[#0f172a] border border-slate-700 focus:border-indigo-500 rounded-lg pl-10 pr-9 py-2 text-xs text-white placeholder-slate-500 outline-none transition-colors"
             />
             {searchQuery && (
               <button
                 type="button"
                 onClick={() => setSearchQuery('')}
-                title="Очистить поиск"
+                title={t('Очистить поиск', 'Clear search')}
                 className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white p-0.5 cursor-pointer"
               >
                 <X className="w-3.5 h-3.5" />
@@ -621,7 +653,7 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({ onNavigate
           })}
 
           <span className="ml-auto text-[11px] font-mono text-slate-400">
-            Найдено разделов: {filteredSections.length} из {DOC_SECTIONS.length}
+            {t('Найдено разделов:', 'Sections found:')} {filteredSections.length} / {DOC_SECTIONS.length}
           </span>
         </div>
       </div>

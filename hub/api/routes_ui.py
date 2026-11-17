@@ -1703,12 +1703,19 @@ async def api_install_deps(request: Request, project_id: int) -> dict[str, Any]:
     if not proj:
         raise HTTPException(status_code=404, detail="Проект не найден")
 
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
     workdir = Path(proj["workdir"])
-    runtime = proj["runtime"]
-    dep_argv = build_install_deps_command(workdir, runtime)
+    runtime = str((body.get("runtime") if isinstance(body, dict) else None) or proj.get("runtime") or "python")
+    project_type = str((body.get("type") if isinstance(body, dict) else None) or proj.get("type") or "service")
+    port = int(proj.get("port") or 0)
+    dep_argv = build_install_deps_command(workdir, runtime, project_type=project_type, port=port)
 
     run = await start_project_run(project_id, trigger="manual", custom_argv=dep_argv)
-    return {"ok": True, "run": run}
+    return {"ok": True, "run": run, "runtime": runtime, "project_type": project_type}
 
 
 @router.post("/projects/{project_id}/healthcheck_now")
@@ -3874,3 +3881,242 @@ async def api_system_backup_zip(request: Request) -> Response:
             "Cache-Control": "no-store",
         },
     )
+
+
+def _inspect_git_update_status(check_remote: bool = False) -> dict[str, Any]:
+    """Проверяет статус Git-репозитория панели Beacon и наличие новых коммитов в remote."""
+    default_repo = get_setting("git_repo_url", "https://github.com/VoidAruta/Beacon.git") or "https://github.com/VoidAruta/Beacon.git"
+    git_dir = BASE_DIR / ".git"
+    info: dict[str, Any] = {
+        "ok": True,
+        "version": "2.2.0",
+        "git_available": False,
+        "is_git_repo": git_dir.exists(),
+        "branch": "main",
+        "commit": "standalone",
+        "commit_subject": "Локальная сборка Beacon v2.2.0",
+        "remote_url": default_repo,
+        "has_update": False,
+        "behind_count": 0,
+        "remote_commits": [],
+        "dirty_files": 0,
+        "checked_at": int(time.time()),
+        "message": "Установлена актуальная версия Beacon v2.2.0",
+    }
+
+    try:
+        ver_proc = subprocess.run(
+            ["git", "--version"],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        info["git_available"] = ver_proc.returncode == 0
+    except Exception:
+        return info
+
+    if not git_dir.exists():
+        info["message"] = (
+            "Панель запущена из автономного архива (папка .git отсутствует). "
+            "Вы можете привязать репозиторий кнопкой «Инициализировать Git-обновления» ниже."
+        )
+        return info
+
+    try:
+        br = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if br.returncode == 0 and br.stdout.strip():
+            info["branch"] = br.stdout.strip()
+
+        sha = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if sha.returncode == 0 and sha.stdout.strip():
+            info["commit"] = sha.stdout.strip()
+
+        subj = subprocess.run(
+            ["git", "log", "-1", "--pretty=%s (%cr)"],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if subj.returncode == 0 and subj.stdout.strip():
+            info["commit_subject"] = subj.stdout.strip()
+
+        rem = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if rem.returncode == 0 and rem.stdout.strip():
+            info["remote_url"] = rem.stdout.strip()
+
+        st = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if st.returncode == 0:
+            lines = [ln for ln in st.stdout.splitlines() if ln.strip()]
+            info["dirty_files"] = len(lines)
+
+        if check_remote and info["remote_url"]:
+            subprocess.run(
+                ["git", "fetch", "origin", info["branch"], "--quiet"],
+                cwd=str(BASE_DIR),
+                capture_output=True,
+                text=True,
+                timeout=6,
+            )
+            cnt = subprocess.run(
+                ["git", "rev-list", f"HEAD..origin/{info['branch']}", "--count"],
+                cwd=str(BASE_DIR),
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if cnt.returncode == 0 and cnt.stdout.strip().isdigit():
+                behind = int(cnt.stdout.strip())
+                info["behind_count"] = behind
+                info["has_update"] = behind > 0
+                if behind > 0:
+                    lg = subprocess.run(
+                        ["git", "log", f"HEAD..origin/{info['branch']}", "--oneline", "-n", "8"],
+                        cwd=str(BASE_DIR),
+                        capture_output=True,
+                        text=True,
+                        timeout=3,
+                    )
+                    if lg.returncode == 0:
+                        info["remote_commits"] = [ln.strip() for ln in lg.stdout.splitlines() if ln.strip()]
+                    info["message"] = f"Доступно обновление: {behind} новых коммитов в ветке origin/{info['branch']}"
+                else:
+                    info["message"] = f"Установлена последняя версия ({info['branch']} @ {info['commit']})"
+    except Exception as exc:
+        info["message"] = f"Проверка локального Git завершена ({exc})"
+
+    return info
+
+
+@router.get("/system/update_status")
+async def api_system_update_status(request: Request) -> dict[str, Any]:
+    check_remote = request.query_params.get("check_remote", "0") in ("1", "true", "yes")
+    return await asyncio.to_thread(_inspect_git_update_status, check_remote)
+
+
+def _execute_self_update_sync(repo_url_override: str = "", branch_override: str = "") -> dict[str, Any]:
+    """
+    Выполняет безопасное обновление панели Beacon в 2 клика:
+    1. Создаёт резервную копию БД, секретов и конфигов в data/backups/pre_update_*.zip.
+    2. Если есть .git и remote — выполняет git fetch + git pull --ff-only (или настраивает remote).
+    3. Применяет миграции SQLite (init_db) и переподхватывает живые дочерние процессы без SIGPIPE.
+    """
+    steps_log: list[str] = []
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    backup_file = BACKUPS_DIR / f"beacon_pre_update_{ts}.zip"
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Шаг 1: Автоматический пред-апдейт бэкап
+    try:
+        create_backup_archive(backup_file)
+        steps_log.append(f"[1/4] Создана страховочная резервная копия: {backup_file.name}")
+    except Exception as exc:
+        steps_log.append(f"[1/4] Предупреждение бэкапа (продолжаем): {exc}")
+
+    target_repo = (repo_url_override or get_setting("git_repo_url", "https://github.com/VoidAruta/Beacon.git") or "https://github.com/VoidAruta/Beacon.git").strip()
+    if repo_url_override.strip():
+        set_setting("git_repo_url", target_repo)
+
+    git_dir = BASE_DIR / ".git"
+    branch = (branch_override or "main").strip()
+    git_updated = False
+
+    # Шаг 2: Git pull (если окружение подключено к Git)
+    if git_dir.exists():
+        try:
+            if repo_url_override.strip():
+                subprocess.run(
+                    ["git", "remote", "set-url", "origin", target_repo],
+                    cwd=str(BASE_DIR),
+                    capture_output=True,
+                    text=True,
+                    timeout=4,
+                )
+            pull_res = subprocess.run(
+                ["git", "pull", "--ff-only", "origin", branch],
+                cwd=str(BASE_DIR),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            out_txt = (pull_res.stdout or pull_res.stderr or "").strip()
+            if pull_res.returncode == 0:
+                git_updated = True
+                steps_log.append(f"[2/4] Git pull origin/{branch}: {out_txt or 'Успешно синхронизировано'}")
+            else:
+                steps_log.append(
+                    f"[2/4] Git pull пропущен (локальная ветка или нет доступа к remote): {out_txt[:240]}"
+                )
+        except Exception as exc:
+            steps_log.append(f"[2/4] Git pull пропущен ({exc}) — используется текущая локальная сборка")
+    else:
+        steps_log.append(
+            f"[2/4] Автономная сборка (без .git): сохранён URL репозитория {target_repo} для обновлений"
+        )
+
+    # Шаг 3: Миграция схемы SQLite и перезагрузка кеша редактирования секретов
+    init_db()
+    reload_redaction_cache()
+    steps_log.append("[3/4] Схема SQLite (WAL) и кеш безопасности 0600 проверены и синхронизированы")
+
+    # Шаг 4: Бесшовный перехват выживших процессов (Direct FD без SIGPIPE)
+    rec = recover_running_processes()
+    steps_log.append(
+        f"[4/4] Перехват живых процессов без остановки ботов: активных={rec['recovered']}, завершённых={rec['marked_dead']}"
+    )
+
+    status_after = _inspect_git_update_status(check_remote=False)
+    return {
+        "ok": True,
+        "git_updated": git_updated,
+        "backup_file": backup_file.name if backup_file.exists() else "",
+        "steps": steps_log,
+        "recovered": rec["recovered"],
+        "status": status_after,
+    }
+
+
+@router.post("/system/self_update")
+async def api_system_self_update(request: Request) -> dict[str, Any]:
+    _require_admin_session(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    repo_url = str(body.get("repo_url") or "") if isinstance(body, dict) else ""
+    branch = str(body.get("branch") or "") if isinstance(body, dict) else ""
+    res = await asyncio.to_thread(_execute_self_update_sync, repo_url, branch)
+    log_audit(
+        actor=_actor_name(request),
+        action="system.self_update",
+        target=res.get("status", {}).get("commit", "HEAD"),
+        details=f"backup={res.get('backup_file')}, recovered={res.get('recovered')}",
+        ip=getattr(request.state, "client_ip", "127.0.0.1"),
+    )
+    return res
+

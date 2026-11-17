@@ -167,12 +167,35 @@ test('findNextInCode and findAndReplaceInCode respect caseSensitive flag consist
   assert.equal(replacedInsensitive.count, 2);
 });
 
-test('getDepsButtonMeta adapts dependency button to python, node, and bash runtimes', () => {
-  assert.equal(getDepsButtonMeta('python').show, true);
-  assert.equal(getDepsButtonMeta('python').label, '.venv / pip install');
-  assert.equal(getDepsButtonMeta('node').show, true);
-  assert.equal(getDepsButtonMeta('node').label, 'npm install');
-  assert.equal(getDepsButtonMeta('bash').show, false);
+test('getDepsButtonMeta adapts dependency button to project type (service/web/job), runtime (python/node/bash), and language', () => {
+  // Python across service, web, and job types
+  const pyService = getDepsButtonMeta('python', 'service');
+  assert.equal(pyService.show, true);
+  assert.equal(pyService.label, '.venv / pip (24/7)');
+
+  const pyWeb = getDepsButtonMeta('python', 'web');
+  assert.equal(pyWeb.show, true);
+  assert.equal(pyWeb.label, '.venv + pip (Web API)');
+
+  const pyJob = getDepsButtonMeta('python', 'job');
+  assert.equal(pyJob.show, true);
+  assert.equal(pyJob.label, '.venv + Проверка Job');
+
+  // Node across web and service
+  const nodeWeb = getDepsButtonMeta('node', 'web');
+  assert.equal(nodeWeb.show, true);
+  assert.equal(nodeWeb.label, 'npm install (Web API)');
+
+  // Bash runtime now shows syntax & chmod action tailored to project type
+  const bashJob = getDepsButtonMeta('bash', 'job');
+  assert.equal(bashJob.show, true);
+  assert.equal(bashJob.label, 'chmod +x / bash -n (Job)');
+
+  // English localization
+  const pyWebEn = getDepsButtonMeta('python', 'web', '', [], 'en');
+  assert.equal(pyWebEn.label, '.venv + pip (Web API)');
+  const pyJobEn = getDepsButtonMeta('python', 'job', '', [], 'en');
+  assert.equal(pyJobEn.label, '.venv + Check Job');
 });
 
 test('classifyStatusNotice, formatLiveUptime, getRuntimeSdkSnippets, and generateBeaconFileTemplate work as expected', () => {

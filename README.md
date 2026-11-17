@@ -1,8 +1,43 @@
-# Beacon
+# Beacon — Containerless PaaS, Process Supervisor & MCP Server (`< 80 MB RAM`)
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-indigo.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Platform: Linux / Raspberry Pi / Android chroot](https://img.shields.io/badge/Platform-Linux%20%7C%20RPi%20%7C%20Android%20chroot-emerald.svg)](#)
+[![MCP: Streamable HTTP](https://img.shields.io/badge/MCP-Streamable%20HTTP%20%2Fmcp-purple.svg)](#доступ-для-ии-агентов-mcp-и-rest-api)
+
+> **🌍 Language / Язык:** [English Summary](#-english-overview--quick-start) | [Русская документация](#описание-на-русском)  
+> **UI Languages:** Built-in `RU | EN` instant language switcher in the web panel header + **2-Click Git Self-Update** (`v2.2 / Обновить`).
+
+---
+
+## 🌐 English Overview & Quick Start
+
+**Beacon** is a self-hosted, ultra-lightweight **containerless PaaS and process supervisor** (`< 80 MB RAM` idle) designed to run 24/7 Telegram/Discord bots (`service`), HTTP APIs & websites (`web`), and scheduled cron/webhook scrapers (`job`) **without Docker**.
+
+It runs natively on **low-cost Linux VPS, Raspberry Pi / Orange Pi (`x86_64` / `aarch64`)**, and **Android home servers (`chroot` / Termux)** where Docker or `systemd` are unavailable:
+- **Zero-Downtime Updates & No `SIGPIPE`:** Child `stdout`/`stderr` write directly to disk file descriptors (`buffering=0`), and processes run in isolated process groups (`os.setsid` / `os.killpg`). Restarting or updating Beacon itself never terminates running bots or web servers.
+- **Built-in SDK (`import beacon` / `require('beacon')`):** Zero-install SDK injected into every project for Telegram/Webhook alerts (`beacon.notify`), `0600` secrets & `Cookie-Editor` sessions (`beacon.secret`), interactive 2FA/SMS prompts (`beacon.ask`), Dead Man's Switch (`beacon.ping`), and persistent SQLite KV state (`beacon.state`).
+- **Built-in AI Agent MCP Server (`/mcp`):** Streamable HTTP Model Context Protocol server + REST API (`/api/v1/`) for **Claude Code, Cursor, and Windsurf** with granular token scopes, human-in-the-loop diff approvals, secret redaction, and an emergency AI Kill-Switch.
+- **2-Click Panel Self-Update:** Click **`v2.2 / Update`** in the top navbar to check Git commits, create an automatic backup in `data/backups/`, pull updates (`git pull --ff-only`), run SQLite migrations, and seamlessly re-attach running processes.
+
+```bash
+git clone https://github.com/VoidAruta/Beacon.git beacon
+cd beacon
+pip install -r requirements.txt
+npm install && npm run build
+python3 -m beacon --port 8050
+# Open http://127.0.0.1:8050 (Default password: admin)
+```
+
+**GitHub Topics / Keywords:** `containerless-paas` `process-manager` `process-supervisor` `systemd-alternative` `pm2-alternative` `telegram-bot-hosting` `mcp-server` `model-context-protocol` `raspberry-pi` `android-chroot` `termux` `self-hosted-paas` `python-supervisor`
+
+---
+
+## Описание на русском
 
 **Beacon** — автономная легковесная панель управления процессами и серверная консоль (Containerless PaaS), созданная для круглосуточного (24/7) запуска и мониторинга ботов, фоновых сервисов, веб-бэкендов и периодических задач **без использования Docker**.
 
-Панель спроектирована с жёстким бюджетом ресурсов (**< 80 МБ ОЗУ** в простое, нулевая нагрузка на CPU в фоне) и одинаково нативно работает в двух средах:
+Панель спроектирована с жёстким бюджетом ресурсов (**< 80 МБ ОЗУ** в простое, нулевая нагрузка на CPU в фоне), поддерживает **мгновенное переключение языка интерфейса (`RU | EN`)** и **обновление из Git в 2 клика** прямо из браузера, и одинаково нативно работает в двух средах:
 
 1. **Классические Linux-серверы** — бюджетные VPS, одноплатные компьютеры (Raspberry Pi, Orange Pi), мини-ПК и LXC-контейнеры (`x86_64` / `aarch64`, с `systemd` или без него).
 2. **Домашние серверы на базе Android-устройств** — Linux в `chroot` / Termux (`aarch64`, без `systemd` и Docker, с жёсткими лимитами памяти, поддержкой сетевых групп ядра Android `aid_inet` / `aid_net_raw` и мониторингом температуры/заряда батареи).
@@ -11,9 +46,11 @@
 
 ## Содержание
 
+- [English Overview & Quick Start](#-english-overview--quick-start)
 - [Ключевые возможности](#ключевые-возможности)
 - [Архитектура супервизора](#архитектура-супервизора)
 - [Быстрый старт](#быстрый-старт)
+- [Обновление панели в 2 клика (Self-Update)](#обновление-панели-в-2-клика-self-update)
 - [Команды CLI и режимы запуска](#команды-cli-и-режимы-запуска)
 - [Типы проектов и Config-as-Code (`project.yaml`)](#типы-проектов-и-config-as-code-projectyaml)
 - [Встроенный SDK (`beacon`) для Python и Node.js](#встроенный-sdk-beacon-для-python-и-nodejs)
@@ -99,6 +136,15 @@ python3 -m beacon --port 8050
 
 - **Пароль по умолчанию:** `admin`
 - Сразу после первого входа рекомендуется сменить пароль во вкладке **«Настройки»** (минимум 8 символов). Пока установлен пароль `admin`, вход разрешён только из локальной сети (`127.0.0.1` и частные диапазоны `192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`), а модуль ИИ-доступа выключен.
+
+---
+
+## Обновление панели в 2 клика (Self-Update)
+
+Вам не нужно подключаться по SSH для обновления Beacon:
+1. Нажмите кнопку **`v2.2 / Обновить`** (`Update`) в правом верхнем углу веб-панели.
+2. Нажмите **«1. Проверить обновления в Git»** — панель выполнит `git fetch` и покажет список новых коммитов.
+3. Нажмите **«2. Обновить панель (с авто-бэкапом)»** — Beacon автоматически создаст резервную копию конфигурации в `data/backups/`, подтянет свежий код (`git pull --ff-only`), применит миграции SQLite и переподхватит все запущенные проекты без их остановки (`No SIGPIPE`).
 
 ---
 

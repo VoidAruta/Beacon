@@ -1,7 +1,28 @@
 {
   "name": "beacon-server",
-  "private": true,
+  "private": false,
   "version": "2.2.0",
+  "description": "Beacon — Lightweight Containerless PaaS, Process Supervisor (<80MB RAM) & Streamable HTTP MCP Server for Linux VPS, Raspberry Pi, and Android chroot/Termux",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/VoidAruta/Beacon.git"
+  },
+  "keywords": [
+    "beacon",
+    "process-manager",
+    "process-supervisor",
+    "containerless-paas",
+    "self-hosted-paas",
+    "mcp-server",
+    "model-context-protocol",
+    "telegram-bot-hosting",
+    "raspberry-pi",
+    "android-chroot",
+    "termux",
+    "systemd-alternative",
+    "pm2-alternative"
+  ],
   "type": "module",
   "scripts": {
     "dev": "vite build --outDir hub/static --emptyOutDir && BEACON_PREVIEW_MODE=1 python3 -m beacon --port 3000",

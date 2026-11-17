@@ -16,6 +16,8 @@ import {
   PlayCircle,
   ShieldAlert,
   BookOpen,
+  DownloadCloud,
+  Globe,
 } from 'lucide-react';
 import { DashboardData, ProjectItem, SecretItem, WorkspaceSubTab } from './types/hub';
 import { GlobalAlertBanners } from './components/GlobalAlertBanners';
@@ -27,37 +29,56 @@ import { AiAccessView } from './components/AiAccessView';
 import { DocumentationView } from './components/DocumentationView';
 import { CreateProjectModal } from './components/CreateProjectModal';
 import { CommandPaletteModal } from './components/CommandPaletteModal';
+import { SystemUpdateModal } from './components/SystemUpdateModal';
+import { useI18n } from './utils/i18n';
 
 type NavTab = 'dashboard' | 'projects' | 'secrets' | 'ai_access' | 'settings' | 'acceptance' | 'docs';
 
-const TAB_META: Record<NavTab, { title: string; subtitle: string }> = {
+const TAB_META: Record<
+  NavTab,
+  { title: string; subtitle: string; titleEn: string; subtitleEn: string }
+> = {
   dashboard: {
     title: 'Обзор, Сеть и Проекты',
     subtitle: 'Мониторинг ресурсов и сетевой нагрузки RX/TX, постоянные сервисы 24/7, веб-сайты и задачи Cron',
+    titleEn: 'Overview, Network & Projects',
+    subtitleEn: 'Live CPU/RAM/Disk & RX/TX network telemetry, 24/7 services, web APIs, and scheduled Cron jobs',
   },
   projects: {
     title: 'Проекты, Код и Расписание',
     subtitle: 'Редактор файлов, project.yaml, индивидуальные куки, защита от crash-loop и живые логи',
+    titleEn: 'Projects, Code IDE & Schedule',
+    subtitleEn: 'Syntax code editor, project.yaml, isolated cookies, crash-loop protection, and live SSE logs',
   },
   secrets: {
     title: 'Куки проектов и Секреты (0600)',
     subtitle: 'Импорт куки Cookie-Editor с инспектором доменов, хранение API-ключей и привязка доступа по проектам',
+    titleEn: 'Project Cookies & Secrets Vault (0600)',
+    subtitleEn: 'Cookie-Editor JSON import with domain inspector, encrypted API keys, and per-project ACLs',
   },
   ai_access: {
     title: 'Доступ ИИ (MCP и /api/v1/)',
     subtitle: 'Подключение Claude Code / Cursor / Windsurf, токены с правами, очередь подтверждений с diff и Kill-Switch',
+    titleEn: 'AI Access (Streamable MCP & REST /api/v1/)',
+    subtitleEn: 'Connect Claude Code / Cursor / Windsurf, scoped tokens, unified diff approvals, and Kill-Switch',
   },
   settings: {
     title: 'Настройки Панели, Безопасность и Пользователи',
     subtitle: 'Смена пароля администратора, фильтр подсетей и Tailscale, роли RBAC, Telegram-бот и бэкап',
+    titleEn: 'Panel Settings, Security & RBAC Users',
+    subtitleEn: 'Admin password, CIDR / Tailscale subnet filter, RBAC roles, Telegram bot, and full backups',
   },
   acceptance: {
     title: 'Тестовый полигон и Beacon Doctor',
     subtitle: 'Автономный прогон 6 проверок супервизора, диагностика среды и просмотр исходников',
+    titleEn: 'Acceptance Suite & Beacon Doctor',
+    subtitleEn: 'Automated supervisor invariant checks, environment diagnostics, and source inspection',
   },
   docs: {
     title: 'Документация и Справочник Beacon',
     subtitle: 'Полное руководство по проектам, встроенному SDK (import beacon), кукам, супервизору и MCP с поиском',
+    titleEn: 'Beacon Documentation & Reference',
+    subtitleEn: 'Complete guide to projects, built-in SDK (import beacon), cookies, supervisor invariants, and MCP',
   },
 };
 
@@ -146,6 +167,7 @@ async function safeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
 }
 
 export function App() {
+  const { lang, toggleLang, t } = useI18n();
   const [authenticated, setAuthenticated] = useState<boolean>(false);
   const [authChecking, setAuthChecking] = useState<boolean>(true);
   const [csrfToken, setCsrfToken] = useState<string>('');
@@ -154,6 +176,7 @@ export function App() {
   const [isDefaultPassword, setIsDefaultPassword] = useState<boolean>(false);
   const [quickPwInput, setQuickPwInput] = useState<string>('');
   const [quickPwMsg, setQuickPwMsg] = useState<string>('');
+  const [updateModalOpen, setUpdateModalOpen] = useState<boolean>(false);
 
   const [loginUsername, setLoginUsername] = useState<string>('admin');
   const [loginPassword, setLoginPassword] = useState<string>('admin');
@@ -931,14 +954,22 @@ export function App() {
           className="hidden lg:flex w-68 shrink-0 bg-[#111622] border-r border-slate-800/90 flex-col justify-between p-3.5 h-full overflow-y-auto"
         >
           <div className="space-y-3.5">
-            <div className="px-2 pt-0.5 flex items-center justify-between border-b border-slate-800/80 pb-2.5">
+            <div className="px-2 pt-0.5 flex items-center justify-between border-b border-slate-800/80 pb-2.5 gap-1.5">
               <div className="min-w-0">
                 <div className="text-base font-bold tracking-tight text-white">Beacon Control Panel</div>
                 <div className="text-[11px] text-slate-400 truncate" title={envLabel}>
                   {envLabel}
                 </div>
               </div>
-              <span className="text-xs font-mono text-indigo-300 tabular-nums shrink-0">v2.2</span>
+              <button
+                type="button"
+                onClick={() => setUpdateModalOpen(true)}
+                className="px-2 py-1 text-[11px] font-mono text-indigo-200 hover:text-white bg-indigo-950/60 hover:bg-indigo-900/70 border border-indigo-700/60 rounded-lg inline-flex items-center gap-1 shrink-0 cursor-pointer"
+                title={t('Проверить обновления и обновить панель в 2 клика', 'Check for updates & self-update in 2 clicks')}
+              >
+                <DownloadCloud className="w-3 h-3 text-indigo-400" />
+                <span>v2.2</span>
+              </button>
             </div>
 
             {/* Кнопка быстрого вызова командной палитры Ctrl+K */}
@@ -949,7 +980,7 @@ export function App() {
             >
               <span className="inline-flex items-center gap-2">
                 <Search className="w-3.5 h-3.5 text-indigo-400" />
-                <span>Поиск и команды...</span>
+                <span>{t('Поиск и команды...', 'Search & commands...')}</span>
               </span>
               <kbd className="text-[10px] font-mono text-slate-400 bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800">
                 Ctrl+K
@@ -960,7 +991,7 @@ export function App() {
               <button
                 type="button"
                 onClick={() => setActiveTab('dashboard')}
-                title="Перейти на Дашборд (Alt+1)"
+                title={t('Перейти на Дашборд (Alt+1)', 'Go to Dashboard (Alt+1)')}
                 className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'dashboard'
                     ? 'bg-indigo-600 text-white'
@@ -970,7 +1001,7 @@ export function App() {
                 <div className="flex items-start gap-2.5 min-w-0">
                   <LayoutDashboard className="w-4 h-4 mt-0.5 shrink-0" />
                   <div className="min-w-0">
-                    <div className="text-xs font-semibold">Дашборд и Реестр</div>
+                    <div className="text-xs font-semibold">{t('Дашборд и Реестр', 'Dashboard & Registry')}</div>
                     <div
                       className={`text-[11px] leading-snug mt-0.5 truncate ${
                         activeTab === 'dashboard' ? 'text-indigo-100' : 'text-slate-400'
@@ -986,7 +1017,7 @@ export function App() {
               <button
                 type="button"
                 onClick={() => setActiveTab('projects')}
-                title="Перейти в Проекты и Консоль (Alt+2)"
+                title={t('Перейти в Проекты и Консоль (Alt+2)', 'Go to Projects & Console (Alt+2)')}
                 className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'projects'
                     ? 'bg-indigo-600 text-white'
@@ -996,13 +1027,13 @@ export function App() {
                 <div className="flex items-start gap-2.5 min-w-0">
                   <FolderCode className="w-4 h-4 mt-0.5 shrink-0" />
                   <div className="min-w-0">
-                    <div className="text-xs font-semibold">Проекты и Консоль</div>
+                    <div className="text-xs font-semibold">{t('Проекты и Консоль', 'Projects & Console')}</div>
                     <div
                       className={`text-[11px] leading-snug mt-0.5 truncate ${
                         activeTab === 'projects' ? 'text-indigo-100' : 'text-slate-400'
                       }`}
                     >
-                      Код, project.yaml, живые логи, stdin
+                      {t('Код, project.yaml, живые логи, stdin', 'Code IDE, project.yaml, live logs')}
                     </div>
                   </div>
                 </div>
@@ -1012,7 +1043,7 @@ export function App() {
               <button
                 type="button"
                 onClick={() => setActiveTab('secrets')}
-                title="Перейти в Куки и Секреты (Alt+3)"
+                title={t('Перейти в Куки и Секреты (Alt+3)', 'Go to Cookies & Secrets (Alt+3)')}
                 className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'secrets'
                     ? 'bg-indigo-600 text-white'
@@ -1022,13 +1053,13 @@ export function App() {
                 <div className="flex items-start gap-2.5 min-w-0">
                   <KeyRound className="w-4 h-4 mt-0.5 shrink-0" />
                   <div className="min-w-0">
-                    <div className="text-xs font-semibold">Куки и Секреты (0600)</div>
+                    <div className="text-xs font-semibold">{t('Куки и Секреты (0600)', 'Cookies & Secrets (0600)')}</div>
                     <div
                       className={`text-[11px] leading-snug mt-0.5 truncate ${
                         activeTab === 'secrets' ? 'text-indigo-100' : 'text-slate-400'
                       }`}
                     >
-                      Изоляция секретов и Cookie-Editor
+                      {t('Изоляция секретов и Cookie-Editor', 'Secret isolation & Cookie-Editor')}
                     </div>
                   </div>
                 </div>
@@ -1038,7 +1069,7 @@ export function App() {
               <button
                 type="button"
                 onClick={() => setActiveTab('ai_access')}
-                title="Перейти в Доступ ИИ (Alt+4)"
+                title={t('Перейти в Доступ ИИ (Alt+4)', 'Go to AI / MCP Access (Alt+4)')}
                 className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'ai_access'
                     ? 'bg-indigo-600 text-white'
@@ -1048,13 +1079,13 @@ export function App() {
                 <div className="flex items-start gap-2.5 min-w-0">
                   <Bot className="w-4 h-4 mt-0.5 shrink-0" />
                   <div className="min-w-0">
-                    <div className="text-xs font-semibold">Доступ ИИ (MCP)</div>
+                    <div className="text-xs font-semibold">{t('Доступ ИИ (MCP)', 'AI Access (MCP)')}</div>
                     <div
                       className={`text-[11px] leading-snug mt-0.5 truncate ${
                         activeTab === 'ai_access' ? 'text-indigo-100' : 'text-slate-400'
                       }`}
                     >
-                      Токены, diff-одобрение, Kill-Switch
+                      {t('Токены, diff-одобрение, Kill-Switch', 'Tokens, diff approvals, Kill-Switch')}
                     </div>
                   </div>
                 </div>
@@ -1071,7 +1102,7 @@ export function App() {
               <button
                 type="button"
                 onClick={() => setActiveTab('settings')}
-                title="Перейти в Настройки (Alt+5)"
+                title={t('Перейти в Настройки (Alt+5)', 'Go to Settings (Alt+5)')}
                 className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'settings'
                     ? 'bg-indigo-600 text-white'
@@ -1081,13 +1112,13 @@ export function App() {
                 <div className="flex items-start gap-2.5 min-w-0">
                   <Settings className="w-4 h-4 mt-0.5 shrink-0" />
                   <div className="min-w-0">
-                    <div className="text-xs font-semibold">Настройки, Пароль и RBAC</div>
+                    <div className="text-xs font-semibold">{t('Настройки, Пароль и RBAC', 'Settings, Password & RBAC')}</div>
                     <div
                       className={`text-[11px] leading-snug mt-0.5 truncate ${
                         activeTab === 'settings' ? 'text-indigo-100' : 'text-slate-400'
                       }`}
                     >
-                      Смена пароля, Tailscale, роли, бэкап
+                      {t('Смена пароля, Tailscale, роли, бэкап', 'Password, Tailscale, roles, backup')}
                     </div>
                   </div>
                 </div>
@@ -1097,7 +1128,7 @@ export function App() {
               <button
                 type="button"
                 onClick={() => setActiveTab('acceptance')}
-                title="Перейти в Приёмку и Doctor (Alt+6)"
+                title={t('Перейти в Приёмку и Doctor (Alt+6)', 'Go to Acceptance & Doctor (Alt+6)')}
                 className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
                   activeTab === 'acceptance'
                     ? 'bg-indigo-600 text-white'
@@ -1107,13 +1138,13 @@ export function App() {
                 <div className="flex items-start gap-2.5 min-w-0">
                   <FlaskConical className="w-4 h-4 mt-0.5 shrink-0" />
                   <div className="min-w-0">
-                    <div className="text-xs font-semibold">Приёмка и Doctor</div>
+                    <div className="text-xs font-semibold">{t('Приёмка и Doctor', 'Acceptance & Doctor')}</div>
                     <div
                       className={`text-[11px] leading-snug mt-0.5 truncate ${
                         activeTab === 'acceptance' ? 'text-indigo-100' : 'text-slate-400'
                       }`}
                     >
-                      Автотесты ТЗ и диагностика среды
+                      {t('Автотесты ТЗ и диагностика среды', 'Self-tests & system diagnostics')}
                     </div>
                   </div>
                 </div>
@@ -1127,7 +1158,7 @@ export function App() {
             <button
               type="button"
               onClick={() => setActiveTab('docs')}
-              title="Открыть Документацию по панели (Alt+7)"
+              title={t('Открыть Документацию по панели (Alt+7)', 'Open Panel Documentation (Alt+7)')}
               className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
                 activeTab === 'docs'
                   ? 'bg-indigo-600 text-white'
@@ -1137,13 +1168,13 @@ export function App() {
               <div className="flex items-start gap-2.5 min-w-0">
                 <BookOpen className={`w-4 h-4 mt-0.5 shrink-0 ${activeTab === 'docs' ? 'text-white' : 'text-indigo-400'}`} />
                 <div className="min-w-0">
-                  <div className="text-xs font-semibold">Документация по панели</div>
+                  <div className="text-xs font-semibold">{t('Документация по панели', 'Panel Documentation')}</div>
                   <div
                     className={`text-[11px] leading-snug mt-0.5 truncate ${
                       activeTab === 'docs' ? 'text-indigo-100' : 'text-slate-400'
                     }`}
                   >
-                    Разделы, SDK, примеры и поиск
+                    {t('Разделы, SDK, примеры и поиск', 'Guides, SDK, examples & search')}
                   </div>
                 </div>
               </div>
@@ -1162,7 +1193,7 @@ export function App() {
               className="w-full flex items-center gap-2 px-3 py-2 text-xs text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-colors cursor-pointer"
             >
               <LogOut className="w-4 h-4" />
-              Выйти из сессии
+              {t('Выйти из сессии', 'Sign Out')}
             </button>
           </div>
         </aside>
@@ -1171,28 +1202,58 @@ export function App() {
         <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-y-auto">
           <header className="flex items-center justify-between gap-4 px-4 sm:px-6 py-3.5 border-b border-slate-800/90 bg-[#0b0f17]">
             <div className="min-w-0">
-              <h1 className="text-base font-bold tracking-tight text-white truncate">{currentMeta.title}</h1>
-              <p className="text-xs text-slate-400 truncate hidden sm:block">{currentMeta.subtitle}</p>
+              <h1 className="text-base font-bold tracking-tight text-white truncate">
+                {lang === 'en' ? currentMeta.titleEn : currentMeta.title}
+              </h1>
+              <p className="text-xs text-slate-400 truncate hidden sm:block">
+                {lang === 'en' ? currentMeta.subtitleEn : currentMeta.subtitle}
+              </p>
             </div>
 
-            <div className="flex items-center gap-2.5 shrink-0">
+            <div className="flex items-center gap-2 shrink-0">
               {dashboard?.system && (
-                <div className="hidden md:flex items-center gap-2 text-xs font-mono text-slate-300 tabular-nums">
+                <div className="hidden xl:flex items-center gap-2 text-xs font-mono text-slate-300 tabular-nums">
                   {dashboard.system.hardware?.available && dashboard.system.hardware.battery_percent !== null && (
                     <>
-                      <span className="text-emerald-300">АКБ {dashboard.system.hardware.battery_percent}%</span>
+                      <span className="text-emerald-300">
+                        {t('АКБ', 'BAT')} {dashboard.system.hardware.battery_percent}%
+                      </span>
                       <span className="text-slate-600" aria-hidden="true">
                         ·
                       </span>
                     </>
                   )}
-                  <span>Beacon {dashboard.system.hub_rss_mb} МБ</span>
+                  <span>Beacon {dashboard.system.hub_rss_mb} {t('МБ', 'MB')}</span>
                   <span className="text-slate-600" aria-hidden="true">
                     ·
                   </span>
-                  <span>Диск {dashboard.system.disk.free_mb} МБ</span>
+                  <span>{t('Диск', 'Disk')} {dashboard.system.disk.free_mb} {t('МБ', 'MB')}</span>
                 </div>
               )}
+
+              {/* Переключатель языка RU / EN */}
+              <button
+                type="button"
+                onClick={toggleLang}
+                aria-label={t('Переключить язык интерфейса (RU / EN)', 'Switch interface language (RU / EN)')}
+                className="px-2.5 py-1.5 text-xs font-mono font-semibold text-slate-200 hover:text-white bg-[#111622] hover:bg-slate-800 border border-slate-800 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                title={t('Язык панели: Русский / English', 'Panel Language: Russian / English')}
+              >
+                <Globe className="w-3.5 h-3.5 text-indigo-400" />
+                <span>{lang.toUpperCase()}</span>
+              </button>
+
+              {/* Кнопка проверки и установки обновлений в 2 клика */}
+              <button
+                type="button"
+                onClick={() => setUpdateModalOpen(true)}
+                aria-label={t('Обновление панели Beacon', 'Beacon Self-Update')}
+                className="px-2.5 py-1.5 text-xs font-semibold text-indigo-200 hover:text-white bg-indigo-950/50 hover:bg-indigo-900/60 border border-indigo-800/60 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                title={t('Проверить обновления в Git и обновить панель в 2 клика', 'Check Git updates & update panel in 2 clicks')}
+              >
+                <DownloadCloud className="w-3.5 h-3.5 text-indigo-400" />
+                <span className="hidden sm:inline">{t('Обновить', 'Update')}</span>
+              </button>
 
               {/* Кнопка экстренной блокировки ИИ (Пауза ИИ) в шапке (Фаза B.6) */}
               <button
@@ -1203,17 +1264,17 @@ export function App() {
                     ? 'bg-amber-950/80 text-amber-300 border-amber-500/50 hover:bg-amber-900'
                     : 'bg-[#111622] text-slate-300 hover:text-white border-slate-800'
                 }`}
-                title="Мгновенно заблокировать или возобновить все запросы ИИ (/mcp и /api/v1/)"
+                title={t('Мгновенно заблокировать или возобновить все запросы ИИ (/mcp и /api/v1/)', 'Immediately pause or resume all AI requests (/mcp & /api/v1/)')}
               >
                 {dashboard?.system?.ai_access_paused ? (
                   <>
                     <PlayCircle className="w-3.5 h-3.5 text-amber-400" />
-                    <span className="hidden sm:inline">ИИ на паузе</span>
+                    <span className="hidden sm:inline">{t('ИИ на паузе', 'AI Paused')}</span>
                   </>
                 ) : (
                   <>
                     <PauseCircle className="w-3.5 h-3.5 text-rose-400" />
-                    <span className="hidden sm:inline">Пауза ИИ</span>
+                    <span className="hidden sm:inline">{t('Пауза ИИ', 'Pause AI')}</span>
                   </>
                 )}
               </button>
@@ -1222,7 +1283,7 @@ export function App() {
                 type="button"
                 onClick={() => setCommandPaletteOpen(true)}
                 className="px-2.5 py-1.5 text-xs font-mono text-slate-300 hover:text-white bg-[#111622] border border-slate-800 rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer"
-                title="Открыть командную палитру (Ctrl+K)"
+                title={t('Открыть командную палитру (Ctrl+K)', 'Open Command Palette (Ctrl+K)')}
               >
                 <Search className="w-3.5 h-3.5 text-indigo-400" />
                 <span className="hidden sm:inline">Ctrl+K</span>
@@ -1234,7 +1295,7 @@ export function App() {
                 className="px-3.5 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition-colors whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 cursor-pointer"
               >
                 <Plus className="w-3.5 h-3.5" />
-                Новый проект
+                {t('Новый проект', 'New Project')}
               </button>
             </div>
           </header>
@@ -1416,6 +1477,13 @@ export function App() {
         isOpen={createModalOpen}
         onClose={() => setCreateModalOpen(false)}
         onCreate={handleCreateProject}
+      />
+
+      <SystemUpdateModal
+        isOpen={updateModalOpen}
+        onClose={() => setUpdateModalOpen(false)}
+        apiFetch={apiFetch}
+        onUpdated={() => loadAllData()}
       />
 
       <CommandPaletteModal
