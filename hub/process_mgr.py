@@ -162,7 +162,7 @@ def kill_orphan_processes_by_run_id(
     exclude_pids: Optional[set[int]] = None,
 ) -> int:
     """
-    Находит и завершает осиротевшие процессы только конкретного запуска (_BEACON_RUN_ID / _HUB_RUN_ID),
+    Находит и завершает осиротевшие процессы только конкретного запуска (_BEACON_RUN_ID),
     не затрагивая параллельно работающие сервисы того же проекта (P0-3).
     """
     target_run = str(run_id)
@@ -178,11 +178,11 @@ def kill_orphan_processes_by_run_id(
             env = p.environ()
             if not env:
                 continue
-            env_run = env.get("_BEACON_RUN_ID") or env.get("_ARUTA_RUN_ID") or env.get("_HUB_RUN_ID")
+            env_run = env.get("_BEACON_RUN_ID")
             if env_run != target_run:
                 continue
             if target_proj is not None:
-                env_proj = env.get("_BEACON_PROJECT_ID") or env.get("_ARUTA_PROJECT_ID") or env.get("_HUB_PROJECT_ID")
+                env_proj = env.get("_BEACON_PROJECT_ID")
                 if env_proj and env_proj != target_proj:
                     continue
             orphan_pids.append(p.pid)
@@ -209,7 +209,7 @@ def kill_orphan_processes_by_project_id(project_id: int, exclude_pids: Optional[
             env = p.environ()
             if not env:
                 continue
-            env_proj = env.get("_BEACON_PROJECT_ID") or env.get("_ARUTA_PROJECT_ID") or env.get("_HUB_PROJECT_ID")
+            env_proj = env.get("_BEACON_PROJECT_ID")
             if env_proj == target_val:
                 orphan_pids.append(p.pid)
         except (ProcessLookupError, PermissionError, psutil.NoSuchProcess, psutil.AccessDenied, Exception):
@@ -649,7 +649,7 @@ def _build_command_args(project: dict[str, Any], custom_cmd: Optional[str] = Non
 _RESERVED_PARAM_EXACT = frozenset(
     {"PATH", "ENV", "SHELLOPTS", "PS4", "PORT", "HOME", "TMPDIR", "TEMP", "TMP", "VIRTUAL_ENV", "IFS"}
 )
-_RESERVED_PARAM_PREFIXES = ("LD_", "PYTHON", "NODE_", "BASH_", "GIT_", "BEACON", "ARUTA_", "HUB", "XDG_")
+_RESERVED_PARAM_PREFIXES = ("LD_", "PYTHON", "NODE_", "BASH_", "GIT_", "BEACON", "XDG_")
 _RESERVED_PARAM_SUBSTRS = ("PROXY",)
 
 
@@ -718,15 +718,11 @@ def _build_process_env(
     if venv_dir.exists():
         env["VIRTUAL_ENV"] = str(venv_dir)
 
-    # 3. Маркировка процессов для отлова сирот (_BEACON_PROJECT_ID / _HUB_PROJECT_ID)
+    # 3. Маркировка процессов для отлова сирот (_BEACON_PROJECT_ID / _BEACON_RUN_ID)
     if project.get("id") is not None:
         env["_BEACON_PROJECT_ID"] = str(project["id"])
-        env["_ARUTA_PROJECT_ID"] = str(project["id"])
-        env["_HUB_PROJECT_ID"] = str(project["id"])
     if run_id is not None:
         env["_BEACON_RUN_ID"] = str(run_id)
-        env["_ARUTA_RUN_ID"] = str(run_id)
-        env["_HUB_RUN_ID"] = str(run_id)
 
     # 4. Проброс переменной PORT для веб-бэкендов и сервисов
     proj_port = int(project.get("port") or 0)
@@ -745,11 +741,7 @@ def _build_process_env(
     hub_port = str(get_runtime_port() or settings.get("port", "8050") or "8050")
     internal_url = f"http://127.0.0.1:{hub_port}/internal"
     env["BEACON_API_URL"] = internal_url
-    env["ARUTA_API_URL"] = internal_url
-    env["HUB_API_URL"] = internal_url
     env["BEACON_RUN_TOKEN"] = run_token
-    env["ARUTA_RUN_TOKEN"] = run_token
-    env["HUB_RUN_TOKEN"] = run_token
     ping_tok = str(project.get("ping_token") or "").strip()
     if ping_tok:
         env["BEACON_PING_TOKEN"] = ping_tok
@@ -780,11 +772,7 @@ def _build_process_env(
                 if sec:
                     sec_type = str(sec.get("type") or "text")
                     env[f"BEACON_SECRET_FILE_{sec['name']}"] = str(sec["file_path"])
-                    env[f"ARUTA_SECRET_FILE_{sec['name']}"] = str(sec["file_path"])
-                    env[f"HUB_SECRET_FILE_{sec['name']}"] = str(sec["file_path"])
                     env[f"BEACON_SECRET_TYPE_{sec['name']}"] = sec_type
-                    env[f"ARUTA_SECRET_TYPE_{sec['name']}"] = sec_type
-                    env[f"HUB_SECRET_TYPE_{sec['name']}"] = sec_type
     except Exception:
         logger.exception("Ошибка подготовки секретов для проекта id=%s", project.get("id"))
 
@@ -1041,8 +1029,6 @@ async def start_project_run(
 
         # Прописываем идентификатор запуска для отлова сирот конкретно этого run_id
         env["_BEACON_RUN_ID"] = str(run_id)
-        env["_ARUTA_RUN_ID"] = str(run_id)
-        env["_HUB_RUN_ID"] = str(run_id)
 
         # Оборачиваем запуск в тонкий launcher, сохраняющий код возврата в <run_id>.exit (P1-6)
         launch_args = [sys.executable, str(_LAUNCHER_PATH), str(exit_path), "--"] + cmd_args

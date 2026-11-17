@@ -1,6 +1,6 @@
 """
 Тесты PR-10 (операции, CLI, бэкапы, безопасность настроек и управление пользователями):
-1. `hub.names.get_env_var`: BEACON_* и однократное предупреждение для ARUTA_* / HUB_*
+1. `hub.names.get_env_var` и `migrate_legacy_installation`: канонические BEACON_* и миграция старых установок
 2. `hub.backup_mgr`: архивирование и восстановление в изолированном BEACON_DIR, защита от traversal/симмлинков, 0600 на секреты, исключение session.secret / internal.token / .venv / node_modules
 3. CLI subcommands `python3 -m beacon {migrate,systemd,backup,restore,reset-password}`
 4. UI API routes: PUT/DELETE /api/users/{id}, audit_log.actor, строгая валидация PUT /api/settings + confirm_lockout, read-only GET /api/system/systemd_unit, streaming GET /api/system/backup
@@ -32,7 +32,7 @@ from hub.api.routes_ui import (
 )
 from hub.backup_mgr import _validate_zip_member
 from hub.db import execute_sql, get_setting, init_db, query_one, set_setting
-from hub.names import _DEPRECATION_WARNED, get_env_var
+from hub.names import get_env_var, migrate_legacy_installation
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -61,31 +61,24 @@ class TestPr10Ops(unittest.TestCase):
     def setUpClass(cls) -> None:
         init_db()
 
-    def test_01_env_var_deprecation_warned_once(self) -> None:
+    def test_01_env_var_and_legacy_migration(self) -> None:
         saved = dict(os.environ)
-        logger = logging.getLogger("beacon.names")
-        records: list[logging.LogRecord] = []
-
-        class _CapHandler(logging.Handler):
-            def emit(self, record: logging.LogRecord) -> None:
-                records.append(record)
-
-        handler = _CapHandler()
-        logger.addHandler(handler)
         try:
             os.environ.pop("BEACON_UNIT_ALIAS_TEST", None)
-            os.environ["HUB_UNIT_ALIAS_TEST"] = "legacy-val"
-            _DEPRECATION_WARNED.discard("HUB_UNIT_ALIAS_TEST->BEACON_UNIT_ALIAS_TEST")
-
-            self.assertEqual(get_env_var("BEACON_UNIT_ALIAS_TEST"), "legacy-val")
-            self.assertEqual(get_env_var("BEACON_UNIT_ALIAS_TEST"), "legacy-val")
-            self.assertEqual(len(records), 1)
+            self.assertEqual(get_env_var("BEACON_UNIT_ALIAS_TEST", "default-val"), "default-val")
 
             os.environ["BEACON_UNIT_ALIAS_TEST"] = "new-val"
             self.assertEqual(get_env_var("BEACON_UNIT_ALIAS_TEST"), "new-val")
-            self.assertEqual(len(records), 1)
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                bdir = Path(tmpdir)
+                (bdir / "data").mkdir(parents=True)
+                (bdir / "data" / "hub.pid").write_text("12345", encoding="utf-8")
+                res = migrate_legacy_installation(bdir)
+                self.assertTrue(res["ok"])
+                self.assertEqual(res["migrated_files"], 1)
+                self.assertTrue((bdir / "data" / "beacon.pid").exists())
         finally:
-            logger.removeHandler(handler)
             os.environ.clear()
             os.environ.update(saved)
 

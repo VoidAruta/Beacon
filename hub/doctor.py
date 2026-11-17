@@ -178,7 +178,7 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
         }
     )
 
-    # 4. Целостность SQLite WAL, размер hub.db-wal и таблица project_kv
+    # 4. Целостность SQLite WAL, размер beacon.db-wal и таблица project_kv
     wal_info = checkpoint_wal(truncate_threshold_mb=4.0)
     journal_mode = "unknown"
     integrity = "unknown"
@@ -204,7 +204,7 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
                 f"Режим {journal_mode.upper()}, quick_check={integrity}, project_kv={'OK' if has_kv_table else 'missing'}, "
                 f"размер WAL после чекпоинта ({wal_info['mode']}): {wal_info['wal_size_after_kb']} КБ."
             ),
-            "fix_hint": "sqlite3 data/hub.db 'PRAGMA wal_checkpoint(TRUNCATE);'",
+            "fix_hint": "sqlite3 data/beacon.db 'PRAGMA wal_checkpoint(TRUNCATE);'",
             "details": {
                 "journal_mode": journal_mode,
                 "quick_check": integrity,
@@ -260,7 +260,7 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
         }
     )
 
-    # 7. Бюджет ОЗУ самого Hub (< 80 МБ) и свободное место на диске
+    # 7. Бюджет ОЗУ самого Beacon (< 80 МБ) и свободное место на диске
     hub_proc = psutil.Process(os.getpid())
     hub_rss_mb = round(hub_proc.memory_info().rss / (1024 * 1024), 1)
     disk_st = get_disk_status()
@@ -353,7 +353,7 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
     if run_as_user == "root":
         rau_status = "error"
         rau_summary = (
-            "run_as_user=root: дочерние проекты запускаются от root и имеют прямой доступ к data/secrets и hub.db."
+            "run_as_user=root: дочерние проекты запускаются от root и имеют прямой доступ к data/secrets и beacon.db."
         )
     elif not user_exists:
         rau_status = "error"

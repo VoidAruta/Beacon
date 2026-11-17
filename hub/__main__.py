@@ -295,11 +295,7 @@ async def security_and_auth_middleware(request: Request, call_next: Callable[[Re
                 token = str(request.cookies.get(cname) or "")
                 break
         if not token:
-            token = (
-                request.headers.get("x-beacon-session", "")
-                or request.headers.get("x-aruta-session", "")
-                or request.headers.get("x-hub-session", "")
-            )
+            token = request.headers.get("x-beacon-session", "")
         session = verify_session_token(token)
 
         if path.startswith("/api/runs/") and path.endswith("/stream") and request.method == "GET":
@@ -460,10 +456,15 @@ async def on_startup() -> None:
 
 
 def _run_cli_migrate() -> int:
-    """Команда `python3 -m beacon migrate`: миграция БД и проверка совместимости путей."""
+    """Команда `python3 -m beacon migrate`: миграция БД, автоматический переезд и проверка путей."""
+    from hub.names import migrate_legacy_installation
+
     ensure_directories()
     init_db()
+    mig_res = migrate_legacy_installation(BASE_DIR)
     print("[Beacon Migrate] Схема базы данных SQLite успешно обновлена до версии 2.2.0.")
+    if mig_res.get("migrated_files"):
+        print(f"[Beacon Migrate] Автоматически перенесено файлов старых версий: {mig_res['migrated_files']}")
     print(f"[Beacon Migrate] Рабочая директория: {BASE_DIR}")
     return 0
 
@@ -601,8 +602,8 @@ def main() -> None:
         print("[Beacon AI Kill-Switch] Доступ ИИ возобновлён.", flush=True)
         sys.exit(0)
 
-    port_str = get_env_var("BEACON_PORT", "HUB_PORT") or get_setting("port", "8050")
-    host = get_env_var("BEACON_HOST", "HUB_HOST") or "0.0.0.0"
+    port_str = get_env_var("BEACON_PORT") or get_setting("port", "8050")
+    host = get_env_var("BEACON_HOST") or "0.0.0.0"
 
     for i, arg in enumerate(args):
         if arg == "--port" and i + 1 < len(args):

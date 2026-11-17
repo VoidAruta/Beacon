@@ -18,3 +18,8 @@ All notable changes to **Beacon** are documented in this file.
 
 ### Supervisor & Platform Capabilities
 - Added crash-loop protection (`crash_loop` status), Dead Man's Switch (`GET/POST /api/ping/{project}`), `project.yaml` Config-as-Code sync, project `.zip` export/import, RBAC roles (`viewer`, `operator`, `admin`), project chaining (`on_success_project_id`), launch parameters schema, and Safe Mode (`--safe-mode`).
+- **2-Click Backup Upload & Restore (Server Migration):** Added `GET /api/system/backups_list` and `POST /api/system/restore_backup` endpoints + Web UI in Settings so users can upload a `.zip` backup or restore from `data/backups/` with automatic pre-restore safety snapshot (`beacon_pre_restore_<ts>.zip`) and SQLite `PRAGMA integrity_check`.
+- **In-Panel Self-Update:** Added `GET /api/system/update_status` and `POST /api/system/update_run` + header update modal to check `origin/main` and run `scripts/update.sh` with automatic rollback on healthcheck failure.
+- **Full Bilingual Localization (EN / RU):** Added instant `RU | EN` language switcher covering the entire interface, plus bilingual `README.md` (English) and `README.ru.md` (Russian).
+- **Canonical Naming & Automatic Migration:** Removed legacy wrappers (`aruta`, `hub` SDK shims) and added automatic one-time migration (`migrate_legacy_installation`) on `python3 -m beacon migrate`.
+

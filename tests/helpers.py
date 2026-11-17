@@ -156,10 +156,8 @@ def temp_hub_env() -> Iterator[Path]:
     """Изолированный временный BEACON_DIR + init_db() с полным восстановлением глобальных путей."""
     tmpdir = Path(tempfile.mkdtemp(prefix="beacon_test_")).resolve()
     old_beacon_env = os.environ.get("BEACON_DIR")
-    old_hub_env = os.environ.get("HUB_DIR")
     old_preview_env = os.environ.get("BEACON_PREVIEW_MODE")
     os.environ["BEACON_DIR"] = str(tmpdir)
-    os.environ["HUB_DIR"] = str(tmpdir)
     os.environ.pop("BEACON_PREVIEW_MODE", None)
 
     _reset_caches()
@@ -176,10 +174,6 @@ def temp_hub_env() -> Iterator[Path]:
             os.environ.pop("BEACON_DIR", None)
         else:
             os.environ["BEACON_DIR"] = old_beacon_env
-        if old_hub_env is None:
-            os.environ.pop("HUB_DIR", None)
-        else:
-            os.environ["HUB_DIR"] = old_hub_env
         if old_preview_env is None:
             os.environ.pop("BEACON_PREVIEW_MODE", None)
         else:

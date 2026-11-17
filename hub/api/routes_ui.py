@@ -60,9 +60,10 @@ from hub.auth import (
     verify_password,
     verify_session_token,
 )
-from hub.backup_mgr import create_backup_archive
+from hub.backup_mgr import create_backup_archive, restore_backup_archive
 from hub.compat import croniter, psutil
 from hub.config import (
+    BACKUPS_DIR,
     BASE_DIR,
     EXAMPLES_DIR,
     GENERATED_DIR,
@@ -804,8 +805,6 @@ async def api_login(request: Request) -> Response:
         samesite=samesite_mode,
         secure=is_https,
     )
-    resp.delete_cookie("aruta_session")
-    resp.delete_cookie("hub_session")
     resp.set_cookie(
         "csrf_token",
         csrf_token,
@@ -864,11 +863,7 @@ async def api_logout(request: Request) -> Response:
     client_ip = _client_ip(request)
     token = (
         request.cookies.get("beacon_session")
-        or request.cookies.get("aruta_session")
-        or request.cookies.get("hub_session")
         or request.headers.get("x-beacon-session", "")
-        or request.headers.get("x-aruta-session", "")
-        or request.headers.get("x-hub-session", "")
     )
     logout_actor = "admin"
     if token:
@@ -879,8 +874,6 @@ async def api_logout(request: Request) -> Response:
     log_audit(client_ip, "LOGOUT", "Выход из веб-панели (сессия инвалидирована)", actor=logout_actor)
     resp = JSONResponse({"ok": True, "authenticated": False})
     resp.delete_cookie("beacon_session")
-    resp.delete_cookie("aruta_session")
-    resp.delete_cookie("hub_session")
     resp.delete_cookie("csrf_token")
     return resp
 
@@ -889,11 +882,7 @@ async def api_logout(request: Request) -> Response:
 async def api_auth_me(request: Request) -> Response:
     token = (
         request.cookies.get("beacon_session")
-        or request.cookies.get("aruta_session")
-        or request.cookies.get("hub_session")
         or request.headers.get("x-beacon-session", "")
-        or request.headers.get("x-aruta-session", "")
-        or request.headers.get("x-hub-session", "")
     )
     session = verify_session_token(token)
     default_pw = is_default_password()
@@ -3178,7 +3167,7 @@ async def api_stream_run_log(request: Request, run_id: int) -> StreamingResponse
 
 
 # ==============================================================================
-# 6. СЕКРЕТЫ И ИНТЕРАКТИВНЫЕ ЗАПРОСЫ (aruta.ask / Cookie-Editor)
+# 6. СЕКРЕТЫ И ИНТЕРАКТИВНЫЕ ЗАПРОСЫ (beacon.ask / Cookie-Editor)
 # ==============================================================================
 @router.get("/secrets")
 async def api_get_secrets(request: Request) -> list[dict[str, Any]]:
@@ -3783,11 +3772,7 @@ async def api_system_bundle(request: Request) -> dict[str, Any]:
         "scripts/zstart_line.sh",
         "scripts/beacon.service.template",
         "sdk/python/beacon.py",
-        "sdk/python/aruta.py",
-        "sdk/python/hub.py",
         "sdk/node/beacon.js",
-        "sdk/node/aruta.js",
-        "sdk/node/hub.js",
         "beacon/__init__.py",
         "beacon/__main__.py",
         "hub/__init__.py",
@@ -3881,6 +3866,112 @@ async def api_system_backup_zip(request: Request) -> Response:
             "Cache-Control": "no-store",
         },
     )
+
+
+@router.get("/system/backups_list")
+async def api_system_backups_list(request: Request) -> dict[str, Any]:
+    """Возвращает список доступных ZIP-архивов резервных копий в data/backups/."""
+    _require_admin_session(request)
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+    items: list[dict[str, Any]] = []
+    for p in sorted(
+        (f for f in BACKUPS_DIR.glob("*.zip") if f.is_file() and not f.name.startswith(".")),
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    ):
+        st = p.stat()
+        items.append(
+            {
+                "filename": p.name,
+                "size_bytes": st.st_size,
+                "created_at": int(st.st_mtime),
+            }
+        )
+    return {"ok": True, "backups": items}
+
+
+@router.post("/system/restore_backup")
+async def api_system_restore_backup(request: Request) -> dict[str, Any]:
+    """
+    Восстанавливает состояние сервера Beacon из загруженного .zip архива или из файла в data/backups/.
+    Перед восстановлением автоматически создаёт страховочный бэкап текущего состояния.
+    """
+    _require_admin_session(request)
+    client_ip = _client_ip(request)
+    actor = _session_actor(request)
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+
+    content_type = (request.headers.get("content-type") or "").lower()
+    tmp_uploaded_zip: Optional[Path] = None
+    target_zip: Optional[Path] = None
+    source_label = ""
+
+    try:
+        if "multipart/form-data" in content_type:
+            form = await request.form()
+            upload = form.get("file") or form.get("backup")
+            if upload is None or not hasattr(upload, "read"):
+                raise HTTPException(status_code=400, detail="Не передан файл архива бэкапа (.zip)")
+            raw_bytes = await upload.read()
+            if not raw_bytes or len(raw_bytes) < 22:
+                raise HTTPException(status_code=400, detail="Загруженный файл пуст или не является ZIP-архивом")
+            fd, tmp_name = tempfile.mkstemp(prefix="beacon_upload_restore_", suffix=".zip", dir=str(BACKUPS_DIR))
+            os.close(fd)
+            tmp_uploaded_zip = Path(tmp_name)
+            tmp_uploaded_zip.write_bytes(raw_bytes)
+            target_zip = tmp_uploaded_zip
+            source_label = getattr(upload, "filename", "") or "uploaded_backup.zip"
+        else:
+            body = await read_json(request)
+            filename = str(body.get("filename") or "").strip()
+            if not filename or "/" in filename or "\\" in filename or ".." in filename or not filename.endswith(".zip"):
+                raise HTTPException(status_code=400, detail="Укажите корректное имя файла бэкапа (.zip) из data/backups/")
+            cand = (BACKUPS_DIR / filename).resolve()
+            if cand.parent != BACKUPS_DIR.resolve() or not cand.exists() or not cand.is_file():
+                raise HTTPException(status_code=404, detail=f"Файл резервной копии не найден: {filename}")
+            target_zip = cand
+            source_label = filename
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        safety_backup = BACKUPS_DIR / f"beacon_pre_restore_{ts}.zip"
+        safety_name = ""
+        try:
+            await asyncio.to_thread(create_backup_archive, safety_backup)
+            safety_name = safety_backup.name
+        except Exception as exc:
+            logger.warning("Не удалось создать пре-рестор бэкап: %s", exc)
+
+        # Останавливаем активные запуски асинхронно перед заменой БД
+        for run_proj_id in list({int(info.get("project_id", 0)) for info in ACTIVE_RUNS.values() if info.get("project_id")}):
+            try:
+                await stop_project(run_proj_id)
+            except Exception:
+                pass
+
+        res = await asyncio.to_thread(restore_backup_archive, target_zip, False)
+        invalidate_user_cache()
+        reload_redaction_cache()
+        log_audit(
+            client_ip,
+            "BACKUP_RESTORED",
+            f"Восстановлен бэкап {source_label} (секретов: {res.get('restored_secrets')}, файлов: {res.get('restored_project_files')})",
+            actor=actor,
+        )
+        return {
+            "ok": True,
+            "source": source_label,
+            "safety_backup": safety_name,
+            **res,
+        }
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Ошибка восстановления бэкапа: {exc}") from exc
+    finally:
+        if tmp_uploaded_zip is not None:
+            tmp_uploaded_zip.unlink(missing_ok=True)
 
 
 def _inspect_git_update_status(check_remote: bool = False) -> dict[str, Any]:

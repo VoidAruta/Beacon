@@ -17,6 +17,7 @@ import {
   ChevronUp,
   Sliders,
   Download,
+  Upload,
   Terminal,
 } from 'lucide-react';
 import { AcceptanceCheckItem, AuditEntry, ProjectItem } from '../types/hub';
@@ -71,6 +72,11 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
   const [showTgHelp, setShowTgHelp] = useState<boolean>(false);
   const [systemdInfo, setSystemdInfo] = useState<{ path: string; content: string } | null>(null);
   const [downloadingBackup, setDownloadingBackup] = useState<boolean>(false);
+  const [backupsList, setBackupsList] = useState<Array<{ filename: string; size_bytes: number; updated_at: number }>>([]);
+  const [restoreFile, setRestoreFile] = useState<File | null>(null);
+  const [selectedServerBackup, setSelectedServerBackup] = useState<string>('');
+  const [restoringBackup, setRestoringBackup] = useState<boolean>(false);
+  const [confirmRestoreModal, setConfirmRestoreModal] = useState<{ mode: 'upload' | 'server'; targetName: string } | null>(null);
 
   // Пользователи и RBAC
   const [users, setUsers] = useState<RbacUserItem[]>([]);
@@ -96,10 +102,11 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
 
   const loadSettingsAndAudit = async () => {
     try {
-      const [sRes, aRes, uRes] = await Promise.all([
+      const [sRes, aRes, uRes, bRes] = await Promise.all([
         apiFetch('/api/settings'),
         apiFetch('/api/system/audit'),
         apiFetch('/api/users'),
+        apiFetch('/api/system/backups_list'),
       ]);
       if (sRes.ok) {
         const sData = await sRes.json();
@@ -117,6 +124,15 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
         const uData = await uRes.json();
         if (Array.isArray(uData)) {
           setUsers(uData);
+        }
+      }
+      if (bRes.ok) {
+        const bData = await bRes.json();
+        if (bData && Array.isArray(bData.backups)) {
+          setBackupsList(bData.backups);
+          if (!selectedServerBackup && bData.backups.length > 0) {
+            setSelectedServerBackup(bData.backups[0].filename);
+          }
         }
       }
     } catch {
@@ -373,6 +389,54 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
       }
     } finally {
       setDownloadingBackup(false);
+    }
+  };
+
+  const handleExecuteRestoreBackup = async () => {
+    if (!confirmRestoreModal) return;
+    setRestoringBackup(true);
+    setSaveMsg(null);
+    try {
+      let res: Response;
+      if (confirmRestoreModal.mode === 'upload' && restoreFile) {
+        const formData = new FormData();
+        formData.append('file', restoreFile);
+        res = await apiFetch('/api/system/restore_backup', {
+          method: 'POST',
+          body: formData,
+        });
+      } else {
+        res = await apiFetch('/api/system/restore_backup', {
+          method: 'POST',
+          body: JSON.stringify({ filename: confirmRestoreModal.targetName }),
+        });
+      }
+      if (res.ok) {
+        const data = await res.json();
+        setConfirmRestoreModal(null);
+        setRestoreFile(null);
+        setSaveMsg({
+          type: 'ok',
+          text: `Бэкап успешно восстановлен! Проектов: ${data.projects_count ?? 0}, секретов: ${data.secrets_count ?? 0}. Страховочная копия: ${data.pre_restore_backup || 'создана'}.`,
+        });
+        await loadSettingsAndAudit();
+        await onRefreshDashboard();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        setConfirmRestoreModal(null);
+        setSaveMsg({
+          type: 'err',
+          text: err.detail || 'Не удалось восстановить бэкап (.zip). Проверьте целостность архива.',
+        });
+      }
+    } catch (e: any) {
+      setConfirmRestoreModal(null);
+      setSaveMsg({
+        type: 'err',
+        text: e?.message || 'Сетевая ошибка при восстановлении бэкапа',
+      });
+    } finally {
+      setRestoringBackup(false);
     }
   };
 
@@ -967,7 +1031,6 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
                       className="w-full bg-[#0b0f17] border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
                     >
                       <option value="beacon-runner">beacon-runner (изолированный юзер)</option>
-                      <option value="hub-runner">hub-runner (совместимость со старой версией)</option>
                       <option value="root">root (без понижения привилегий)</option>
                     </select>
                   </div>
@@ -1477,6 +1540,119 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
                   className="w-full bg-[#0b0f17] border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
                 />
               </div>
+            </div>
+
+            {/* Переезд в 2 клика: Загрузка и восстановление бэкапа (.zip) */}
+            <div className="p-4 bg-[#0f172a]/90 border border-indigo-500/30 rounded-xl space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div>
+                  <h4 className="text-xs font-bold text-white flex items-center gap-2">
+                    <Upload className="w-4 h-4 text-indigo-400" />
+                    Переезд на другой сервер в 2 клика: Загрузка и восстановление бэкапа (.zip)
+                  </h4>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    Загрузите архив <code className="font-mono">beacon_backup_*.zip</code> со старого сервера или выберите локальный архив из <code className="font-mono">data/backups/</code>. Перед заменой автоматически создаётся страховочный слепок <code className="font-mono">beacon_pre_restore_*.zip</code> и проверяется <code className="font-mono">PRAGMA integrity_check</code>.
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 pt-1">
+                {/* Вариант А: Загрузить файл .zip с компьютера */}
+                <div className="p-3 bg-[#0b0f17] border border-slate-800 rounded-lg space-y-2">
+                  <div className="text-xs font-semibold text-slate-200">
+                    1. Загрузить файл архива (.zip) с вашего устройства
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="file"
+                      accept=".zip,application/zip"
+                      aria-label="Выбрать zip-архив бэкапа для восстановления"
+                      onChange={(e) => setRestoreFile(e.target.files?.[0] || null)}
+                      className="flex-1 min-w-0 text-xs text-slate-300 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-slate-800 file:text-indigo-300 hover:file:bg-slate-700 cursor-pointer"
+                    />
+                    <button
+                      type="button"
+                      disabled={!restoreFile || restoringBackup}
+                      onClick={() =>
+                        restoreFile &&
+                        setConfirmRestoreModal({ mode: 'upload', targetName: restoreFile.name })
+                      }
+                      className="px-3 py-1.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg inline-flex items-center gap-1.5 cursor-pointer shrink-0"
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      Восстановить из файла
+                    </button>
+                  </div>
+                </div>
+
+                {/* Вариант Б: Восстановить из существующего архива в data/backups/ */}
+                <div className="p-3 bg-[#0b0f17] border border-slate-800 rounded-lg space-y-2">
+                  <div className="text-xs font-semibold text-slate-200">
+                    2. Восстановить из архива на сервере (<code className="font-mono text-indigo-300">data/backups/</code>)
+                  </div>
+                  {backupsList.length > 0 ? (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <select
+                        aria-label="Выбрать архив из data/backups"
+                        value={selectedServerBackup}
+                        onChange={(e) => setSelectedServerBackup(e.target.value)}
+                        className="flex-1 min-w-0 bg-[#0f172a] border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white"
+                      >
+                        {backupsList.map((b) => (
+                          <option key={b.filename} value={b.filename}>
+                            {b.filename} ({formatBytes(b.size_bytes)})
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        disabled={!selectedServerBackup || restoringBackup}
+                        onClick={() =>
+                          selectedServerBackup &&
+                          setConfirmRestoreModal({ mode: 'server', targetName: selectedServerBackup })
+                        }
+                        className="px-3 py-1.5 text-xs font-semibold bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-slate-950 rounded-lg inline-flex items-center gap-1.5 cursor-pointer shrink-0"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        Восстановить выбранный
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="text-xs text-slate-400 py-1">
+                      В папке <code className="font-mono">data/backups/</code> пока нет сохранённых архивов. Нажмите «Скачать полный бэкап (.zip)» выше или загрузите файл слева.
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {confirmRestoreModal && (
+                <div className="p-3.5 bg-amber-950/70 border border-amber-500/50 rounded-xl text-xs text-amber-100 space-y-2.5">
+                  <div className="font-bold text-amber-300">
+                    Подтвердите восстановление сервера из архива: <code className="font-mono text-white">{confirmRestoreModal.targetName}</code>
+                  </div>
+                  <p className="text-[11px] text-amber-100/90 leading-relaxed">
+                    Все запущенные проекты будут аккуратно остановлены, текущее состояние сохранится в страховочный архив <code className="font-mono">beacon_pre_restore_*.zip</code>, после чего база данных <code className="font-mono">hub.db</code>, секреты <code className="font-mono">0600</code> и папки <code className="font-mono">projects/*</code> будут заменены данными из выбранного бэкапа.
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={restoringBackup}
+                      onClick={handleExecuteRestoreBackup}
+                      className="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold rounded-lg cursor-pointer"
+                    >
+                      {restoringBackup ? 'Восстановление...' : 'Да, восстановить бэкап сейчас'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={restoringBackup}
+                      onClick={() => setConfirmRestoreModal(null)}
+                      className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg cursor-pointer"
+                    >
+                      Отмена
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             {systemdInfo && (

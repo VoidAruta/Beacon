@@ -198,8 +198,8 @@ class TestHubCore(unittest.TestCase):
             env_map = _build_process_env(proj, get_internal_token(), get_all_settings())
             for k, v in env_map.items():
                 self.assertNotIn("secret_bound_val_112233", v)
-            self.assertNotIn("HUB_SECRET_bound_secret", env_map)
-            self.assertIn("HUB_SECRET_FILE_bound_secret", env_map)
+            self.assertNotIn("BEACON_SECRET_bound_secret", env_map)
+            self.assertIn("BEACON_SECRET_FILE_bound_secret", env_map)
 
             # 2. Запрос разрешённого секрета проходит, а непривязанного возвращает 403
             test_run_tok = secrets.token_hex(24)
@@ -208,7 +208,7 @@ class TestHubCore(unittest.TestCase):
                    VALUES (?, 'running', 'manual', ?, ?, 0.0, ?, '/tmp/test.log', ?)""",
                 (proj_id, os.getpid(), os.getpid(), now, test_run_tok),
             )
-            req_ok = _DummyReq(headers={"x-hub-token": test_run_tok})
+            req_ok = _DummyReq(headers={"x-beacon-token": test_run_tok})
             res_ok = asyncio.run(internal_get_secret(req_ok, "bound_secret"))  # type: ignore[arg-type]
             self.assertEqual(res_ok["value"], "secret_bound_val_112233")
 
@@ -396,9 +396,7 @@ class TestHubCore(unittest.TestCase):
             assert proj is not None
             env_map = _build_process_env(proj, get_internal_token(), get_all_settings(), run_id=777)
             self.assertEqual(env_map["_BEACON_PROJECT_ID"], str(proj_id))
-            self.assertEqual(env_map["_HUB_PROJECT_ID"], str(proj_id))
             self.assertEqual(env_map["_BEACON_RUN_ID"], "777")
-            self.assertEqual(env_map["_HUB_RUN_ID"], "777")
             self.assertEqual(env_map["PORT"], "18991")
             self.assertEqual(env_map["PYTHONDONTWRITEBYTECODE"], "1")
             self.assertTrue(env_map["TMPDIR"].endswith("/.tmp"))
@@ -419,11 +417,11 @@ class TestHubCore(unittest.TestCase):
                    VALUES (?, 'running', 'manual', ?, ?, 0.0, ?, '/tmp/test_kv.log', ?)""",
                 (proj_id, os.getpid(), os.getpid(), now, test_run_tok),
             )
-            req_put = _DummyReq(headers={"x-hub-token": test_run_tok}, body={"value": {"cursor": 42, "items": ["a", "b"]}})
+            req_put = _DummyReq(headers={"x-beacon-token": test_run_tok}, body={"value": {"cursor": 42, "items": ["a", "b"]}})
             res_put = asyncio.run(internal_kv_put(req_put, "sync_state"))  # type: ignore[arg-type]
             self.assertTrue(res_put["ok"])
 
-            req_get = _DummyReq(headers={"x-hub-token": test_run_tok})
+            req_get = _DummyReq(headers={"x-beacon-token": test_run_tok})
             res_get = asyncio.run(internal_kv_get(req_get, "sync_state"))  # type: ignore[arg-type]
             self.assertTrue(res_get["found"])
             self.assertEqual(res_get["value"]["cursor"], 42)
@@ -793,13 +791,8 @@ class TestHubCore(unittest.TestCase):
         self.assertTrue(hasattr(beacon_sdk, "ask"))
         self.assertTrue(hasattr(beacon_sdk, "state"))
 
-        with warnings.catch_warnings(record=True) as w_list:
-            warnings.simplefilter("always", DeprecationWarning)
-            spec = importlib.util.spec_from_file_location("sdk_hub_alias", str(sdk_py_dir / "hub.py"))
-            assert spec is not None and spec.loader is not None
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            self.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in w_list))
+        self.assertFalse((sdk_py_dir / "hub.py").exists())
+        self.assertFalse((sdk_py_dir / "aruta.py").exists())
 
         # 2. Проверяем синхронизацию project.yaml и Dead Man's Switch /api/ping/{ping_token}
         hb = query_one("SELECT * FROM projects WHERE name = 'heartbeat-daemon'")

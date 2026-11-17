@@ -446,7 +446,7 @@ class TestSecurityAndRbac(unittest.TestCase):
     def test_p1_1_start_params_whitelist_reserved_and_order(self) -> None:
         with create_temp_hub():
             # 1. Резервные имена отклоняются is_reserved_param_name
-            for bad_name in ("LD_PRELOAD", "PATH", "BEACON_API_URL", "ARUTA_INTERNAL_TOKEN", "HUB_PORT", "HTTP_PROXY", "PORT", "PYTHONHOME", "NODE_OPTIONS"):
+            for bad_name in ("LD_PRELOAD", "PATH", "BEACON_API_URL", "BEACON_INTERNAL_TOKEN", "BEACON_PORT", "HTTP_PROXY", "PORT", "PYTHONHOME", "NODE_OPTIONS"):
                 self.assertTrue(is_reserved_param_name(bad_name), f"{bad_name} must be reserved")
             self.assertFalse(is_reserved_param_name("TARGET_URL"))
 
@@ -501,13 +501,13 @@ class TestSecurityAndRbac(unittest.TestCase):
         import os
 
         with create_temp_hub() as tmpdir:
-            # 1. init_db очищает ARUTA_ADMIN_PASSWORD / HUB_ADMIN_PASSWORD / BEACON_ADMIN_PASSWORD из os.environ
-            os.environ["ARUTA_ADMIN_PASSWORD"] = "SuperTopSecretBootstrap#1"
+            # 1. init_db очищает BEACON_ADMIN_PASSWORD / BEACON_INIT_PASSWORD из os.environ
+            os.environ["BEACON_INIT_PASSWORD"] = "SuperTopSecretBootstrap#1"
             os.environ["BEACON_ADMIN_PASSWORD"] = "SuperTopSecretBootstrap#2"
             os.environ["OPENAI_API_KEY"] = "sk-panel-host-leak-should-not-pass-123456"
             try:
                 init_db()
-                self.assertNotIn("ARUTA_ADMIN_PASSWORD", os.environ)
+                self.assertNotIn("BEACON_INIT_PASSWORD", os.environ)
                 self.assertNotIn("BEACON_ADMIN_PASSWORD", os.environ)
 
                 proj = make_project("env-iso-proj")
@@ -516,12 +516,10 @@ class TestSecurityAndRbac(unittest.TestCase):
                 # Секреты хоста и internal_token не попадают в окружение ребёнка
                 self.assertNotIn("OPENAI_API_KEY", env_map)
                 self.assertNotIn("BEACON_INTERNAL_TOKEN", env_map)
-                self.assertNotIn("ARUTA_INTERNAL_TOKEN", env_map)
-                self.assertNotIn("HUB_INTERNAL_TOKEN", env_map)
                 self.assertEqual(env_map["BEACON_RUN_TOKEN"], "run_tok_abc")
                 self.assertIn("PATH", env_map)
             finally:
-                os.environ.pop("ARUTA_ADMIN_PASSWORD", None)
+                os.environ.pop("BEACON_INIT_PASSWORD", None)
                 os.environ.pop("BEACON_ADMIN_PASSWORD", None)
                 os.environ.pop("OPENAI_API_KEY", None)
 

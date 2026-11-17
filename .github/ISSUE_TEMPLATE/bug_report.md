@@ -1,30 +1,30 @@
 ---
-name: Сообщение об ошибке / Bug Report
-about: Сообщить о сбое Hub, утечке процессов или проблеме в Android chroot
+name: Bug Report / Сообщение об ошибке
+about: Report a bug in Beacon supervisor, process groups, MCP server, or Web UI
 title: "[BUG] "
 labels: bug
 assignees: ''
 ---
 
-## Окружение / Environment
-- **Устройство и SoC (например, Xiaomi Poco X3 NFC `surya`):**
-- **Версия Android / Прошивка:**
-- **Среда Linux (Ubuntu 24.04 chroot / Linux Deploy / Termux proot):**
-- **Версия ядра (`uname -r`) и Python (`python3 --version`):**
-- **Версия Hub (`git rev-parse --short HEAD`):**
+## Environment / Окружение
+- **Hardware / Platform (e.g., Linux VPS x86_64, Raspberry Pi ARM64, Android chroot):**
+- **OS & Environment (e.g., Debian 12, Ubuntu 24.04 systemd / chroot / Termux):**
+- **Kernel (`uname -r`) & Python (`python3 --version`):**
+- **Beacon Commit (`git rev-parse --short HEAD`):**
 
-## Описание проблемы / Bug Description
-Кратко и чётко опишите, что произошло.
+## Bug Description / Описание проблемы
+Briefly and clearly describe what happened.
 
-## Шаги для воспроизведения / Steps to Reproduce
-1. Перейти в раздел `...`
-2. Запустить проект `...`
-3. Увидеть ошибку `...`
+## Steps to Reproduce / Шаги для воспроизведения
+1. Open tab `...`
+2. Start project `...`
+3. Observe error `...`
 
-## Ожидаемое поведение / Expected Behavior
-Что должно было произойти.
+## Expected Behavior / Ожидаемое поведение
+What should have happened instead.
 
-## Логи и вывод `hub doctor` / Logs
+## Logs & `python3 -m beacon doctor` Output / Логи
 ```text
-Вставьте сюда вывод лога из data/logs/ или вывод команды диагностического отчёта
+Paste relevant logs from data/logs/ or output of `python3 -m beacon doctor`
 ```
+

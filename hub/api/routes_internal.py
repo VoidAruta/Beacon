@@ -30,17 +30,12 @@ _KV_KEY_RE = re.compile(r"^[a-zA-Z0-9_.:-]{1,128}$")
 def _authenticate_sdk_request(request: Request) -> dict[str, Any]:
     """
     Аутентифицирует внутренний запрос SDK строго по одноразовому токену активного запуска
-    (X-Beacon-Token / X-Aruta-Token / X-Hub-Token) в статусе running/waiting_input (P0-4).
+    (X-Beacon-Token) в статусе running/waiting_input (P0-4).
     """
-    token = (
-        request.headers.get("x-beacon-token")
-        or request.headers.get("x-aruta-token")
-        or request.headers.get("x-hub-token")
-        or ""
-    ).strip()
+    token = (request.headers.get("x-beacon-token") or "").strip()
 
     if not token:
-        raise HTTPException(status_code=401, detail="Отсутствует заголовок X-Beacon-Token / X-Hub-Token")
+        raise HTTPException(status_code=401, detail="Отсутствует заголовок X-Beacon-Token")
 
     row = query_one(
         """SELECT r.id AS run_id, r.project_id, r.status,
@@ -51,7 +46,7 @@ def _authenticate_sdk_request(request: Request) -> dict[str, Any]:
         (token,),
     )
     if not row:
-        raise HTTPException(status_code=401, detail="Недействительный X-Beacon-Token / X-Hub-Token")
+        raise HTTPException(status_code=401, detail="Недействительный X-Beacon-Token")
     if row["status"] not in ("running", "waiting_input"):
         raise HTTPException(status_code=403, detail="Токен запуска (X-Beacon-Token) больше не активен (процесс завершён)")
     return row

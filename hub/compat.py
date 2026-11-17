@@ -1,5 +1,5 @@
 """
-Совместимый слой зависимостей для запуска Hub как с установленными пакетами из requirements.txt
+Совместимый слой зависимостей для запуска Beacon как с установленными пакетами из requirements.txt
 (psutil, croniter, httpx), так и напрямую на чистом системном Python 3.10+/3.12 через /proc.
 """
 
@@ -24,7 +24,7 @@ _compat_logger = get_logger("compat")
 try:
     import psutil as psutil  # type: ignore
 except ImportError:
-    _compat_logger.warning("Пакет psutil не установлен; используется встроенная эмуляция через /proc")
+    _compat_logger.debug("Пакет psutil не установлен; используется встроенная эмуляция через /proc")
     pmem = namedtuple("pmem", ["rss", "vms"])
     svmem = namedtuple("svmem", ["total", "available", "percent", "used", "free"])
     sdiskusage = namedtuple("sdiskusage", ["total", "used", "free", "percent"])
@@ -264,7 +264,7 @@ except ImportError:
 try:
     from croniter import croniter as croniter  # type: ignore
 except ImportError:
-    _compat_logger.warning("Пакет croniter не установлен; используется встроенный POSIX-парсер cron")
+    _compat_logger.debug("Пакет croniter не установлен; используется встроенный POSIX-парсер cron")
     class croniter:  # type: ignore
         """Полная реализация 5-польного cron-вычислителя (минута час день месяц день_недели)."""
 
@@ -343,7 +343,7 @@ except ImportError:
 try:
     import httpx as httpx  # type: ignore
 except ImportError:
-    _compat_logger.warning("Пакет httpx не установлен; используется встроенный urllib HTTP-клиент")
+    _compat_logger.debug("Пакет httpx не установлен; используется встроенный urllib HTTP-клиент")
     class _FallbackResponse:
         def __init__(self, status_code: int, text: str, headers: dict[str, str]):
             self.status_code = status_code

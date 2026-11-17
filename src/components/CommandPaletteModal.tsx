@@ -305,7 +305,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
     <div
       role="dialog"
       aria-modal="true"
-      aria-label="Командная палитра Hub"
+      aria-label="Командная палитра Beacon"
       className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-xs flex items-start justify-center pt-16 sm:pt-24 p-4"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
@@ -369,7 +369,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
 
         <div className="px-4 py-2 bg-[#0b0f17] border-t border-slate-800/90 flex items-center justify-between text-[11px] text-slate-400 font-mono">
           <span>↑↓ выбор · Enter выполнить · Esc закрыть</span>
-          <span>Hub Operations Palette</span>
+          <span>Beacon Operations Palette</span>
         </div>
       </div>
     </div>

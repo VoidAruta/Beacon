@@ -1,5 +1,5 @@
 """
-Конфигурация путей, системных настроек по умолчанию и совместимости имён Beacon / Aruta / Hub.
+Конфигурация путей и системных настроек по умолчанию Beacon.
 """
 
 import os
@@ -18,14 +18,11 @@ def validate_project_name(name: str) -> bool:
 
 
 def _detect_default_base_dir() -> str:
-    env_dir = (
-        get_env_var("BEACON_DIR", "HUB_DIR", "", extra_keys=("BEACON_BASE_DIR", "ARUTA_BASE_DIR"))
-    )
+    env_dir = get_env_var("BEACON_DIR", "", extra_keys=("BEACON_BASE_DIR",))
     if env_dir:
         return env_dir
-    for d in ("/opt/beacon", "/opt/aruta", "/opt/hub"):
-        if os.path.exists(d):
-            return d
+    if os.path.exists("/opt/beacon"):
+        return "/opt/beacon"
     return str(Path(__file__).resolve().parent.parent)
 
 
@@ -49,9 +46,9 @@ STATIC_DIR = BASE_DIR / "hub" / "static"
 # Для обратной совместимости импортов (сам список теперь настраивается через настройку reserved_ports)
 FORBIDDEN_PORTS: set[int] = set()
 
-DEFAULT_PORT = int(get_env_var("BEACON_PORT", "HUB_PORT", "8050") or "8050")
+DEFAULT_PORT = int(get_env_var("BEACON_PORT", "8050") or "8050")
 RUNTIME_PORT: int = DEFAULT_PORT
-_RUNTIME_SAFE_MODE: bool = get_env_var("BEACON_SAFE_MODE", "HUB_SAFE_MODE", "0") in ("1", "true", "yes")
+_RUNTIME_SAFE_MODE: bool = get_env_var("BEACON_SAFE_MODE", "0") in ("1", "true", "yes")
 
 
 def set_runtime_port(port: int) -> None:
@@ -75,16 +72,14 @@ def is_runtime_safe_mode() -> bool:
 
 def detect_default_runner_user() -> str:
     """
-    Если в системе создан непривилегированный пользователь beacon-runner (или aruta-runner/hub-runner)
+    Если в системе создан непривилегированный пользователь beacon-runner
     и процесс запущен от root — использует его по умолчанию для новых установок.
     """
-    for candidate in ("beacon-runner", "aruta-runner", "hub-runner"):
-        try:
-            pwd.getpwnam(candidate)
-            return candidate
-        except KeyError:
-            continue
-    return "root"
+    try:
+        pwd.getpwnam("beacon-runner")
+        return "beacon-runner"
+    except KeyError:
+        return "root"
 
 
 _DEFAULT_ALLOWED_SUBNETS = "127.0.0.0/8,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,169.254.0.0/16,::1/128"
@@ -94,12 +89,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "password_hash": "",  # Заполняется при инициализации БД scrypt-хешем пароля 'admin'
     "session_epoch": "1",
     "must_change_password": "0",
-    "allowed_subnets": get_env_var("BEACON_ALLOWED_SUBNETS", "HUB_ALLOWED_SUBNETS", _DEFAULT_ALLOWED_SUBNETS),
+    "allowed_subnets": get_env_var("BEACON_ALLOWED_SUBNETS", _DEFAULT_ALLOWED_SUBNETS),
     "allow_tailscale": "0",
-    "trusted_proxies": get_env_var("BEACON_TRUSTED_PROXIES", "HUB_TRUSTED_PROXIES", ""),
+    "trusted_proxies": get_env_var("BEACON_TRUSTED_PROXIES", ""),
     "reserved_ports": "",
     "cookie_secure": "0",
-    "proxy_url": get_env_var("BEACON_PROXY_URL", "HUB_PROXY_URL", ""),
+    "proxy_url": get_env_var("BEACON_PROXY_URL", ""),
     "run_as_user": detect_default_runner_user(),
     "safe_mode": "0",
     "healthcheck_allow_external": "0",

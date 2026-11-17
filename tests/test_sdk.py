@@ -5,7 +5,7 @@
 - `secret()` с `BEACON_SECRET_TYPE_*` (числовые строки не конвертируются в int, cookie_json парсится, file -> path)
 - Fallback на env-файлы при недоступности панели
 - Немедленное прерывание `ask()` на HTTP 401/403/404
-- `ping()` с BEACON_PING_TOKEN и совместимость обёрток aruta/hub + Node.js SDK smoke test
+- `ping()` с BEACON_PING_TOKEN + Node.js SDK smoke test
 """
 
 import http.server
@@ -263,7 +263,7 @@ class TestBeaconSdk(unittest.TestCase):
             beacon_sdk.ask("SMS code?", timeout=30)
         self.assertEqual(ctx.exception.status_code, 404)
 
-    def test_05_ping_and_legacy_wrappers(self) -> None:
+    def test_05_ping_and_canonical_exports(self) -> None:
         self.assertFalse(beacon_sdk.ping())
         with self.assertRaises(RuntimeError):
             beacon_sdk.ping(strict=True)
@@ -271,21 +271,10 @@ class TestBeaconSdk(unittest.TestCase):
         os.environ["BEACON_PING_TOKEN"] = "valid-ping-tok"
         self.assertTrue(beacon_sdk.ping())
 
-        # Wrappers aruta.py (alias) & hub.py (DeprecationWarning) expose ping/notify
-        for wrapper_name in ("aruta", "hub"):
-            with warnings.catch_warnings(record=True) as w_list:
-                warnings.simplefilter("always", DeprecationWarning)
-                spec = importlib.util.spec_from_file_location(
-                    f"test_wrap_{wrapper_name}",
-                    str(SDK_PY_DIR / f"{wrapper_name}.py"),
-                )
-                assert spec is not None and spec.loader is not None
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                if wrapper_name == "hub":
-                    self.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in w_list))
-                self.assertTrue(hasattr(mod, "ping"))
-                self.assertTrue(callable(mod.notify))
+        # Verify only canonical beacon.py / beacon.js exist in sdk/
+        self.assertTrue((SDK_PY_DIR / "beacon.py").exists())
+        self.assertFalse((SDK_PY_DIR / "aruta.py").exists())
+        self.assertFalse((SDK_PY_DIR / "hub.py").exists())
 
     def test_06_node_sdk_smoke(self) -> None:
         if shutil.which("node") is None:

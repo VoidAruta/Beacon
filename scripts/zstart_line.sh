@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Идемпотентный запуск Beacon для добавления в zstart (Ubuntu chroot на Android)
-BEACON_DIR="${BEACON_DIR:-${ARUTA_DIR:-${HUB_DIR:-/opt/beacon}}}"
-BEACON_PORT="${BEACON_PORT:-${ARUTA_PORT:-${HUB_PORT:-8050}}}"
+# Idempotent Beacon startup helper for non-systemd environments (Ubuntu chroot on Android / containers)
+BEACON_DIR="${BEACON_DIR:-/opt/beacon}"
+BEACON_PORT="${BEACON_PORT:-8050}"
 LOG_FILE="${BEACON_DIR}/data/logs/beacon-daemon.log"
 PID_FILE="${BEACON_DIR}/data/beacon.pid"
 
@@ -14,7 +14,7 @@ if [ -f "${PID_FILE}" ]; then
     fi
 fi
 
-if pgrep -f "python.*-m (beacon|aruta|hub)" >/dev/null 2>&1; then
+if pgrep -f "python.*-m beacon" >/dev/null 2>&1; then
     exit 0
 fi
 

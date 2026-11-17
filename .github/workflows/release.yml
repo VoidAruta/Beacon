@@ -38,7 +38,7 @@ jobs:
       - name: Package standalone release archive (no Node.js required on target host)
         run: |
           mkdir -p dist-release/beacon-server/data
-          cp -r beacon aruta hub sdk scripts projects docs AGENTS.md requirements.txt README.md LICENSE SECURITY.md CONTRIBUTING.md CHANGELOG.md .gitignore dist-release/beacon-server/
+          cp -r beacon hub sdk scripts projects docs AGENTS.md requirements.txt README.md README.ru.md LICENSE SECURITY.md CONTRIBUTING.md CHANGELOG.md .env.example .gitignore dist-release/beacon-server/
           cp data/.gitkeep dist-release/beacon-server/data/
           tar -czf beacon-release.tar.gz -C dist-release beacon-server
 

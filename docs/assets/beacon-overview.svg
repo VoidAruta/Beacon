@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630" role="img" aria-label="Beacon Control Panel Overview">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#050811"/>
+      <stop offset="55%" stop-color="#0b1224"/>
+      <stop offset="100%" stop-color="#071a1e"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="50%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect x="30" y="28" width="1140" height="574" rx="18" fill="#0d1425" stroke="#1e293b" stroke-width="2"/>
+
+  <!-- Top Navbar -->
+  <rect x="30" y="28" width="1140" height="58" rx="18" fill="#111a30"/>
+  <circle cx="62" cy="57" r="7" fill="#ef4444"/>
+  <circle cx="84" cy="57" r="7" fill="#f59e0b"/>
+  <circle cx="106" cy="57" r="7" fill="#10b981"/>
+
+  <text x="140" y="63" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="20" font-weight="700" fill="#f8fafc">BEACON v2.2</text>
+  <text x="295" y="62" font-family="system-ui, -apple-system, sans-serif" font-size="13" fill="#94a3b8">Containerless PaaS • Process Supervisor • Streamable HTTP MCP (/mcp)</text>
+
+  <!-- Language & Self-Update Badges -->
+  <rect x="865" y="42" width="76" height="30" rx="8" fill="#1e293b" stroke="#334155"/>
+  <text x="903" y="61" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12" font-weight="700" fill="#38bdf8">RU | EN</text>
+
+  <rect x="952" y="42" width="196" height="30" rx="8" fill="#064e3b" stroke="#10b981"/>
+  <text x="1050" y="61" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12" font-weight="700" fill="#34d399">v2.2 • 2-Click Git Update</text>
+
+  <!-- Left Navigation Tabs -->
+  <g transform="translate(52, 108)" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600">
+    <rect x="0" y="0" width="215" height="38" rx="8" fill="#1e1b4b" stroke="#6366f1"/>
+    <text x="16" y="24" fill="#c7d2fe">1. Dashboard &amp; Registries</text>
+
+    <rect x="0" y="48" width="215" height="38" rx="8" fill="#111827" stroke="#1f2937"/>
+    <text x="16" y="72" fill="#e2e8f0">2. Projects &amp; Live Console</text>
+
+    <rect x="0" y="96" width="215" height="38" rx="8" fill="#111827" stroke="#1f2937"/>
+    <text x="16" y="120" fill="#e2e8f0">3. Web Sessions &amp; Secrets</text>
+
+    <rect x="0" y="144" width="215" height="38" rx="8" fill="#111827" stroke="#1f2937"/>
+    <text x="16" y="168" fill="#e2e8f0">4. AI / MCP Access (/mcp)</text>
+
+    <rect x="0" y="192" width="215" height="38" rx="8" fill="#111827" stroke="#1f2937"/>
+    <text x="16" y="216" fill="#e2e8f0">5. Settings, Backup &amp; RBAC</text>
+
+    <rect x="0" y="240" width="215" height="38" rx="8" fill="#111827" stroke="#1f2937"/>
+    <text x="16" y="264" fill="#e2e8f0">6. System Doctor &amp; Audit</text>
+
+    <rect x="0" y="288" width="215" height="38" rx="8" fill="#111827" stroke="#1f2937"/>
+    <text x="16" y="312" fill="#e2e8f0">7. SDK &amp; Documentation</text>
+  </g>
+
+  <!-- Main Workspace Cards -->
+  <g transform="translate(290, 108)">
+    <!-- Telemetry Bar -->
+    <rect x="0" y="0" width="855" height="82" rx="12" fill="#111827" stroke="#1e293b"/>
+    <text x="22" y="28" font-family="ui-monospace, monospace" font-size="12" fill="#94a3b8">SUPERVISOR FOOTPRINT</text>
+    <text x="22" y="56" font-family="ui-monospace, monospace" font-size="22" font-weight="700" fill="#34d399">38.4 MB RSS (&lt; 80 MB budget)</text>
+
+    <text x="345" y="28" font-family="ui-monospace, monospace" font-size="12" fill="#94a3b8">ISOLATION INVARIANTS</text>
+    <text x="345" y="56" font-family="ui-monospace, monospace" font-size="16" font-weight="700" fill="#38bdf8">PGID setsid/killpg • Direct FD Logs (No SIGPIPE)</text>
+
+    <!-- 3 Workload Class Cards -->
+    <rect x="0" y="102" width="272" height="175" rx="12" fill="#111827" stroke="#10b981"/>
+    <text x="20" y="132" font-family="ui-monospace, monospace" font-size="13" font-weight="700" fill="#34d399">SERVICE (24/7 Daemons)</text>
+    <text x="20" y="158" font-family="system-ui, sans-serif" font-size="13" fill="#e2e8f0">• Telegram / Discord Bots</text>
+    <text x="20" y="182" font-family="system-ui, sans-serif" font-size="13" fill="#e2e8f0">• Crash-loop backoff protection</text>
+    <text x="20" y="206" font-family="system-ui, sans-serif" font-size="13" fill="#e2e8f0">• PGID RSS memory enforcement</text>
+    <text x="20" y="230" font-family="system-ui, sans-serif" font-size="13" fill="#e2e8f0">• Survives Beacon self-restart</text>
+
+    <rect x="291" y="102" width="272" height="175" rx="12" fill="#111827" stroke="#38bdf8"/>
+    <text x="311" y="132" font-family="ui-monospace, monospace" font-size="13" font-weight="700" fill="#38bdf8">WEB / API ($PORT + Health)</text>
+    <text x="311" y="158" font-family="system-ui, sans-serif" font-size="13" fill="#e2e8f0">• FastAPI / Express / Go APIs</text>
+    <text x="311" y="182" font-family="system-ui, sans-serif" font-size="13" fill="#e2e8f0">• Pre-launch port conflict check</text>
+    <text x="311" y="206" font-family="system-ui, sans-serif" font-size="13" fill="#e2e8f0">• Active HTTP /health &amp; TCP probes</text>
+    <text x="311" y="230" font-family="system-ui, sans-serif" font-size="13" fill="#e2e8f0">• Auto-restart on 3 probe failures</text>
+
+    <rect x="582" y="102" width="273" height="175" rx="12" fill="#111827" stroke="#a855f7"/>
+    <text x="602" y="132" font-family="ui-monospace, monospace" font-size="13" font-weight="700" fill="#c084fc">JOB (Cron / Webhook / Chain)</text>
+    <text x="602" y="158" font-family="system-ui, sans-serif" font-size="13" fill="#e2e8f0">• Interval, Cron &amp; Daily HH:MM</text>
+    <text x="602" y="206" font-family="system-ui, sans-serif" font-size="13" fill="#e2e8f0">• Dead Man's Switch (beacon.ping)</text>
+    <text x="602" y="182" font-family="system-ui, sans-serif" font-size="13" fill="#e2e8f0">• HMAC-SHA256 Webhook triggers</text>
+    <text x="602" y="230" font-family="system-ui, sans-serif" font-size="13" fill="#e2e8f0">• Chaining (on_success_project_id)</text>
+
+    <!-- Built-in SDK & MCP Bottom Panel -->
+    <rect x="0" y="297" width="855" height="176" rx="12" fill="#090e1a" stroke="#334155"/>
+    <rect x="0" y="297" width="855" height="4" fill="url(#accent)"/>
+    <text x="22" y="328" font-family="ui-monospace, monospace" font-size="13" font-weight="700" fill="#a5b4fc">ZERO-INSTALL SDK (Python &amp; Node.js) + 2-CLICK SERVER MIGRATION</text>
+    <text x="22" y="358" font-family="ui-monospace, monospace" font-size="13" fill="#e2e8f0">import beacon  # or const beacon = require('beacon')</text>
+    <text x="22" y="384" font-family="ui-monospace, monospace" font-size="13" fill="#34d399">beacon.notify("Ready") • beacon.secret("API_KEY") • beacon.ask("Enter 2FA:") • beacon.state.set("cursor", 42)</text>
+    <text x="22" y="416" font-family="ui-monospace, monospace" font-size="13" fill="#38bdf8">MCP Server: http://&lt;server&gt;:8050/mcp (18 tools, unified diff approval queue, secret redaction)</text>
+    <text x="22" y="446" font-family="ui-monospace, monospace" font-size="13" fill="#fcd34d">Backup &amp; Restore: Download .zip on old server -&gt; Upload .zip in Settings on new server</text>
+  </g>
+</svg>

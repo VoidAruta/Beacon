@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS secrets (
     updated_at INTEGER NOT NULL
 );
 
--- 5. Интерактивные запросы hub.ask() / aruta.ask()
+-- 5. Интерактивные запросы beacon.ask()
 CREATE TABLE IF NOT EXISTS pending_asks (
     id TEXT PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -157,7 +157,7 @@ CREATE TABLE IF NOT EXISTS revoked_sessions (
     exp INTEGER NOT NULL
 );
 
--- 8. Персистентное Key-Value хранилище состояния проектов (aruta.state / hub.state)
+-- 8. Персистентное Key-Value хранилище состояния проектов (beacon.state)
 CREATE TABLE IF NOT EXISTS project_kv (
     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     key TEXT NOT NULL,
@@ -584,17 +584,13 @@ def init_db() -> None:
     ensure_directories()
     EXAMPLES_DIR.mkdir(parents=True, exist_ok=True)
     default_pw = (
-        get_env_var("BEACON_ADMIN_PASSWORD", "HUB_ADMIN_PASSWORD", "")
-        or get_env_var("BEACON_INIT_PASSWORD", "HUB_INIT_PASSWORD", "")
+        get_env_var("BEACON_ADMIN_PASSWORD", "")
+        or get_env_var("BEACON_INIT_PASSWORD", "")
         or "admin"
     )
     for _pw_env_key in (
         "BEACON_ADMIN_PASSWORD",
-        "ARUTA_ADMIN_PASSWORD",
-        "HUB_ADMIN_PASSWORD",
         "BEACON_INIT_PASSWORD",
-        "ARUTA_INIT_PASSWORD",
-        "HUB_INIT_PASSWORD",
     ):
         os.environ.pop(_pw_env_key, None)
 

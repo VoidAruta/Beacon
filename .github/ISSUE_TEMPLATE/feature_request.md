@@ -1,16 +1,17 @@
 ---
-name: Предложение функции / Feature Request
-about: Предложить улучшение для автономного Android-сервера или панели Hub
+name: Feature Request / Предложение функции
+about: Suggest an enhancement for Beacon supervisor, SDK, MCP server, or Web UI
 title: "[FEAT] "
 labels: enhancement
 assignees: ''
 ---
 
-## Какую задачу решает функция? / Problem Statement
-Опишите сценарий использования на домашнем Android-сервере (например: контроль температуры батареи, новый метод в `hub_sdk`, триггер расписания).
+## Problem Statement / Какую задачу решает функция?
+Describe the use case on your server (e.g., process supervision, new method in `beacon` SDK, schedule trigger, or MCP tool).
 
-## Предлагаемое решение / Proposed Solution
-Как именно это должно работать в веб-панели или через API / SDK?
+## Proposed Solution / Предлагаемое решение
+How should this work in the Web UI, CLI, or via the API / SDK?
 
-## Влияние на потребление ресурсов / Resource Impact
-Потребует ли эта функция фонового опроса, новых зависимостей в `requirements.txt` или дополнительного расхода ОЗУ/батареи?
+## Resource Impact / Влияние на потребление ресурсов
+Will this feature require background polling, new dependencies in `requirements.txt`, or extra RAM overhead (idle budget is `< 80 MB`)?
+

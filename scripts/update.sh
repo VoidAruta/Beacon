@@ -16,7 +16,7 @@ for arg in "$@"; do
 done
 
 BEACON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BEACON_PORT="${BEACON_PORT:-${ARUTA_PORT:-${HUB_PORT:-8050}}}"
+BEACON_PORT="${BEACON_PORT:-8050}"
 cd "$BEACON_DIR"
 
 echo "================================================================"
@@ -93,10 +93,6 @@ if [ "$USE_SYSTEMD" -eq 1 ]; then
     sudo systemctl daemon-reload || true
     if systemctl list-unit-files | grep -q "^beacon\.service"; then
         sudo systemctl restart beacon.service
-    elif systemctl list-unit-files | grep -q "^aruta\.service"; then
-        sudo systemctl restart aruta.service
-    elif systemctl list-unit-files | grep -q "^hub\.service"; then
-        sudo systemctl restart hub.service
     else
         echo "[*] Systemd-юнит не установлен, пробуем локальный перезапуск..."
         USE_SYSTEMD=0
@@ -117,7 +113,7 @@ if [ "$USE_SYSTEMD" -eq 0 ]; then
             kill -0 "$OLD_PID" 2>/dev/null && kill -KILL "$OLD_PID" 2>/dev/null || true
         fi
     else
-        pkill -TERM -f "python.*-m (beacon|aruta|hub)" 2>/dev/null || true
+        pkill -TERM -f "python.*-m beacon" 2>/dev/null || true
         sleep 2
     fi
 

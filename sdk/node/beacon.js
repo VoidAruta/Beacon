@@ -20,15 +20,9 @@ class BeaconApiError extends Error {
 function getApiConfig() {
   const apiUrl = (
     process.env.BEACON_API_URL ||
-    process.env.ARUTA_API_URL ||
-    process.env.HUB_API_URL ||
     'http://127.0.0.1:8050/internal'
   ).replace(/\/+$/, '');
-  const runToken =
-    process.env.BEACON_RUN_TOKEN ||
-    process.env.ARUTA_RUN_TOKEN ||
-    process.env.HUB_RUN_TOKEN ||
-    '';
+  const runToken = process.env.BEACON_RUN_TOKEN || '';
   return { apiUrl, runToken };
 }
 
@@ -115,8 +109,6 @@ async function requestJson(method, path, payload = null, timeoutMs = 15000, maxA
   const targetUrl = `${apiUrl}/${path.replace(/^\/+/, '')}`;
   const headers = {
     'X-Beacon-Token': runToken,
-    'X-Aruta-Token': runToken,
-    'X-Hub-Token': runToken,
     Accept: 'application/json',
   };
   return requestRawUrl(method, targetUrl, headers, payload, timeoutMs, maxAttempts);
@@ -153,16 +145,8 @@ async function secret(name, { asPath = false } = {}) {
     if (res.type === 'file') return res.file_path;
     return res.value === undefined || res.value === null ? res.value : String(res.value);
   } catch (err) {
-    const envFile =
-      process.env[`BEACON_SECRET_FILE_${name}`] ||
-      process.env[`ARUTA_SECRET_FILE_${name}`] ||
-      process.env[`HUB_SECRET_FILE_${name}`];
-    const secType = (
-      process.env[`BEACON_SECRET_TYPE_${name}`] ||
-      process.env[`ARUTA_SECRET_TYPE_${name}`] ||
-      process.env[`HUB_SECRET_TYPE_${name}`] ||
-      'text'
-    ).trim().toLowerCase();
+    const envFile = process.env[`BEACON_SECRET_FILE_${name}`];
+    const secType = (process.env[`BEACON_SECRET_TYPE_${name}`] || 'text').trim().toLowerCase();
     if (asPath && envFile) return envFile;
     if (envFile && fs.existsSync(envFile)) {
       if (secType === 'file') return envFile;

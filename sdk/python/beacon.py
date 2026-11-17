@@ -32,16 +32,9 @@ class BeaconApiError(RuntimeError):
 def _get_api_config() -> tuple[str, str]:
     api_url = (
         os.environ.get("BEACON_API_URL")
-        or os.environ.get("ARUTA_API_URL")
-        or os.environ.get("HUB_API_URL")
         or "http://127.0.0.1:8050/internal"
     ).rstrip("/")
-    run_token = (
-        os.environ.get("BEACON_RUN_TOKEN")
-        or os.environ.get("ARUTA_RUN_TOKEN")
-        or os.environ.get("HUB_RUN_TOKEN")
-        or ""
-    )
+    run_token = os.environ.get("BEACON_RUN_TOKEN") or ""
     return api_url, run_token
 
 
@@ -104,8 +97,6 @@ def _request_json(
     url = f"{api_url}/{path.lstrip('/')}"
     headers = {
         "X-Beacon-Token": run_token,
-        "X-Aruta-Token": run_token,
-        "X-Hub-Token": run_token,
         "Accept": "application/json",
     }
     return _request_raw_url(method, url, payload=payload, headers=headers, timeout=timeout, max_attempts=max_attempts)
@@ -157,17 +148,8 @@ def secret(name: str, as_path: bool = False) -> Any:
 
         return val if val is None or isinstance(val, str) else str(val)
     except Exception:
-        env_file = (
-            os.environ.get(f"BEACON_SECRET_FILE_{name}")
-            or os.environ.get(f"ARUTA_SECRET_FILE_{name}")
-            or os.environ.get(f"HUB_SECRET_FILE_{name}")
-        )
-        sec_type = (
-            os.environ.get(f"BEACON_SECRET_TYPE_{name}")
-            or os.environ.get(f"ARUTA_SECRET_TYPE_{name}")
-            or os.environ.get(f"HUB_SECRET_TYPE_{name}")
-            or "text"
-        ).strip().lower()
+        env_file = os.environ.get(f"BEACON_SECRET_FILE_{name}")
+        sec_type = (os.environ.get(f"BEACON_SECRET_TYPE_{name}") or "text").strip().lower()
         if as_path and env_file:
             return env_file
         if env_file and os.path.exists(env_file):

@@ -88,7 +88,7 @@ def get_internal_token() -> str:
         return _INTERNAL_TOKEN
 
     ensure_directories()
-    env_tok = get_env_var("BEACON_INTERNAL_TOKEN", "HUB_INTERNAL_TOKEN", "")
+    env_tok = get_env_var("BEACON_INTERNAL_TOKEN", "")
     if env_tok and len(env_tok) >= 16:
         _INTERNAL_TOKEN = env_tok
         return _INTERNAL_TOKEN
