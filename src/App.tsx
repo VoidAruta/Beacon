@@ -159,7 +159,38 @@ export function App() {
   const [loginPassword, setLoginPassword] = useState<string>('admin');
   const [loginError, setLoginError] = useState<string>('');
 
-  const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
+  const [activeTab, setActiveTabState] = useState<NavTab>(() => {
+    try {
+      const saved = sessionStorage.getItem('beacon_active_tab') as NavTab | null;
+      if (saved && saved in TAB_META) return saved;
+    } catch {
+      // ignore
+    }
+    return 'dashboard';
+  });
+  const setActiveTab = useCallback((nextTab: NavTab) => {
+    setActiveTabState(nextTab);
+    try {
+      sessionStorage.setItem('beacon_active_tab', nextTab);
+    } catch {
+      // ignore
+    }
+  }, []);
+  const [sysBannersCollapsed, setSysBannersCollapsed] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem('beacon_sys_banners_collapsed') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const toggleSysBanners = useCallback((collapsed: boolean) => {
+    setSysBannersCollapsed(collapsed);
+    try {
+      sessionStorage.setItem('beacon_sys_banners_collapsed', collapsed ? '1' : '0');
+    } catch {
+      // ignore
+    }
+  }, []);
   const [workspaceSubTab, setWorkspaceSubTab] = useState<WorkspaceSubTab>('editor');
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [projects, setProjects] = useState<ProjectItem[]>([]);
@@ -736,18 +767,54 @@ export function App() {
 
   return (
     <div className="min-h-screen lg:h-screen lg:overflow-hidden bg-[#0b0f17] text-slate-100 flex flex-col pb-16 lg:pb-0">
+      {/* Свёрнутая компактная полоска системных предупреждений (если пользователь свернул баннеры) */}
+      {sysBannersCollapsed && (isDefaultPassword || dashboard?.system?.run_as_user === 'root') && (
+        <div className="bg-[#111622] border-b border-slate-800 px-4 py-1 text-[11px] text-slate-300 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-3 flex-wrap">
+            {isDefaultPassword && (
+              <span className="inline-flex items-center gap-1 text-amber-300">
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
+                Стандартный пароль «admin»
+              </span>
+            )}
+            {dashboard?.system?.run_as_user === 'root' && (
+              <span className="inline-flex items-center gap-1 text-rose-300">
+                <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />
+                Запуск процессов от root
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => setActiveTab('settings')}
+              className="text-indigo-300 hover:text-white underline cursor-pointer"
+            >
+              Настроить безопасность
+            </button>
+            <button
+              type="button"
+              onClick={() => toggleSysBanners(false)}
+              className="text-slate-400 hover:text-white cursor-pointer"
+            >
+              Развернуть
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Постоянный жёлтый баннер при использовании пароля по умолчанию 'admin' (Фаза A.1(в)) */}
-      {isDefaultPassword && (
+      {!sysBannersCollapsed && isDefaultPassword && (
         <div
           role="region"
           aria-label="Предупреждение о пароле по умолчанию"
-          className="bg-amber-950/90 border-b border-amber-500/50 px-4 py-2.5"
+          className="bg-amber-950/90 border-b border-amber-500/50 px-4 py-2"
         >
           <form
             onSubmit={handleQuickChangeDefaultPassword}
-            className="max-w-[1440px] mx-auto flex flex-wrap items-center justify-between gap-3"
+            className="max-w-[1440px] mx-auto flex flex-wrap items-center justify-between gap-2"
           >
-            <div className="flex items-center gap-2.5 text-xs text-amber-100">
+            <div className="flex items-center gap-2 text-xs text-amber-100">
               <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
               <span>
                 <strong className="text-amber-300">Внимание: используется стандартный пароль «admin»!</strong> Вход
@@ -772,9 +839,17 @@ export function App() {
               <button
                 type="button"
                 onClick={() => setActiveTab('settings')}
-                className="px-2.5 py-1 text-xs text-amber-300 hover:text-white underline cursor-pointer"
+                className="px-2 py-1 text-xs text-amber-300 hover:text-white underline cursor-pointer"
               >
                 В Настройки
+              </button>
+              <button
+                type="button"
+                onClick={() => toggleSysBanners(true)}
+                className="px-2 py-1 text-[11px] text-amber-200/80 hover:text-white bg-amber-900/40 rounded cursor-pointer"
+                title="Свернуть системные баннеры в тонкую полоску"
+              >
+                Свернуть
               </button>
             </div>
             {quickPwMsg && <div className="w-full text-xs text-rose-300 font-medium">{quickPwMsg}</div>}
@@ -803,11 +878,11 @@ export function App() {
       )}
 
       {/* Красный баннер при запуске проектов от имени root */}
-      {dashboard?.system?.run_as_user === 'root' && (
+      {!sysBannersCollapsed && dashboard?.system?.run_as_user === 'root' && (
         <div
           role="region"
           aria-label="Предупреждение о запуске проектов от root"
-          className="bg-red-950/90 border-b border-red-500/50 px-4 py-2 text-xs text-red-100"
+          className="bg-red-950/90 border-b border-red-500/50 px-4 py-1.5 text-xs text-red-100"
         >
           <div className="max-w-[1440px] mx-auto flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
@@ -820,13 +895,23 @@ export function App() {
                 и выберите его в Настройках.
               </span>
             </div>
-            <button
-              type="button"
-              onClick={() => setActiveTab('settings')}
-              className="text-red-200 hover:text-white underline cursor-pointer shrink-0"
-            >
-              Переключить в Настройках
-            </button>
+            <div className="flex items-center gap-3 shrink-0">
+              <button
+                type="button"
+                onClick={() => setActiveTab('settings')}
+                className="text-red-200 hover:text-white underline cursor-pointer"
+              >
+                Переключить в Настройках
+              </button>
+              <button
+                type="button"
+                onClick={() => toggleSysBanners(true)}
+                className="px-2 py-0.5 text-[11px] text-red-200/80 hover:text-white bg-red-900/40 rounded cursor-pointer"
+                title="Свернуть системные баннеры в тонкую полоску"
+              >
+                Свернуть
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -131,10 +131,10 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
 }) => {
   const [subTab, setSubTab] = useState<WorkspaceSubTab>(initialSubTab);
 
-  // Адаптивная компоновка рабочей области (экономия места на экране)
+  // Адаптивная компоновка рабочей области (экономия места на экране: консоль логов сбоку по умолчанию)
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false);
   const [explorerCollapsed, setExplorerCollapsed] = useState<boolean>(false);
-  const [splitConsoleMode, setSplitConsoleMode] = useState<boolean>(false);
+  const [splitConsoleMode, setSplitConsoleMode] = useState<boolean>(true);
   const [editorHeightMode, setEditorHeightMode] = useState<'normal' | 'tall' | 'fullscreen'>('normal');
   const [goToLineInput, setGoToLineInput] = useState<string>('');
 
@@ -2746,17 +2746,17 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                 }`}
               >
                 <div className="px-3.5 py-2 bg-[#0b0f17] border-b border-[#1e2638] flex flex-wrap items-center justify-between gap-2 shrink-0">
-                  <div className="flex items-center gap-1">
+                  <div className="flex items-center gap-1 flex-wrap">
                     <button
                       type="button"
                       onClick={() => setBottomConsoleTab('logs')}
-                      className={`px-2.5 py-1 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer ${
+                      className={`px-2 py-1 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0 ${
                         bottomConsoleTab === 'logs'
                           ? 'bg-indigo-600 text-white'
                           : 'text-slate-400 hover:text-white hover:bg-[#111622]'
                       }`}
                     >
-                      <Terminal className="w-3.5 h-3.5" />
+                      <Terminal className="w-3.5 h-3.5 shrink-0" />
                       Живой лог
                     </button>
 
@@ -2766,26 +2766,26 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                         setBottomConsoleTab('kv');
                         loadProjectKv(activeProj.id);
                       }}
-                      className={`px-2.5 py-1 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer ${
+                      className={`px-2 py-1 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0 ${
                         bottomConsoleTab === 'kv'
                           ? 'bg-indigo-600 text-white'
                           : 'text-slate-400 hover:text-white hover:bg-[#111622]'
                       }`}
                     >
-                      <Database className="w-3.5 h-3.5" />
+                      <Database className="w-3.5 h-3.5 shrink-0" />
                       state ({kvItems.length})
                     </button>
 
                     <button
                       type="button"
                       onClick={() => setBottomConsoleTab('shell')}
-                      className={`px-2.5 py-1 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer ${
+                      className={`px-2 py-1 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0 ${
                         bottomConsoleTab === 'shell'
                           ? 'bg-indigo-600 text-white'
                           : 'text-slate-400 hover:text-white hover:bg-[#111622]'
                       }`}
                     >
-                      <Package className="w-3.5 h-3.5" />
+                      <Package className="w-3.5 h-3.5 shrink-0" />
                       Shell
                     </button>
                   </div>
@@ -3266,7 +3266,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                     ? 'flex-1 min-h-0'
                     : editorHeightMode === 'tall'
                     ? 'h-[660px]'
-                    : 'h-[470px]';
+                    : 'h-[430px]';
 
                 return (
                   <div
@@ -3327,22 +3327,22 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                           }`}
                         >
                           <div className="space-y-2 flex flex-col flex-1 min-h-0">
-                            <div className="flex items-center justify-between gap-1.5">
-                              <span className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5 whitespace-nowrap">
+                            <div className="flex items-center justify-between gap-1">
+                              <span className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5 whitespace-nowrap shrink-0">
                                 <FolderCode className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
                                 Проводник
                               </span>
-                              <div className="flex items-center gap-1.5">
+                              <div className="flex items-center gap-1 shrink-0">
                                 <button
                                   type="button"
                                   onClick={() => setFuzzyFinderOpen(true)}
-                                  className="px-1.5 py-0.5 text-[10px] font-mono text-indigo-300 hover:text-white bg-[#111622] border border-[#1e2638] rounded cursor-pointer"
+                                  className="px-1.5 py-0.5 text-[10px] font-mono text-indigo-300 hover:text-white bg-[#111622] border border-[#1e2638] rounded cursor-pointer whitespace-nowrap shrink-0"
                                   title="Быстрый переход к файлу по имени (Alt+P или Ctrl+P)"
                                 >
                                   Alt+P
                                 </button>
-                                <span className="text-[10px] font-mono text-slate-400">
-                                  {files.filter((f) => !f.is_dir).length} ф. / {files.filter((f) => f.is_dir).length} п.
+                                <span className="text-[10px] font-mono text-slate-400 whitespace-nowrap shrink-0">
+                                  {files.filter((f) => !f.is_dir).length}ф/{files.filter((f) => f.is_dir).length}п
                                 </span>
                               </div>
                               <input
@@ -3823,11 +3823,11 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                                 type="button"
                                 onClick={() => handleSaveFile()}
                                 disabled={!activeFilePath || savingFileBusy}
-                                className="px-3 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                                className="px-2.5 py-1 text-[11px] font-semibold text-white bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 rounded-lg inline-flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
                                 title="Сохранить файл на диск (Ctrl+S)"
                               >
-                                <Save className="w-3.5 h-3.5" />
-                                {savingFileBusy ? 'Сохранение...' : LABELS.saveFileBtn}
+                                <Save className="w-3.5 h-3.5 shrink-0" />
+                                {savingFileBusy ? 'Сохр...' : LABELS.saveFileBtn}
                               </button>
 
                               {isProjectCurrentlyRunning && activeFilePath && (
@@ -3835,10 +3835,10 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                                   type="button"
                                   onClick={() => handleSaveFile(undefined, undefined, true)}
                                   disabled={savingFileBusy || Boolean(procActionBusy)}
-                                  className="px-2.5 py-1.5 text-xs font-semibold text-amber-200 bg-amber-950/60 hover:bg-amber-900/70 border border-amber-700/60 disabled:opacity-40 rounded-lg inline-flex items-center gap-1 cursor-pointer"
+                                  className="px-2 py-1 text-[11px] font-semibold text-amber-200 bg-amber-950/60 hover:bg-amber-900/70 border border-amber-700/60 disabled:opacity-40 rounded-lg inline-flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
                                   title="Сохранить файл и сразу перезапустить работающий процесс (Ctrl+Shift+S)"
                                 >
-                                  <RotateCcw className="w-3.5 h-3.5 text-amber-300" />
+                                  <RotateCcw className="w-3.5 h-3.5 text-amber-300 shrink-0" />
                                   <span>+ Рестарт</span>
                                 </button>
                               )}

@@ -109,9 +109,9 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       {
         id: 'nav-dashboard',
         group: 'Навигация',
-        title: 'Перейти: Дашборд, Сеть и Реестр проектов',
+        title: 'Перейти: Дашборд, Сеть и Реестр проектов (Alt+1)',
         subtitle: 'Метрики CPU/RAM/Диска, сетевая статистика RX/TX и управление процессами',
-        keywords: 'dashboard overview network дашборд обзор сеть главная',
+        keywords: 'dashboard overview network alt+1 дашборд обзор сеть главная',
         icon: <LayoutDashboard className="w-4 h-4 text-slate-300" />,
         action: () => {
           onNavigateTab('dashboard');
@@ -121,9 +121,9 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       {
         id: 'nav-projects',
         group: 'Навигация',
-        title: 'Перейти: Проекты и Консоль (Projects Workspace)',
-        subtitle: 'Редактор кода, файловый менеджер, превью сайтов, расписание и живые логи',
-        keywords: 'projects workspace code logs terminal код логи терминал',
+        title: 'Перейти: Проекты и Консоль — IDE & Логи (Alt+2)',
+        subtitle: 'Редактор кода с подсветкой, файловый менеджер, расписание и живые логи сбоку',
+        keywords: 'projects workspace code logs terminal alt+2 код логи терминал',
         icon: <FolderCode className="w-4 h-4 text-slate-300" />,
         action: () => {
           onNavigateTab('projects');
@@ -133,9 +133,9 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       {
         id: 'nav-secrets',
         group: 'Навигация',
-        title: 'Перейти: Куки и Секреты (0600)',
+        title: 'Перейти: Куки и Секреты 0600 (Alt+3)',
         subtitle: 'Импорт Cookie-Editor JSON, API-ключи и привязка секретов к проектам',
-        keywords: 'secrets cookies ask events куки секреты токены',
+        keywords: 'secrets cookies ask events alt+3 куки секреты токены',
         icon: <KeyRound className="w-4 h-4 text-slate-300" />,
         action: () => {
           onNavigateTab('secrets');
@@ -145,9 +145,9 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       {
         id: 'nav-ai-access',
         group: 'Навигация',
-        title: 'Перейти: Доступ ИИ (MCP и /api/v1/)',
+        title: 'Перейти: Доступ ИИ — MCP и /api/v1/ (Alt+4)',
         subtitle: 'Токены для Claude Code / Cursor, очередь подтверждений и аудит ИИ',
-        keywords: 'ai mcp claude cursor токены ии агент',
+        keywords: 'ai mcp claude cursor alt+4 токены ии агент',
         icon: <Bot className="w-4 h-4 text-slate-300" />,
         action: () => {
           onNavigateTab('ai_access');
@@ -157,9 +157,9 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       {
         id: 'nav-settings',
         group: 'Навигация',
-        title: 'Перейти: Настройки Панели, Пароль, RBAC и Бэкап',
+        title: 'Перейти: Настройки Панели, Пароль, RBAC и Бэкап (Alt+5)',
         subtitle: 'Смена пароля администратора, фильтр подсетей, системный Telegram-бот и бэкап',
-        keywords: 'settings password backup rbac настройки пароль прокси бэкап',
+        keywords: 'settings password backup rbac alt+5 настройки пароль прокси бэкап',
         icon: <Settings className="w-4 h-4 text-slate-300" />,
         action: () => {
           onNavigateTab('settings');
@@ -169,9 +169,9 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       {
         id: 'nav-acceptance',
         group: 'Навигация',
-        title: 'Перейти: Полигон приёмки и Beacon Doctor',
+        title: 'Перейти: Полигон приёмки и Beacon Doctor (Alt+6)',
         subtitle: 'Автоматический прогон приёмочных проверок и диагностика окружения',
-        keywords: 'acceptance tests doctor тесты приёмка диагностика',
+        keywords: 'acceptance tests doctor alt+6 тесты приёмка диагностика',
         icon: <FlaskConical className="w-4 h-4 text-slate-300" />,
         action: () => {
           onNavigateTab('acceptance');
@@ -181,9 +181,9 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
       {
         id: 'nav-docs',
         group: 'Навигация',
-        title: 'Перейти: Документация и Справочник Beacon',
-        subtitle: 'Подробное руководство по панели, встроенному SDK (import beacon), кукам и MCP с поиском',
-        keywords: 'docs documentation help sdk документация справка руководство',
+        title: 'Перейти: Документация и Справочник Beacon (Alt+7)',
+        subtitle: 'Подробное руководство по панели, встроенному SDK (import beacon), горячим клавишам и MCP',
+        keywords: 'docs documentation help sdk alt+7 документация справка руководство',
         icon: <BookOpen className="w-4 h-4 text-indigo-400" />,
         action: () => {
           onNavigateTab('docs');

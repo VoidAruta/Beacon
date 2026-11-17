@@ -4,7 +4,7 @@
   "version": "2.2.0",
   "type": "module",
   "scripts": {
-    "dev": "(test -f hub/static/index.html || vite build --outDir hub/static --emptyOutDir) && BEACON_PREVIEW_MODE=1 python3 -m beacon --port 3000",
+    "dev": "vite build --outDir hub/static --emptyOutDir && BEACON_PREVIEW_MODE=1 python3 -m beacon --port 3000",
     "start": "BEACON_PREVIEW_MODE=1 python3 -m beacon --port 3000",
     "build": "vite build --outDir hub/static --emptyOutDir",
     "build:static": "vite build --outDir hub/static --emptyOutDir",

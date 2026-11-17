@@ -89,8 +89,12 @@ def _attach_security_headers(response: Any, path: str = "", is_https: bool = Fal
     headers_to_apply = dict(_SECURITY_HEADERS)
     if os.environ.get("BEACON_PREVIEW_MODE") != "1":
         headers_to_apply["X-Frame-Options"] = "DENY"
-    if path.startswith("/api/"):
-        headers_to_apply["Cache-Control"] = "no-store"
+    if (
+        path.startswith("/api/")
+        or path in ("/", "/index.html")
+        or os.environ.get("BEACON_PREVIEW_MODE") == "1"
+    ):
+        headers_to_apply["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     if is_https:
         headers_to_apply["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
 
