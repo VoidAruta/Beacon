@@ -1235,6 +1235,31 @@ async def api_dashboard(request: Request) -> dict[str, Any]:
 # ==============================================================================
 # 3. ПРОЕКТЫ (Jobs, Services, Web) + Фаза D
 # ==============================================================================
+def _validate_project_port(port: int, exclude_project_id: int = 0) -> None:
+    if port <= 0:
+        return
+    if port < 1024 or port > 65535:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Порт {port} недопустим: используйте непривилегированный порт в диапазоне 1024..65535",
+        )
+    reserved = parse_reserved_ports(get_setting("reserved_ports", ""))
+    if port in reserved:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Порт {port} указан в списке зарезервированных портов (reserved_ports)",
+        )
+    conflict = query_one(
+        "SELECT name FROM projects WHERE port = ? AND id != ?",
+        (port, exclude_project_id),
+    )
+    if conflict:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Порт {port} уже закреплён за проектом «{conflict['name']}»",
+        )
+
+
 @router.get("/projects")
 async def api_list_projects(request: Request) -> list[dict[str, Any]]:
     mask_sensitive = _session_role(request) != "admin"
@@ -1657,9 +1682,14 @@ async def api_start_project(request: Request, project_id: int) -> dict[str, Any]
                 raise HTTPException(status_code=400, detail=f"Недопустимое значение параметра '{raw_k}' (макс. 4096 символов, без NUL)")
             extra_env[f"PARAM_{clean_k}"] = val_str
 
+    actor = _session_actor(request)
     execute_sql("UPDATE projects SET crash_loop_count = 0 WHERE id = ?", (project_id,))
     try:
         run = await start_project_run(project_id, trigger="manual", extra_env=extra_env or None)
+        if run and run.get("id"):
+            execute_sql("UPDATE runs SET triggered_by = ? WHERE id = ?", (actor, int(run["id"])))
+            run["triggered_by"] = actor
+        log_audit(_client_ip(request), "PROJECT_STARTED", f"Запущен проект {proj['name']}", actor=actor)
         proj_after = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
         return {"ok": True, "run": run, "project": _enrich_project(proj_after or {})}
     except Exception as e:
@@ -1668,19 +1698,28 @@ async def api_start_project(request: Request, project_id: int) -> dict[str, Any]
 
 @router.post("/projects/{project_id}/stop")
 async def api_stop_project(request: Request, project_id: int) -> dict[str, Any]:
+    actor = _session_actor(request)
     await stop_project(project_id)
     proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if proj:
+        log_audit(_client_ip(request), "PROJECT_STOPPED", f"Остановлен проект {proj['name']}", actor=actor)
     return {"ok": True, "project": _enrich_project(proj or {})}
 
 
 @router.post("/projects/{project_id}/restart")
 async def api_restart_project(request: Request, project_id: int) -> dict[str, Any]:
+    actor = _session_actor(request)
     await stop_project(project_id)
     await asyncio.sleep(0.2)
     execute_sql("UPDATE projects SET crash_loop_count = 0 WHERE id = ?", (project_id,))
     try:
         run = await start_project_run(project_id, trigger="manual")
+        if run and run.get("id"):
+            execute_sql("UPDATE runs SET triggered_by = ? WHERE id = ?", (actor, int(run["id"])))
+            run["triggered_by"] = actor
         proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+        if proj:
+            log_audit(_client_ip(request), "PROJECT_RESTARTED", f"Перезапущен проект {proj['name']}", actor=actor)
         return {"ok": True, "run": run, "project": _enrich_project(proj or {})}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -1826,6 +1865,7 @@ async def api_get_project_yaml(request: Request, project_id: int) -> dict[str, A
 
 @router.put("/projects/{project_id}/yaml")
 async def api_put_project_yaml(request: Request, project_id: int) -> dict[str, Any]:
+    _require_admin_session(request)
     proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
     if not proj:
         raise HTTPException(status_code=404, detail="Проект не найден")
@@ -1833,6 +1873,26 @@ async def api_put_project_yaml(request: Request, project_id: int) -> dict[str, A
     body = await read_json(request)
     yaml_text = str(body.get("content", ""))
     parsed = parse_simple_project_yaml(yaml_text)
+
+    y_type = str(parsed.get("type", proj["type"])).strip()
+    if y_type not in ("job", "service", "web"):
+        raise HTTPException(status_code=400, detail="Поле 'type' в project.yaml должно быть 'job', 'service' или 'web'")
+
+    y_runtime = str(parsed.get("runtime", proj["runtime"])).strip()
+    if y_runtime == "shell":
+        y_runtime = "bash"
+    if y_runtime not in ("python", "node", "bash", "custom"):
+        raise HTTPException(status_code=400, detail="Поле 'runtime' в project.yaml должно быть 'python', 'node', 'bash' или 'custom'")
+
+    y_restart = str(parsed.get("restart_policy", proj["restart_policy"])).strip()
+    if y_restart == "never":
+        y_restart = "no"
+    if y_restart not in ("no", "on-failure", "always"):
+        raise HTTPException(status_code=400, detail="Поле 'restart_policy' в project.yaml должно быть 'no', 'on-failure' или 'always'")
+
+    y_port = parse_int_param(parsed.get("port", proj.get("port", 0)), "port", default=0, min_val=0, max_val=65535)
+    if y_port > 0:
+        _validate_project_port(y_port, exclude_project_id=project_id)
 
     y_stype = str(parsed.get("schedule_type", proj["schedule_type"])).strip()
     y_sexpr = str(parsed.get("schedule_expr", proj["schedule_expr"])).strip()
@@ -1855,14 +1915,14 @@ async def api_put_project_yaml(request: Request, project_id: int) -> dict[str, A
             heartbeat_interval_sec = ?, heartbeat_grace_sec = ?, updated_at = ?
            WHERE id = ?""",
         (
-            parsed.get("type", proj["type"]),
-            parsed.get("runtime", proj["runtime"]),
-            parsed.get("cmd", proj["cmd"]),
-            int(parsed.get("port", proj.get("port", 0)) or 0),
+            y_type,
+            y_runtime,
+            str(parsed.get("cmd", proj["cmd"])),
+            y_port,
             int(parsed.get("ram_limit_mb", proj.get("ram_limit_mb", 0)) or 0),
             1 if parsed.get("use_proxy", proj["use_proxy"]) else 0,
             1 if parsed.get("autostart", proj["autostart"]) else 0,
-            str(parsed.get("restart_policy", proj["restart_policy"])),
+            y_restart,
             int(parsed.get("min_uptime_sec", proj.get("min_uptime_sec", 10)) or 10),
             int(parsed.get("max_restarts", proj.get("max_restarts", 10)) or 10),
             int(parsed.get("restart_delay_sec", proj.get("restart_delay_sec", 5)) or 5),
@@ -1996,10 +2056,30 @@ async def api_import_project_archive(request: Request) -> dict[str, Any]:
     if yaml_file.exists():
         yaml_cfg = parse_simple_project_yaml(yaml_file.read_text(encoding="utf-8", errors="replace"))
 
-    proj_type = str(yaml_cfg.get("type", "service"))
+    proj_type = str(yaml_cfg.get("type", "service")).strip()
     if proj_type not in ("job", "service", "web"):
         proj_type = "service"
-    runtime = str(yaml_cfg.get("runtime", "python"))
+    runtime = str(yaml_cfg.get("runtime", "python")).strip()
+    if runtime == "shell":
+        runtime = "bash"
+    if runtime not in ("python", "node", "bash", "custom"):
+        runtime = "python"
+    restart_policy = str(yaml_cfg.get("restart_policy", "on-failure")).strip()
+    if restart_policy == "never":
+        restart_policy = "no"
+    if restart_policy not in ("no", "on-failure", "always"):
+        restart_policy = "on-failure"
+    imp_port = parse_int_param(yaml_cfg.get("port", 0), "port", default=0, min_val=0, max_val=65535)
+    if imp_port > 0:
+        try:
+            _validate_project_port(imp_port)
+        except HTTPException:
+            imp_port = 0
+    imp_stype = str(yaml_cfg.get("schedule_type", "manual")).strip()
+    imp_sexpr = str(yaml_cfg.get("schedule_expr", "")).strip()
+    if imp_stype not in ("manual", "cron", "interval", "daily"):
+        imp_stype = "manual"
+        imp_sexpr = ""
     cmd = str(yaml_cfg.get("cmd", "python3 main.py"))
 
     now = int(time.time())
@@ -2023,14 +2103,14 @@ async def api_import_project_archive(request: Request) -> dict[str, Any]:
             json.dumps(yaml_cfg.get("secrets", []), ensure_ascii=False),
             1 if yaml_cfg.get("use_proxy") else 0,
             int(yaml_cfg.get("ram_limit_mb", 0) or 0),
-            int(yaml_cfg.get("port", 0) or 0),
+            imp_port,
             str(yaml_cfg.get("healthcheck_url", "")),
-            str(yaml_cfg.get("schedule_type", "manual")),
-            str(yaml_cfg.get("schedule_expr", "")),
+            imp_stype,
+            imp_sexpr,
             secrets.token_hex(16),
             secrets.token_hex(16),
             1 if yaml_cfg.get("autostart") else 0,
-            str(yaml_cfg.get("restart_policy", "on-failure")),
+            restart_policy,
             int(yaml_cfg.get("min_uptime_sec", 10) or 10),
             int(yaml_cfg.get("max_restarts", 10) or 10),
             int(yaml_cfg.get("restart_delay_sec", 5) or 5),
@@ -2062,6 +2142,7 @@ async def api_list_project_kv(request: Request, project_id: int) -> list[dict[st
 
 @router.put("/projects/{project_id}/kv/{key}")
 async def api_put_project_kv(request: Request, project_id: int, key: str) -> dict[str, Any]:
+    _require_admin_session(request)
     clean_key = (key or "").strip()
     if not clean_key or len(clean_key) > 128:
         raise HTTPException(status_code=400, detail="Некорректный ключ state")
@@ -2087,6 +2168,7 @@ async def api_put_project_kv(request: Request, project_id: int, key: str) -> dic
 
 @router.delete("/projects/{project_id}/kv/{key}")
 async def api_delete_project_kv(request: Request, project_id: int, key: str) -> dict[str, Any]:
+    _require_admin_session(request)
     clean_key = (key or "").strip()
     execute_sql("DELETE FROM project_kv WHERE project_id = ? AND key = ?", (project_id, clean_key))
     return {"ok": True, "deleted": clean_key}
@@ -3027,7 +3109,7 @@ async def api_upload_file(request: Request, project_id: int) -> dict[str, Any]:
 @router.get("/projects/{project_id}/runs")
 async def api_project_runs(request: Request, project_id: int) -> list[dict[str, Any]]:
     rows = query_all(
-        """SELECT id, project_id, status, trigger, pid, pgid, proc_create_time,
+        """SELECT id, project_id, status, trigger, triggered_by, pid, pgid, proc_create_time,
                   started_at, finished_at, exit_code, log_path, error_summary
            FROM runs
            WHERE project_id = ?
@@ -3197,6 +3279,7 @@ async def api_get_secrets(request: Request) -> list[dict[str, Any]]:
 
 @router.post("/secrets")
 async def api_save_secret(request: Request) -> dict[str, Any]:
+    _require_admin_session(request)
     body = await read_json(request)
     name = str(body.get("name", "")).strip()
     sec_type = str(body.get("type", "text")).strip()
@@ -3210,6 +3293,7 @@ async def api_save_secret(request: Request) -> dict[str, Any]:
 
 @router.post("/secrets/cookies")
 async def api_import_cookies(request: Request) -> dict[str, Any]:
+    _require_admin_session(request)
     body = await read_json(request)
     name = str(body.get("name", "my_cookies")).strip()
     raw_json = body.get("cookies_json", body.get("value", ""))
@@ -3236,6 +3320,7 @@ async def api_expire_cookie_secret(request: Request, name: str) -> dict[str, Any
 
 @router.delete("/secrets/{name}")
 async def api_delete_secret(request: Request, name: str) -> dict[str, Any]:
+    _require_admin_session(request)
     try:
         clean_name = validate_secret_name(name)
         ok = delete_secret(clean_name)
@@ -3912,13 +3997,28 @@ async def api_system_restore_backup(request: Request) -> dict[str, Any]:
             upload = form.get("file") or form.get("backup")
             if upload is None or not hasattr(upload, "read"):
                 raise HTTPException(status_code=400, detail="Не передан файл архива бэкапа (.zip)")
-            raw_bytes = await upload.read()
-            if not raw_bytes or len(raw_bytes) < 22:
-                raise HTTPException(status_code=400, detail="Загруженный файл пуст или не является ZIP-архивом")
             fd, tmp_name = tempfile.mkstemp(prefix="beacon_upload_restore_", suffix=".zip", dir=str(BACKUPS_DIR))
             os.close(fd)
             tmp_uploaded_zip = Path(tmp_name)
-            tmp_uploaded_zip.write_bytes(raw_bytes)
+            total_written = 0
+            with open(tmp_uploaded_zip, "wb") as out_f:
+                try:
+                    while True:
+                        chunk = await upload.read(_ZIP_STREAM_CHUNK)
+                        if not chunk:
+                            break
+                        total_written += len(chunk)
+                        if total_written > MAX_ZIP_ARCHIVE_BYTES:
+                            raise HTTPException(status_code=413, detail="Размер архива бэкапа превышает 50 МБ")
+                        out_f.write(chunk)
+                except TypeError:
+                    raw_bytes = await upload.read()
+                    total_written = len(raw_bytes)
+                    if total_written > MAX_ZIP_ARCHIVE_BYTES:
+                        raise HTTPException(status_code=413, detail="Размер архива бэкапа превышает 50 МБ")
+                    out_f.write(raw_bytes)
+            if total_written < 22:
+                raise HTTPException(status_code=400, detail="Загруженный файл пуст или не является ZIP-архивом")
             target_zip = tmp_uploaded_zip
             source_label = getattr(upload, "filename", "") or "uploaded_backup.zip"
         else:

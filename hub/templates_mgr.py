@@ -260,6 +260,121 @@ beacon.state.set("last_item_id", int(last_id) + 1)
         )
         (workdir / "requirements.txt").write_text("httpx>=0.27.2\n", encoding="utf-8")
 
+    elif template == "fastapi":
+        _ensure_python_venv(workdir)
+        default_cmd = ".venv/bin/python main.py" if (workdir / ".venv" / "bin" / "python").exists() else "python3 main.py"
+        (workdir / "main.py").write_text(
+            f"""import json
+import os
+import signal
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import beacon
+
+PORT = int(os.environ.get("PORT", "18080") or 18080)
+
+class ApiHandler(BaseHTTPRequestHandler):
+    def _send_json(self, code: int, payload: dict):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._send_json(200, {{"ok": True, "service": "{name}", "port": PORT, "status": "healthy"}})
+            return
+        requests_total = int(beacon.state.get("requests_total", 0) or 0) + 1
+        beacon.state.set("requests_total", requests_total)
+        self._send_json(200, {{"service": "{name}", "path": self.path, "requests_total": requests_total}})
+
+    def log_message(self, fmt, *args):
+        print(f"[{name}] " + (fmt % args), flush=True)
+
+server = HTTPServer(("0.0.0.0", PORT), ApiHandler)
+
+def _graceful_stop(signum, _frame):
+    print(f"[{name}] Получен сигнал {{signum}}, корректная остановка HTTP-сервера...", flush=True)
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _graceful_stop)
+signal.signal(signal.SIGINT, _graceful_stop)
+
+print(f"[{name}] Микросервис API запущен на http://127.0.0.1:{{PORT}} (/health активен)", flush=True)
+server.serve_forever()
+""",
+            encoding="utf-8",
+        )
+        (workdir / "requirements.txt").write_text("httpx>=0.27.2\n", encoding="utf-8")
+
+    elif template == "webhook_job":
+        _ensure_python_venv(workdir)
+        default_cmd = ".venv/bin/python main.py" if (workdir / ".venv" / "bin" / "python").exists() else "python3 main.py"
+        (workdir / "main.py").write_text(
+            f"""import os
+import time
+import beacon
+
+target_env = os.environ.get("PARAM_TARGET", "production")
+dry_run = os.environ.get("PARAM_DRY_RUN", "false")
+run_num = int(beacon.state.get("runs_count", 0) or 0) + 1
+beacon.state.set("runs_count", run_num)
+
+print(f"[{name}] Старт задачи #{{run_num}} · PARAM_TARGET={{target_env}} · PARAM_DRY_RUN={{dry_run}}", flush=True)
+time.sleep(1.0)
+beacon.notify(f"Задача {name} (#{{run_num}}, target={{target_env}}) успешно выполнена", level="info")
+print(f"[{name}] Завершено успешно.", flush=True)
+""",
+            encoding="utf-8",
+        )
+        (workdir / "requirements.txt").write_text("httpx>=0.27.2\n", encoding="utf-8")
+
+    elif template == "node_api":
+        default_cmd = "node index.js"
+        (workdir / "index.js").write_text(
+            f"""const http = require('http');
+const beacon = require('beacon');
+
+const PORT = Number(process.env.PORT || 18080);
+
+const server = http.createServer(async (req, res) => {{
+  if (req.url === '/health') {{
+    res.writeHead(200, {{ 'Content-Type': 'application/json' }});
+    res.end(JSON.stringify({{ ok: true, service: '{name}', port: PORT }}));
+    return;
+  }}
+  const hits = Number((await beacon.state.get('hits', 0)) || 0) + 1;
+  await beacon.state.set('hits', hits);
+  res.writeHead(200, {{ 'Content-Type': 'application/json' }});
+  res.end(JSON.stringify({{ service: '{name}', url: req.url, hits }}));
+}});
+
+process.on('SIGTERM', () => {{
+  console.log('[{name}] SIGTERM received, shutting down HTTP server...');
+  server.close(() => process.exit(0));
+}});
+
+server.listen(PORT, '0.0.0.0', () => {{
+  console.log('[{name}] Node.js HTTP API listening on http://127.0.0.1:' + PORT + ' (/health ready)');
+}});
+""",
+            encoding="utf-8",
+        )
+        (workdir / "package.json").write_text(
+            json.dumps(
+                {
+                    "name": name,
+                    "version": "1.0.0",
+                    "main": "index.js",
+                    "scripts": {"start": "node index.js"},
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
     elif template == "node" or runtime == "node":
         default_cmd = "node index.js"
         (workdir / "index.js").write_text(

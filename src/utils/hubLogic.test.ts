@@ -222,3 +222,29 @@ test('classifyStatusNotice, formatLiveUptime, getRuntimeSdkSnippets, and generat
   assert.ok(yamlTpl.includes('name: demo_bot'));
 });
 
+import { parseDotEnvText, isSensitiveEnvKey, AI_TOKEN_PRESETS } from './hubLogic';
+
+test('parseDotEnvText parses .env lines, strips quotes/export/comments, and detects sensitive keys', () => {
+  const sample = `
+    # Production configuration
+    PORT=8080
+    export APP_ENV="production"
+    BOT_TOKEN='123456:ABC-DEF'
+    STRIPE_API_KEY=sk_live_999111 # inline comment
+    INVALID-KEY=ignored
+  `;
+  const parsed = parseDotEnvText(sample);
+  assert.equal(parsed.count, 4);
+  assert.equal(parsed.entries.PORT, '8080');
+  assert.equal(parsed.entries.APP_ENV, 'production');
+  assert.equal(parsed.entries.BOT_TOKEN, '123456:ABC-DEF');
+  assert.equal(parsed.entries.STRIPE_API_KEY, 'sk_live_999111');
+  assert.ok(parsed.secretCandidates.includes('BOT_TOKEN'));
+  assert.ok(parsed.secretCandidates.includes('STRIPE_API_KEY'));
+  assert.ok(!parsed.secretCandidates.includes('PORT'));
+  assert.equal(isSensitiveEnvKey('DB_PASSWORD'), true);
+  assert.equal(isSensitiveEnvKey('LOG_LEVEL'), false);
+  assert.equal(AI_TOKEN_PRESETS.length, 3);
+});
+
+

@@ -14,7 +14,7 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 
 from hub.compat import httpx
-from hub.db import execute_sql, get_all_settings, log_audit, query_all, query_one
+from hub.db import execute_sql, get_all_settings, get_setting, log_audit, query_all, query_one
 from hub.notifier import send_notification
 from hub.secrets_mgr import import_cookie_editor_json
 
@@ -448,9 +448,18 @@ def _validate_web_auth_target_url(url_str: str) -> tuple[str, str]:
     if not host or host in ("localhost", "localhost.localdomain", "0.0.0.0"):
         raise ValueError("Обращение к локальным адресам (localhost / loopback) в Web Auth запрещено")
 
+    allow_private = get_setting("web_auth_allow_private_ips", "0") == "1"
+
+    def _is_forbidden_ip(ip_val: Any) -> bool:
+        if ip_val.is_loopback or ip_val.is_link_local or ip_val.is_unspecified or ip_val.is_multicast:
+            return True
+        if not allow_private and ip_val.is_private:
+            return True
+        return False
+
     try:
         ip_obj = ipaddress.ip_address(host)
-        if ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_unspecified or ip_obj.is_multicast:
+        if _is_forbidden_ip(ip_obj):
             raise ValueError(f"Обращение к внутреннему адресу {host} запрещено (защита от SSRF)")
     except ValueError as exc:
         if "запрещено" in str(exc):
@@ -459,12 +468,7 @@ def _validate_web_auth_target_url(url_str: str) -> tuple[str, str]:
             infos = socket.getaddrinfo(host, None)
             for _, _, _, _, sockaddr in infos:
                 resolved_ip = ipaddress.ip_address(sockaddr[0].split("%", 1)[0])
-                if (
-                    resolved_ip.is_loopback
-                    or resolved_ip.is_link_local
-                    or resolved_ip.is_unspecified
-                    or resolved_ip.is_multicast
-                ):
+                if _is_forbidden_ip(resolved_ip):
                     raise ValueError(f"Домен {host} указывает на внутренний адрес {resolved_ip} (защита от SSRF)")
         except ValueError:
             raise

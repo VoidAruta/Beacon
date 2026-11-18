@@ -17,6 +17,7 @@ import {
   FileDiff,
 } from 'lucide-react';
 import { ProjectItem } from '../types/hub';
+import { AI_TOKEN_PRESETS } from '../utils/hubLogic';
 
 interface AiTokenItem {
   id: number;
@@ -664,8 +665,41 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
             </div>
           </div>
 
-          <div className="space-y-2">
-            <label className="block text-xs font-semibold text-slate-300">Разрешения (Scopes)</label>
+          <div className="space-y-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label className="block text-xs font-semibold text-slate-300">
+                Профиль доступа и разрешения (Scopes)
+              </label>
+              <span className="text-[11px] text-slate-400">Выберите готовый профиль в 1 клик или отметьте вручную</span>
+            </div>
+
+            {/* 3 готовых пресета Scopes для ИИ-агентов */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              {AI_TOKEN_PRESETS.map((preset) => {
+                const isSelectedPreset =
+                  selectedScopes.length === preset.scopes.length &&
+                  preset.scopes.every((s) => selectedScopes.includes(s));
+                return (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    onClick={() => {
+                      setSelectedScopes([...preset.scopes]);
+                      setRateLimit(preset.rateLimit);
+                    }}
+                    className={`p-2.5 rounded-lg border text-left transition-colors cursor-pointer ${
+                      isSelectedPreset
+                        ? 'bg-indigo-950/60 border-indigo-500/70 text-white'
+                        : 'bg-[#0b0f17] border-slate-800 hover:border-slate-700 text-slate-300'
+                    }`}
+                  >
+                    <div className="text-xs font-bold text-indigo-300">{preset.title}</div>
+                    <div className="text-[10px] text-slate-400 mt-0.5 leading-snug">{preset.description}</div>
+                  </button>
+                );
+              })}
+            </div>
+
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {AVAILABLE_SCOPES.map((sc) => (
                 <label

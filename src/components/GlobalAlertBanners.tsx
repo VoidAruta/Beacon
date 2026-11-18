@@ -1,11 +1,13 @@
 import React, { useState } from 'react';
-import { AlertTriangle, KeyRound, Send, Cookie, X, CheckCircle2 } from 'lucide-react';
+import { AlertTriangle, KeyRound, Send, Cookie, X, CheckCircle2, FileDiff } from 'lucide-react';
 import { ExpiredCookie, PendingAsk } from '../types/hub';
 import { validateCookieEditorJson } from '../utils/hubLogic';
 
 interface GlobalAlertBannersProps {
   pendingAsks: PendingAsk[];
   expiredCookies: ExpiredCookie[];
+  pendingAiApprovalsCount?: number;
+  onOpenAiApprovals?: () => void;
   onAnswerAsk: (askId: string, answer: string) => Promise<void>;
   onImportCookieJson: (secretName: string, rawJson: string) => Promise<void>;
 }
@@ -36,6 +38,8 @@ const SAMPLE_COOKIE_EDITOR_JSON = JSON.stringify(
 export const GlobalAlertBanners: React.FC<GlobalAlertBannersProps> = ({
   pendingAsks,
   expiredCookies,
+  pendingAiApprovalsCount = 0,
+  onOpenAiApprovals,
   onAnswerAsk,
   onImportCookieJson,
 }) => {
@@ -92,6 +96,39 @@ export const GlobalAlertBanners: React.FC<GlobalAlertBannersProps> = ({
 
   return (
     <>
+      {/* 0. Интерактивный баннер ожидающих подтверждений от ИИ-агентов (MCP / REST v1 Approval Queue) */}
+      {pendingAiApprovalsCount > 0 && (
+        <div
+          role="region"
+          aria-label="Ожидающие подтверждения от ИИ-агента"
+          className="bg-indigo-950/95 border-b border-indigo-500/50 px-4 py-2.5 text-indigo-100"
+        >
+          <div className="max-w-[1440px] mx-auto flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+            <div className="flex items-center gap-2.5 text-xs sm:text-sm">
+              <FileDiff className="w-4 h-4 text-amber-400 shrink-0" />
+              <div>
+                <span className="font-semibold text-amber-300">AI_APPROVAL_REQUIRED</span>
+                <span className="mx-2 text-indigo-400/70">·</span>
+                <span>
+                  В очереди подтверждений ИИ ожидает действий:{' '}
+                  <strong className="text-white font-mono">{pendingAiApprovalsCount}</strong> (проверьте unified diff перед выполнением)
+                </span>
+              </div>
+            </div>
+            {onOpenAiApprovals && (
+              <button
+                type="button"
+                onClick={onOpenAiApprovals}
+                className="px-3.5 py-1.5 text-xs font-semibold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer self-start sm:self-auto"
+              >
+                <FileDiff className="w-3.5 h-3.5" />
+                Проверить diff и одобрить (Alt+4)
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* 1. Жёлтый интерактивный баннер WAITING_INPUT (beacon.ask) */}
       {pendingAsks.map((ask) => (
         <div

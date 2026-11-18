@@ -50,7 +50,7 @@ import {
   KeyRound,
 } from 'lucide-react';
 import { ProjectItem, RunItem, SecretItem, SystemStatus, WorkspaceSubTab, WebAuthSession } from '../types/hub';
-import { formatBytes } from '../utils/hubLogic';
+import { formatBytes, isSensitiveEnvKey, parseDotEnvText } from '../utils/hubLogic';
 import {
   DEFAULTS,
   LABELS,
@@ -283,7 +283,10 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   const [cfgNotifyOnCrash, setCfgNotifyOnCrash] = useState<boolean>(true);
   const [cfgNotifyOnSuccess, setCfgNotifyOnSuccess] = useState<boolean>(false);
   const [cfgEnvJson, setCfgEnvJson] = useState<string>('{}');
-  const [envEditorMode, setEnvEditorMode] = useState<'visual' | 'json'>('visual');
+  const [envEditorMode, setEnvEditorMode] = useState<'visual' | 'dotenv' | 'json'>('visual');
+  const [dotEnvRawText, setDotEnvRawText] = useState<string>('');
+  const [migratingSecretKey, setMigratingSecretKey] = useState<string | null>(null);
+  const [mobileIdePanel, setMobileIdePanel] = useState<'explorer' | 'editor' | 'console'>('editor');
   const [newEnvKey, setNewEnvKey] = useState<string>('');
   const [newEnvVal, setNewEnvVal] = useState<string>('');
   const [cfgSelectedSecrets, setCfgSelectedSecrets] = useState<string[]>([]);
@@ -1676,6 +1679,58 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     },
     [parsedEnvObject]
   );
+
+  const handleApplyDotEnvText = useCallback(() => {
+    const parsed = parseDotEnvText(dotEnvRawText);
+    if (parsed.count === 0) {
+      setCfgStatus('Предупреждение: в тексте .env не найдено строк формата KEY=VALUE');
+      return;
+    }
+    const merged = { ...parsedEnvObject, ...parsed.entries };
+    setCfgEnvJson(JSON.stringify(merged, null, 2));
+    setDotEnvRawText('');
+    setEnvEditorMode('visual');
+    setCfgStatus(
+      `Импортировано переменных из .env: ${parsed.count}${
+        parsed.secretCandidates.length > 0
+          ? ` (обнаружено чувствительных ключей: ${parsed.secretCandidates.join(', ')} — рекомендуем перенести в Сейф 0600)`
+          : ''
+      }`
+    );
+  }, [dotEnvRawText, parsedEnvObject]);
+
+  const handleMigrateEnvToSecret = async (envKey: string, envVal: string) => {
+    if (!activeProj || !envKey || !envVal.trim() || migratingSecretKey) return;
+    const secretName = `${activeProj.name}_${envKey.toLowerCase()}`
+      .replace(/[^a-zA-Z0-9_.-]/g, '_')
+      .slice(0, 64);
+    setMigratingSecretKey(envKey);
+    try {
+      const res = await apiFetch('/api/secrets', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: secretName,
+          type: 'text',
+          value: envVal,
+        }),
+      });
+      if (res.ok) {
+        setCfgSelectedSecrets((prev) => (prev.includes(secretName) ? prev : [...prev, secretName]));
+        handleDeleteEnvVar(envKey);
+        onRefreshAll();
+        setCfgStatus(
+          `Ключ «${envKey}» перенесён в защищённый Сейф (0600) как «${secretName}» и привязан к проекту!`
+        );
+      } else {
+        const err = await res.json().catch(() => ({}));
+        setCfgStatus(`Ошибка переноса в Сейф: ${err.detail || 'Не удалось создать секрет'}`);
+      }
+    } catch (e: any) {
+      setCfgStatus(`Ошибка сети при переносе в Сейф: ${e?.message || 'Сбой сети'}`);
+    } finally {
+      setMigratingSecretKey(null);
+    }
+  };
 
   const toggleSecretAttachment = (secName: string) => {
     setCfgSelectedSecrets((prev) =>
@@ -3355,6 +3410,46 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                       </div>
                     )}
 
+                    {/* Мобильный переключатель подпанелей IDE (< lg): [Проводник] / [Код] / [Живой лог] */}
+                    <div className="lg:hidden px-3 py-2 bg-[#0b0f17] border-b border-[#1e2638] grid grid-cols-3 gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setMobileIdePanel('explorer')}
+                        className={`py-1.5 px-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer ${
+                          mobileIdePanel === 'explorer'
+                            ? 'bg-indigo-600 text-white'
+                            : 'bg-[#111622] text-slate-300 border border-[#1e2638]'
+                        }`}
+                      >
+                        <FolderCode className="w-3.5 h-3.5" />
+                        <span>Файлы ({files.filter((f) => !f.is_dir).length})</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setMobileIdePanel('editor')}
+                        className={`py-1.5 px-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer ${
+                          mobileIdePanel === 'editor'
+                            ? 'bg-indigo-600 text-white'
+                            : 'bg-[#111622] text-slate-300 border border-[#1e2638]'
+                        }`}
+                      >
+                        <FileCode className="w-3.5 h-3.5" />
+                        <span>Код</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setMobileIdePanel('console')}
+                        className={`py-1.5 px-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer ${
+                          mobileIdePanel === 'console'
+                            ? 'bg-indigo-600 text-white'
+                            : 'bg-[#111622] text-slate-300 border border-[#1e2638]'
+                        }`}
+                      >
+                        <Terminal className="w-3.5 h-3.5" />
+                        <span>Логи / State</span>
+                      </button>
+                    </div>
+
                     <div
                       className={`grid grid-cols-1 lg:grid-cols-12 ${
                         editorHeightMode === 'fullscreen' ? 'flex-1 min-h-0' : ''
@@ -3374,7 +3469,9 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                             setExplorerDragOver(false);
                           }}
                           onDrop={handleExplorerDrop}
-                          className={`${explorerColCls} border-b lg:border-b-0 lg:border-r border-[#1e2638] bg-[#0b0f17]/75 p-3 flex flex-col justify-between gap-2.5 min-h-0 transition-colors ${
+                          className={`${
+                            mobileIdePanel === 'explorer' ? 'flex' : 'hidden lg:flex'
+                          } ${explorerColCls} border-b lg:border-b-0 lg:border-r border-[#1e2638] bg-[#0b0f17]/75 p-3 flex-col justify-between gap-2.5 min-h-0 transition-colors ${
                             explorerDragOver ? 'ring-2 ring-inset ring-indigo-500 bg-indigo-950/25' : ''
                           }`}
                         >
@@ -3667,7 +3764,9 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
 
                       {/* Центральная часть: Многовкладочный редактор кода с подсветкой синтаксиса (#8) */}
                       <div
-                        className={`${editorColCls} flex flex-col justify-between bg-[#070b14] min-w-0 min-h-0 ${
+                        className={`${
+                          mobileIdePanel === 'editor' ? 'flex' : 'hidden lg:flex'
+                        } ${editorColCls} flex-col justify-between bg-[#070b14] min-w-0 min-h-0 ${
                           splitConsoleMode ? 'border-b lg:border-b-0 lg:border-r border-[#1e2638]' : ''
                         }`}
                       >
@@ -4057,7 +4156,11 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
 
                       {/* Правая колонка в режиме Split-View: Живой лог, stdin и beacon.state прямо рядом с кодом */}
                       {splitConsoleMode && (
-                        <div className={`${splitConsoleColCls} flex flex-col min-w-0 min-h-0 bg-[#070b14]`}>
+                        <div
+                          className={`${
+                            mobileIdePanel === 'console' ? 'flex' : 'hidden lg:flex'
+                          } ${splitConsoleColCls} flex-col min-w-0 min-h-0 bg-[#070b14]`}
+                        >
                           {renderConsolePanel(true)}
                         </div>
                       )}
@@ -5451,7 +5554,14 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                                 <td className="py-2 px-3">
                                   <span className={`px-1.5 py-0.5 rounded text-[10px] ${st.cls}`}>{st.label}</span>
                                 </td>
-                                <td className="py-2 px-3 text-slate-300">{r.trigger}</td>
+                                <td className="py-2 px-3 text-slate-300">
+                                  {r.trigger}
+                                  {r.triggered_by && (
+                                    <span className="ml-1.5 px-1.5 py-0.5 rounded bg-slate-800 text-indigo-300 text-[10px]">
+                                      @{r.triggered_by}
+                                    </span>
+                                  )}
+                                </td>
                                 <td className="py-2 px-3 text-slate-400">
                                   {r.pid || '—'} / {r.pgid || '—'}
                                 </td>

@@ -232,9 +232,16 @@ def _scrypt_hash(password: str) -> str:
 
 
 _THREAD_LOCAL = threading.local()
+_DB_GENERATION: int = 0
 _SETTINGS_CACHE: Optional[tuple[str, float, dict[str, str]]] = None
 _SETTINGS_CACHE_TTL_SEC = 2.0
 _SETTINGS_CACHE_LOCK = threading.Lock()
+
+
+def bump_db_generation() -> None:
+    """Инкрементирует поколение БД, заставляя все рабочие потоки переоткрыть thread-local соединения."""
+    global _DB_GENERATION
+    _DB_GENERATION += 1
 
 
 def invalidate_settings_cache() -> None:
@@ -252,14 +259,16 @@ def close_thread_connection() -> None:
             pass
     _THREAD_LOCAL.conn = None
     _THREAD_LOCAL.conn_db_path = None
+    _THREAD_LOCAL.conn_generation = -1
     _THREAD_LOCAL.tx_depth = 0
 
 
 def get_connection() -> sqlite3.Connection:
     conn = getattr(_THREAD_LOCAL, "conn", None)
     conn_path = getattr(_THREAD_LOCAL, "conn_db_path", None)
+    conn_gen = getattr(_THREAD_LOCAL, "conn_generation", -1)
     target_path = str(DB_PATH)
-    if conn is not None and conn_path == target_path:
+    if conn is not None and conn_path == target_path and conn_gen == _DB_GENERATION:
         return conn
     if conn is not None:
         try:
@@ -274,6 +283,7 @@ def get_connection() -> sqlite3.Connection:
     new_conn.execute("PRAGMA busy_timeout = 5000;")
     _THREAD_LOCAL.conn = new_conn
     _THREAD_LOCAL.conn_db_path = target_path
+    _THREAD_LOCAL.conn_generation = _DB_GENERATION
     _THREAD_LOCAL.tx_depth = 0
     return new_conn
 
@@ -573,12 +583,18 @@ def _run_schema_migrations(conn: sqlite3.Connection) -> None:
     if "actor" not in audit_cols:
         conn.execute("ALTER TABLE audit_log ADD COLUMN actor TEXT NOT NULL DEFAULT ''")
 
+    # Колонка triggered_by в runs для атрибуции пользователя/токена запуска (Этап 2)
+    run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    if "triggered_by" not in run_cols:
+        conn.execute("ALTER TABLE runs ADD COLUMN triggered_by TEXT NOT NULL DEFAULT ''")
+
 
 def init_db() -> None:
     """
     Инициализирует таблицы SQLite в режиме WAL, выполняет миграции и задаёт настройки по умолчанию.
     По умолчанию пароль администратора — 'admin' (без принудительной смены при входе и без записи на диск).
     """
+    bump_db_generation()
     close_thread_connection()
     invalidate_settings_cache()
     ensure_directories()

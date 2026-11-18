@@ -179,6 +179,7 @@ export interface RunItem {
   project_name?: string;
   status: 'running' | 'waiting_input' | 'success' | 'failed' | 'timeout' | 'stopped' | 'killed_oom' | 'crash_loop';
   trigger: 'manual' | 'schedule' | 'webhook' | 'autostart' | 'restart' | 'retry' | 'chain' | 'cron_restart' | 'ai';
+  triggered_by?: string;
   pid: number | null;
   pgid: number | null;
   proc_create_time?: number | null;

@@ -452,3 +452,100 @@ export function getRunStatusBadge(status: string): {
   }
 }
 
+const SENSITIVE_KEY_PATTERNS = /(SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|AUTH_KEY|WEBHOOK_SECRET|HASH)/i;
+
+/**
+ * Проверяет, содержит ли имя переменной окружения признаки секрета/токена,
+ * который безопаснее хранить в зашифрованном сейфе (chmod 0600), а не в открытом env_json.
+ */
+export function isSensitiveEnvKey(key: string): boolean {
+  const clean = (key || '').trim();
+  if (!clean) return false;
+  return SENSITIVE_KEY_PATTERNS.test(clean);
+}
+
+/**
+ * Парсит многострочный текст в формате .env (KEY=VALUE, export KEY="VAL", комментарии #)
+ * и возвращает словарь переменных + список ключей-кандидатов для переноса в Сейф Секретов (0600).
+ */
+export function parseDotEnvText(raw: string): {
+  entries: Record<string, string>;
+  secretCandidates: string[];
+  count: number;
+} {
+  const entries: Record<string, string> = {};
+  const secretSet = new Set<string>();
+  if (!raw || !raw.trim()) {
+    return { entries, secretCandidates: [], count: 0 };
+  }
+
+  const lines = raw.split(/\r?\n/);
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const withoutExport = trimmed.startsWith('export ') ? trimmed.slice(7).trim() : trimmed;
+    const eqIdx = withoutExport.indexOf('=');
+    if (eqIdx <= 0) continue;
+
+    const key = withoutExport.slice(0, eqIdx).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+
+    let val = withoutExport.slice(eqIdx + 1).trim();
+    if (
+      (val.startsWith('"') && val.endsWith('"') && val.length >= 2) ||
+      (val.startsWith("'") && val.endsWith("'") && val.length >= 2)
+    ) {
+      val = val.slice(1, -1);
+    } else {
+      const commentIdx = val.indexOf(' #');
+      if (commentIdx !== -1) {
+        val = val.slice(0, commentIdx).trim();
+      }
+    }
+
+    entries[key] = val;
+    if (isSensitiveEnvKey(key) && val.length > 0) {
+      secretSet.add(key);
+    }
+  }
+
+  return {
+    entries,
+    secretCandidates: Array.from(secretSet),
+    count: Object.keys(entries).length,
+  };
+}
+
+export interface AiTokenScopePreset {
+  id: 'readonly' | 'supervised' | 'autonomous';
+  title: string;
+  description: string;
+  scopes: string[];
+  rateLimit: number;
+}
+
+export const AI_TOKEN_PRESETS: readonly AiTokenScopePreset[] = [
+  {
+    id: 'readonly',
+    title: 'Только диагностика (Read-Only)',
+    description: 'Чтение логов, статуса и исходного кода без права правок и перезапуска',
+    scopes: ['read', 'files:read'],
+    rateLimit: 60,
+  },
+  {
+    id: 'supervised',
+    title: 'Напарник с подтверждением (Diff Approval)',
+    description: 'Чтение, правка кода (через очередь с diff) и перезапуск сервисов',
+    scopes: ['read', 'files:read', 'files:write', 'run', 'ask:answer'],
+    rateLimit: 90,
+  },
+  {
+    id: 'autonomous',
+    title: 'Полный цикл разработки (Dev Sandbox)',
+    description: 'Все разрешения, включая создание проектов из шаблонов и настройку Cron',
+    scopes: ['read', 'files:read', 'files:write', 'run', 'schedule:write', 'templates:create', 'ask:answer'],
+    rateLimit: 120,
+  },
+] as const;
+
+

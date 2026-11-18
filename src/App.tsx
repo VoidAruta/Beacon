@@ -215,6 +215,21 @@ export function App() {
     }
   }, []);
   const [workspaceSubTab, setWorkspaceSubTab] = useState<WorkspaceSubTab>('editor');
+  const [productionMode, setProductionMode] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('beacon_production_mode') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const toggleProductionMode = useCallback((nextVal: boolean) => {
+    setProductionMode(nextVal);
+    try {
+      localStorage.setItem('beacon_production_mode', nextVal ? '1' : '0');
+    } catch {
+      // ignore
+    }
+  }, []);
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [projects, setProjects] = useState<ProjectItem[]>([]);
   const [secrets, setSecrets] = useState<SecretItem[]>([]);
@@ -243,14 +258,17 @@ export function App() {
   );
 
   const loadAllData = useCallback(
-    async (overrideCsrf?: string) => {
+    async (overrideCsrf?: string, overrideRole?: string) => {
       try {
         const hdrs: Record<string, string> = { Accept: 'application/json' };
         if (overrideCsrf || csrfToken) hdrs['X-CSRF-Token'] = overrideCsrf || csrfToken;
+        const effectiveRole = overrideRole || userRole;
 
         const [dRes, sRes] = await Promise.all([
           safeFetch('/api/dashboard', { headers: hdrs, credentials: 'same-origin' }),
-          safeFetch('/api/secrets', { headers: hdrs, credentials: 'same-origin' }),
+          effectiveRole === 'admin'
+            ? safeFetch('/api/secrets', { headers: hdrs, credentials: 'same-origin' })
+            : Promise.resolve(null),
         ]);
 
         let projectsUpdated = false;
@@ -285,17 +303,19 @@ export function App() {
             }
           }
         }
-        if (sRes.ok) {
+        if (sRes && sRes.ok) {
           const sData = await sRes.json();
           if (Array.isArray(sData)) {
             setSecrets(sData as SecretItem[]);
           }
+        } else if (effectiveRole !== 'admin') {
+          setSecrets([]);
         }
       } catch {
         // ignore transient network errors
       }
     },
-    [csrfToken]
+    [csrfToken, userRole]
   );
 
   useEffect(() => {
@@ -313,17 +333,25 @@ export function App() {
           }
           if (res.ok && data.authenticated) {
             const cToken = data.csrf_token || '';
+            const rRole = data.role || 'admin';
             setAuthenticated(true);
             setCsrfToken(cToken);
-            setUserRole(data.role || 'admin');
+            setUserRole(rRole);
             setUsername(data.username || 'admin');
             setIsDefaultPassword(Boolean(data.is_default_password));
-            await loadAllData(cToken);
+            await loadAllData(cToken, rRole);
             break;
           }
 
-          // Вход с дефолтным паролем 'admin' (если ещё не изменён владельцем)
-          if (data?.is_default_password) {
+          let explicitLogout = false;
+          try {
+            explicitLogout = sessionStorage.getItem('beacon_explicit_logout') === '1';
+          } catch {
+            // ignore
+          }
+
+          // Вход с дефолтным паролем 'admin' (если ещё не изменён владельцем и пользователь не нажал Выйти)
+          if (data?.is_default_password && !explicitLogout) {
             const loginRes = await safeFetch('/api/auth/login', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -337,12 +365,13 @@ export function App() {
             }
             if (loginRes.ok && loginData && loginData.authenticated) {
               const cToken = loginData.csrf_token || '';
+              const rRole = loginData.role || 'admin';
               setAuthenticated(true);
               setCsrfToken(cToken);
-              setUserRole(loginData.role || 'admin');
+              setUserRole(rRole);
               setUsername(loginData.username || 'admin');
               setIsDefaultPassword(Boolean(loginData.is_default_password));
-              await loadAllData(cToken);
+              await loadAllData(cToken, rRole);
             }
           }
           break;
@@ -359,9 +388,19 @@ export function App() {
   useEffect(() => {
     if (!authenticated) return;
     const timer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
       loadAllData();
     }, 2000);
-    return () => clearInterval(timer);
+    const onVisChange = () => {
+      if (typeof document !== 'undefined' && !document.hidden) {
+        loadAllData();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisChange);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisChange);
+    };
   }, [authenticated, loadAllData]);
 
   const handleLogin = async (e: React.FormEvent) => {
@@ -376,13 +415,19 @@ export function App() {
     if (res.ok) {
       const data = await res.json();
       if (data && data.authenticated) {
+        try {
+          sessionStorage.removeItem('beacon_explicit_logout');
+        } catch {
+          // ignore
+        }
         const cToken = data.csrf_token || '';
+        const rRole = data.role || 'admin';
         setAuthenticated(true);
         setCsrfToken(cToken);
-        setUserRole(data.role || 'admin');
+        setUserRole(rRole);
         setUsername(data.username || 'admin');
         setIsDefaultPassword(Boolean(data.is_default_password));
-        await loadAllData(cToken);
+        await loadAllData(cToken, rRole);
       } else {
         setLoginError(data?.detail || 'Ошибка авторизации');
       }
@@ -429,6 +474,7 @@ export function App() {
     previewSessionToken = '';
     try {
       sessionStorage.removeItem('beacon_preview_session');
+      sessionStorage.setItem('beacon_explicit_logout', '1');
     } catch {
       // ignore
     }
@@ -939,12 +985,14 @@ export function App() {
         </div>
       )}
 
-      {/* Глобальные тревожные баннеры (WAITING_INPUT и COOKIES_EXPIRED) */}
+      {/* Глобальные тревожные баннеры (WAITING_INPUT, COOKIES_EXPIRED и AI Diff Approvals) */}
       <GlobalAlertBanners
         pendingAsks={dashboard?.pending_asks || []}
         expiredCookies={dashboard?.expired_cookies || []}
+        pendingAiApprovalsCount={pendingAiApprovalsCount}
         onAnswerAsk={handleAnswerAsk}
         onImportCookieJson={(name, json) => handleImportCookieJson(name, json)}
+        onOpenAiApprovals={() => setActiveTab('ai_access')}
       />
 
       <div className="flex-1 flex min-h-0">
@@ -1125,31 +1173,33 @@ export function App() {
                 <kbd className="text-[10px] font-mono opacity-60 shrink-0 mt-0.5">Alt+5</kbd>
               </button>
 
-              <button
-                type="button"
-                onClick={() => setActiveTab('acceptance')}
-                title={t('Перейти в Приёмку и Doctor (Alt+6)', 'Go to Acceptance & Doctor (Alt+6)')}
-                className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
-                  activeTab === 'acceptance'
-                    ? 'bg-indigo-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
-                }`}
-              >
-                <div className="flex items-start gap-2.5 min-w-0">
-                  <FlaskConical className="w-4 h-4 mt-0.5 shrink-0" />
-                  <div className="min-w-0">
-                    <div className="text-xs font-semibold">{t('Приёмка и Doctor', 'Acceptance & Doctor')}</div>
-                    <div
-                      className={`text-[11px] leading-snug mt-0.5 truncate ${
-                        activeTab === 'acceptance' ? 'text-indigo-100' : 'text-slate-400'
-                      }`}
-                    >
-                      {t('Автотесты ТЗ и диагностика среды', 'Self-tests & system diagnostics')}
+              {!productionMode && (
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('acceptance')}
+                  title={t('Перейти в Приёмку и Doctor (Alt+6)', 'Go to Acceptance & Doctor (Alt+6)')}
+                  className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
+                    activeTab === 'acceptance'
+                      ? 'bg-indigo-600 text-white'
+                      : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
+                  }`}
+                >
+                  <div className="flex items-start gap-2.5 min-w-0">
+                    <FlaskConical className="w-4 h-4 mt-0.5 shrink-0" />
+                    <div className="min-w-0">
+                      <div className="text-xs font-semibold">{t('Приёмка и Doctor', 'Acceptance & Doctor')}</div>
+                      <div
+                        className={`text-[11px] leading-snug mt-0.5 truncate ${
+                          activeTab === 'acceptance' ? 'text-indigo-100' : 'text-slate-400'
+                        }`}
+                      >
+                        {t('Автотесты ТЗ и диагностика среды', 'Self-tests & system diagnostics')}
+                      </div>
                     </div>
                   </div>
-                </div>
-                <kbd className="text-[10px] font-mono opacity-60 shrink-0 mt-0.5">Alt+6</kbd>
-              </button>
+                  <kbd className="text-[10px] font-mono opacity-60 shrink-0 mt-0.5">Alt+6</kbd>
+                </button>
+              )}
             </nav>
           </div>
 
@@ -1304,6 +1354,9 @@ export function App() {
             {activeTab === 'dashboard' && (
               <DashboardView
                 data={dashboard}
+                userRole={userRole}
+                productionMode={productionMode}
+                onToggleProductionMode={toggleProductionMode}
                 onStartProject={handleStartProject}
                 onStopProject={handleStopProject}
                 onRestartProject={handleRestartProject}
@@ -1316,6 +1369,8 @@ export function App() {
                   setActiveTab('projects');
                 }}
                 onOpenCreateModal={() => setCreateModalOpen(true)}
+                onOpenSettingsTab={() => setActiveTab('settings')}
+                onOpenAiAccessTab={() => setActiveTab('ai_access')}
                 onTriggerDemoAsk={handleTriggerDemoAsk}
                 onTriggerDemoExpiredCookie={() => handleExpireCookie('cookie-checker-job_cookies')}
                 onTestHubRestartSurvival={handleTestHubRestartSurvival}
@@ -1477,6 +1532,8 @@ export function App() {
         isOpen={createModalOpen}
         onClose={() => setCreateModalOpen(false)}
         onCreate={handleCreateProject}
+        globalProxyUrl={dashboard?.system?.proxy_url || ''}
+        globalProxyOnline={Boolean(dashboard?.system?.proxy_status?.online)}
       />
 
       <SystemUpdateModal

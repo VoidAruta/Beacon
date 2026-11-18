@@ -61,7 +61,17 @@ _WATCH_LOOP_STATUS: dict[str, Any] = {
 # }
 ACTIVE_RUNS: dict[int, dict[str, Any]] = {}
 
-_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Запрещает автоматическое следование по HTTP 301/302/307/308 редиректам при проверке healthcheck (защита от SSRF)."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None
+
+
+_NO_PROXY_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _NoRedirectHandler(),
+)
 
 # Коллбэк в планировщик при завершении процесса
 _ON_FINISH_CALLBACK: Optional[Callable[[dict[str, Any], int, str, str], Coroutine[Any, Any, None]]] = None
@@ -349,6 +359,8 @@ def check_endpoint_health(
                 return True, f"HTTP {code} OK"
             return False, f"HTTP {code}"
     except urllib.error.HTTPError as e:
+        if 300 <= int(e.code) < 400:
+            return True, f"HTTP {e.code} Redirect (not followed)"
         return False, f"HTTP {e.code}"
     except TimeoutError:
         return False, "healthcheck_timeout"

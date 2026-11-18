@@ -40,6 +40,11 @@ import {
 
 interface DashboardViewProps {
   data: DashboardData | null;
+  userRole?: string;
+  productionMode?: boolean;
+  onToggleProductionMode?: (next: boolean) => void;
+  onOpenSettingsTab?: () => void;
+  onOpenAiAccessTab?: () => void;
   onStartProject: (id: number) => void;
   onStopProject: (id: number) => void;
   onRestartProject: (id: number) => void;
@@ -72,6 +77,11 @@ function formatTrafficMb(mb: number): string {
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
   data,
+  userRole = 'admin',
+  productionMode = false,
+  onToggleProductionMode,
+  onOpenSettingsTab,
+  onOpenAiAccessTab,
   onStartProject,
   onStopProject,
   onRestartProject,
@@ -94,6 +104,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [activeLogTab, setActiveLogTab] = useState<'errors' | 'notifications' | 'schedule'>('errors');
   const [showSelfTestDrawer, setShowSelfTestDrawer] = useState(false);
   const [showDashboardHelp, setShowDashboardHelp] = useState(false);
+  const [onboardingDismissed, setOnboardingDismissed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('beacon_onboarding_dismissed') === '1';
+    } catch {
+      return false;
+    }
+  });
+
+  const isViewer = userRole === 'viewer';
+  const isAdmin = userRole === 'admin';
+  const effectiveHideTests = hideTests || productionMode;
 
   const projects = data?.projects ?? [];
 
@@ -107,10 +128,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   }, [projects]);
 
   const filteredProjects = useMemo(() => {
-    const base = filterDashboardProjects(projects, searchQuery, typeFilter, hideTests);
+    const base = filterDashboardProjects(projects, searchQuery, typeFilter, effectiveHideTests);
     if (groupFilter === 'all') return base;
     return base.filter((p) => (p.group_tag || '').trim() === groupFilter);
-  }, [projects, searchQuery, typeFilter, hideTests, groupFilter]);
+  }, [projects, searchQuery, typeFilter, effectiveHideTests, groupFilter]);
 
   // Суммарное потребление ОЗУ и CPU всеми запущенными дочерними проектами
   const projectsWorkload = useMemo(() => {
@@ -174,10 +195,24 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </span>
             )}
           </div>
-          <div className="flex items-center gap-3 font-mono text-slate-400">
+          <div className="flex flex-wrap items-center gap-3 font-mono text-slate-400">
             <span>
               Изоляция юзера: <strong className="text-slate-200">{system.run_as_user}</strong>
             </span>
+            {onToggleProductionMode && (
+              <label
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-800/90 hover:bg-slate-700 text-slate-200 font-sans cursor-pointer select-none"
+                title="Скрыть учебные демо-кнопки, тестовые проекты и вкладку Приёмки"
+              >
+                <input
+                  type="checkbox"
+                  checked={productionMode}
+                  onChange={(e) => onToggleProductionMode(e.target.checked)}
+                  className="rounded border-slate-600"
+                />
+                <span>Чистый режим (Prod)</span>
+              </label>
+            )}
             <button
               type="button"
               onClick={() => setShowDashboardHelp(!showDashboardHelp)}
@@ -186,6 +221,134 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <HelpCircle className="w-3.5 h-3.5 text-indigo-400" />
               {showDashboardHelp ? 'Скрыть подсказки' : 'Справка по метрикам'}
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* Мастер быстрого старта (Quick-Start Onboarding Checklist) для новых установок */}
+      {!onboardingDismissed && !productionMode && (system.is_default_password || projects.length === 0) && (
+        <div className="p-4 bg-[#111622] border border-indigo-500/40 rounded-xl space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-indigo-400" />
+              <h3 className="text-xs sm:text-sm font-bold text-white">
+                Быстрый старт Beacon: 3 шага к готовому серверу процессов
+              </h3>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setOnboardingDismissed(true);
+                try {
+                  localStorage.setItem('beacon_onboarding_dismissed', '1');
+                } catch {
+                  // ignore
+                }
+              }}
+              className="text-xs text-slate-400 hover:text-white cursor-pointer"
+            >
+              Скрыть чеклист
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+            <div
+              className={`p-3 rounded-lg border flex flex-col justify-between gap-2 ${
+                !system.is_default_password
+                  ? 'bg-emerald-950/25 border-emerald-500/40 text-emerald-200'
+                  : 'bg-[#0b0f17] border-amber-500/40 text-slate-200'
+              }`}
+            >
+              <div>
+                <div className="font-bold flex items-center justify-between">
+                  <span>1. Защита панели паролем</span>
+                  <span className="font-mono text-[10px] uppercase">
+                    {!system.is_default_password ? 'Готово' : 'Требуется'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  Смените стандартный пароль «admin» (от 8 символов), чтобы разблокировать удалённый доступ и MCP для ИИ.
+                </p>
+              </div>
+              {system.is_default_password && onOpenSettingsTab && (
+                <button
+                  type="button"
+                  onClick={onOpenSettingsTab}
+                  className="px-3 py-1.5 rounded bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold text-xs self-start cursor-pointer"
+                >
+                  Задать пароль
+                </button>
+              )}
+            </div>
+
+            <div
+              className={`p-3 rounded-lg border flex flex-col justify-between gap-2 ${
+                projects.length > 0
+                  ? 'bg-emerald-950/25 border-emerald-500/40 text-emerald-200'
+                  : 'bg-[#0b0f17] border-indigo-500/40 text-slate-200'
+              }`}
+            >
+              <div>
+                <div className="font-bold flex items-center justify-between">
+                  <span>2. Первый сервис или API</span>
+                  <span className="font-mono text-[10px] uppercase">
+                    {projects.length > 0 ? `Проектов: ${projects.length}` : 'Шаг 2'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  Создайте сервис из шаблона (FastAPI, Node.js, Worker 24/7, Cron) или склонируйте готовый репозиторий с GitHub.
+                </p>
+              </div>
+              {!isViewer && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={onOpenCreateModal}
+                    className="px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs cursor-pointer"
+                  >
+                    + Создать проект
+                  </button>
+                  {projects.length === 0 && (
+                    <button
+                      type="button"
+                      onClick={onImportExamples}
+                      className="px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs cursor-pointer"
+                    >
+                      Демо-примеры
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div
+              className={`p-3 rounded-lg border flex flex-col justify-between gap-2 ${
+                system.ai_access_enabled
+                  ? 'bg-emerald-950/25 border-emerald-500/40 text-emerald-200'
+                  : 'bg-[#0b0f17] border-slate-800 text-slate-200'
+              }`}
+            >
+              <div>
+                <div className="font-bold flex items-center justify-between">
+                  <span>3. ИИ-напарник (MCP) и Алерты</span>
+                  <span className="font-mono text-[10px] uppercase">
+                    {system.ai_access_enabled ? 'MCP Активен' : 'Опционально'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  Подключите Claude Code / Cursor по Streamable HTTP MCP с проверкой diff или настройте Telegram-уведомления.
+                </p>
+              </div>
+              {isAdmin && onOpenAiAccessTab && (
+                <button
+                  type="button"
+                  onClick={onOpenAiAccessTab}
+                  className="px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-indigo-300 font-semibold text-xs self-start cursor-pointer"
+                >
+                  Настроить MCP / ИИ
+                </button>
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -446,7 +609,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </div>
               </div>
               <div className="text-[10px] font-mono text-purple-300">
-                Панель: :8050
+                Панель: :{window.location.port || '8765'}
               </div>
             </div>
           </div>
@@ -595,24 +758,28 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </select>
             )}
 
-            <label className="flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer select-none px-2 py-1 bg-[#0f172a] border border-slate-800 rounded-lg">
-              <input
-                type="checkbox"
-                checked={hideTests}
-                onChange={(e) => setHideTests(e.target.checked)}
-                className="rounded border-slate-700"
-              />
-              Скрыть примеры
-            </label>
+            {!productionMode && (
+              <label className="flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer select-none px-2 py-1 bg-[#0f172a] border border-slate-800 rounded-lg">
+                <input
+                  type="checkbox"
+                  checked={hideTests}
+                  onChange={(e) => setHideTests(e.target.checked)}
+                  className="rounded border-slate-700"
+                />
+                Скрыть примеры
+              </label>
+            )}
 
-            <button
-              type="button"
-              onClick={onImportExamples}
-              className="px-2.5 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700 inline-flex items-center gap-1.5 cursor-pointer"
-            >
-              <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
-              Загрузить 4 примера
-            </button>
+            {!productionMode && !isViewer && (
+              <button
+                type="button"
+                onClick={onImportExamples}
+                className="px-2.5 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700 inline-flex items-center gap-1.5 cursor-pointer"
+              >
+                <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+                Загрузить 4 примера
+              </button>
+            )}
           </div>
         </div>
 
@@ -790,46 +957,52 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
                       <td className="py-3 px-4 text-right whitespace-nowrap">
                         <div className="inline-flex items-center gap-1.5">
-                          {!isRunning ? (
-                            <button
-                              type="button"
-                              onClick={() => onStartProject(proj.id)}
-                              title="Запустить"
-                              className="p-1.5 rounded-lg bg-emerald-600/20 text-emerald-300 hover:bg-emerald-600/30 border border-emerald-500/30 cursor-pointer"
-                            >
-                              <Play className="w-3.5 h-3.5" />
-                            </button>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => onStopProject(proj.id)}
-                              title="Остановить группу процессов (PGID)"
-                              className="p-1.5 rounded-lg bg-red-600/20 text-red-300 hover:bg-red-600/30 border border-red-500/30 cursor-pointer"
-                            >
-                              <Square className="w-3.5 h-3.5" />
-                            </button>
+                          {!isViewer && (
+                            <>
+                              {!isRunning ? (
+                                <button
+                                  type="button"
+                                  onClick={() => onStartProject(proj.id)}
+                                  title="Запустить"
+                                  className="p-1.5 rounded-lg bg-emerald-600/20 text-emerald-300 hover:bg-emerald-600/30 border border-emerald-500/30 cursor-pointer"
+                                >
+                                  <Play className="w-3.5 h-3.5" />
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => onStopProject(proj.id)}
+                                  title="Остановить группу процессов (PGID)"
+                                  className="p-1.5 rounded-lg bg-red-600/20 text-red-300 hover:bg-red-600/30 border border-red-500/30 cursor-pointer"
+                                >
+                                  <Square className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+
+                              <button
+                                type="button"
+                                onClick={() => onRestartProject(proj.id)}
+                                title="Перезапустить"
+                                className="p-1.5 rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700 cursor-pointer"
+                              >
+                                <RotateCw className="w-3.5 h-3.5" />
+                              </button>
+
+                              {isAdmin && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setCloningProjectId(proj.id);
+                                    setCloneNameInput(`${proj.name}-copy`);
+                                  }}
+                                  title="Клонировать проект"
+                                  className="p-1.5 rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700 cursor-pointer"
+                                >
+                                  <Copy className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                            </>
                           )}
-
-                          <button
-                            type="button"
-                            onClick={() => onRestartProject(proj.id)}
-                            title="Перезапустить"
-                            className="p-1.5 rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700 cursor-pointer"
-                          >
-                            <RotateCw className="w-3.5 h-3.5" />
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setCloningProjectId(proj.id);
-                              setCloneNameInput(`${proj.name}-copy`);
-                            }}
-                            title="Клонировать проект"
-                            className="p-1.5 rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700 cursor-pointer"
-                          >
-                            <Copy className="w-3.5 h-3.5" />
-                          </button>
 
                           <button
                             type="button"
@@ -1006,54 +1179,56 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </div>
 
-      {/* Сворачиваемая панель быстрых самопроверок (не загромождает основной экран) */}
-      <div className="border border-slate-800 rounded-xl overflow-hidden bg-slate-900/40">
-        <button
-          type="button"
-          onClick={() => setShowSelfTestDrawer(!showSelfTestDrawer)}
-          className="w-full px-4 py-2.5 flex items-center justify-between text-xs text-slate-400 hover:text-slate-200 cursor-pointer"
-        >
-          <span className="flex items-center gap-2 font-medium">
-            <FlaskConical className="w-3.5 h-3.5 text-indigo-400" />
-            Инструменты быстрой самопроверки SDK и живучести процессов (2FA ask, протухшие куки, тест без SIGPIPE)
-          </span>
-          {showSelfTestDrawer ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-        </button>
+      {/* Сворачиваемая панель быстрых самопроверок (скрывается в Чистом Production-режиме или для роли viewer) */}
+      {!productionMode && !isViewer && (
+        <div className="border border-slate-800 rounded-xl overflow-hidden bg-slate-900/40">
+          <button
+            type="button"
+            onClick={() => setShowSelfTestDrawer(!showSelfTestDrawer)}
+            className="w-full px-4 py-2.5 flex items-center justify-between text-xs text-slate-400 hover:text-slate-200 cursor-pointer"
+          >
+            <span className="flex items-center gap-2 font-medium">
+              <FlaskConical className="w-3.5 h-3.5 text-indigo-400" />
+              Инструменты быстрой самопроверки SDK и живучести процессов (2FA ask, протухшие куки, тест без SIGPIPE)
+            </span>
+            {showSelfTestDrawer ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+          </button>
 
-        {showSelfTestDrawer && (
-          <div className="p-4 border-t border-slate-800 bg-[#0f172a]/80 space-y-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                onClick={onTriggerDemoAsk}
-                className="px-3 py-1.5 text-xs font-medium bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 rounded-lg cursor-pointer"
-              >
-                Симулировать запрос 2FA (beacon.ask)
-              </button>
-              <button
-                type="button"
-                onClick={onTriggerDemoExpiredCookie}
-                className="px-3 py-1.5 text-xs font-medium bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30 rounded-lg cursor-pointer"
-              >
-                Симулировать протухание кук (beacon.cookies_expired)
-              </button>
-              <button
-                type="button"
-                onClick={onTestHubRestartSurvival}
-                className="px-3 py-1.5 text-xs font-medium bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 rounded-lg cursor-pointer"
-              >
-                Проверить выживание сервисов при рестарте (без SIGPIPE)
-              </button>
-            </div>
-
-            {restartTestResult && (
-              <div className="p-3 bg-emerald-950/40 border border-emerald-500/40 rounded-lg text-xs font-mono text-emerald-200">
-                {restartTestResult}
+          {showSelfTestDrawer && (
+            <div className="p-4 border-t border-slate-800 bg-[#0f172a]/80 space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={onTriggerDemoAsk}
+                  className="px-3 py-1.5 text-xs font-medium bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 rounded-lg cursor-pointer"
+                >
+                  Симулировать запрос 2FA (beacon.ask)
+                </button>
+                <button
+                  type="button"
+                  onClick={onTriggerDemoExpiredCookie}
+                  className="px-3 py-1.5 text-xs font-medium bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30 rounded-lg cursor-pointer"
+                >
+                  Симулировать протухание кук (beacon.cookies_expired)
+                </button>
+                <button
+                  type="button"
+                  onClick={onTestHubRestartSurvival}
+                  className="px-3 py-1.5 text-xs font-medium bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 rounded-lg cursor-pointer"
+                >
+                  Проверить выживание сервисов при рестарте (без SIGPIPE)
+                </button>
               </div>
-            )}
-          </div>
-        )}
-      </div>
+
+              {restartTestResult && (
+                <div className="p-3 bg-emerald-950/40 border border-emerald-500/40 rounded-lg text-xs font-mono text-emerald-200">
+                  {restartTestResult}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 };

@@ -80,11 +80,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     def _forward_signal(signum: int, _frame: object) -> None:
         if child.poll() is None:
             try:
-                child.send_signal(signum)
+                pgid = os.getpgid(child.pid)
+                if pgid != os.getpgrp():
+                    os.killpg(pgid, signum)
+                else:
+                    child.send_signal(signum)
             except ProcessLookupError:
                 pass
             except OSError:
-                pass
+                try:
+                    child.send_signal(signum)
+                except OSError:
+                    pass
 
     for sig_name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGUSR1", "SIGUSR2"):
         sig = getattr(signal, sig_name, None)

@@ -19,21 +19,49 @@ interface CreateProjectModalProps {
   isOpen: boolean;
   onClose: () => void;
   onCreate: (payload: Record<string, any>) => Promise<void>;
+  globalProxyUrl?: string;
+  globalProxyOnline?: boolean;
 }
 
 type CreateMode = 'template' | 'github';
 type SchedulePreset = 'manual' | 'every_minutes' | 'every_hours' | 'daily_time' | 'custom_cron';
+type ProjectTemplateId =
+  | 'python'
+  | 'web'
+  | 'fastapi'
+  | 'node_api'
+  | 'webhook_job'
+  | 'cookie_parser'
+  | 'tg_bot'
+  | 'node'
+  | 'bash';
 
-const GROUP_OPTIONS = ['Боты 24/7', 'Web / API', 'Парсеры', 'Домашний сервер', 'GitHub', 'Бэкапы', 'Тесты'];
+const GROUP_OPTIONS = [
+  'Микросервисы',
+  'Web / API',
+  'Автоматизация',
+  'Боты 24/7',
+  'Парсеры',
+  'Домашний сервер',
+  'GitHub',
+  'Бэкапы',
+  'Тесты',
+];
 
-export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, onClose, onCreate }) => {
+export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
+  isOpen,
+  onClose,
+  onCreate,
+  globalProxyUrl = '',
+  globalProxyOnline = false,
+}) => {
   const [createMode, setCreateMode] = useState<CreateMode>('template');
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
-  const [groupTag, setGroupTag] = useState('Боты 24/7');
+  const [groupTag, setGroupTag] = useState('Микросервисы');
   const [type, setType] = useState<'service' | 'web' | 'job'>('service');
-  const [template, setTemplate] = useState<'python' | 'web' | 'cookie_parser' | 'tg_bot' | 'node' | 'bash'>('python');
-  const [useProxy, setUseProxy] = useState(true);
+  const [template, setTemplate] = useState<ProjectTemplateId>('python');
+  const [useProxy, setUseProxy] = useState<boolean>(() => Boolean(globalProxyUrl && globalProxyOnline));
   const [customProxy, setCustomProxy] = useState('');
 
   // Параметры для типа 'web' (Web / API бэкенд)
@@ -71,9 +99,12 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
 
   if (!isOpen) return null;
 
-  const runtimeMap: Record<typeof template, 'python' | 'node' | 'bash'> = {
+  const runtimeMap: Record<ProjectTemplateId, 'python' | 'node' | 'bash'> = {
     python: 'python',
     web: 'python',
+    fastapi: 'python',
+    node_api: 'node',
+    webhook_job: 'python',
     cookie_parser: 'python',
     tg_bot: 'python',
     node: 'node',
@@ -216,7 +247,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
         runtime: runtimeMap[template],
         template: type === 'web' && template === 'python' ? 'web' : template,
         cmd: customCmd.trim() || undefined,
-        use_proxy: template === 'tg_bot' || template === 'cookie_parser' ? true : useProxy,
+        use_proxy: useProxy,
         ram_limit_mb: ramLimitMb,
         port: type === 'web' ? webPort : 0,
         healthcheck_url: type === 'web' ? healthcheckUrl.trim() : '',
@@ -475,22 +506,34 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
                 id="proj-template-select"
                 value={template}
                 onChange={(e) => {
-                  const val = e.target.value as typeof template;
+                  const val = e.target.value as ProjectTemplateId;
                   setTemplate(val);
-                  if (val === 'web') setType('web');
+                  if (val === 'web' || val === 'fastapi' || val === 'node_api') {
+                    setType('web');
+                    setGroupTag('Web / API');
+                  } else if (val === 'webhook_job') {
+                    setType('job');
+                    setSchedulePreset('manual');
+                    setGroupTag('Автоматизация');
+                  }
                   if (val === 'tg_bot' || val === 'cookie_parser') {
-                    setUseProxy(true);
+                    if (globalProxyUrl && globalProxyOnline) {
+                      setUseProxy(true);
+                    }
                     setShowOptionalData(true);
                   }
                 }}
                 className="w-full bg-[#0b0f17] border border-slate-700 rounded-lg px-3 py-2.5 text-xs text-white focus:border-indigo-500 focus:outline-none"
               >
-                <option value="python">Python 3 — Стандартный сервис/скрипт (main.py + beacon.state)</option>
-                <option value="web">Python Web / API — HTTP-сервер с $PORT и эндпоинтом /health</option>
+                <option value="python">Python 3 — Универсальный воркер / демон 24/7 (main.py + beacon.state)</option>
+                <option value="fastapi">Python FastAPI + Uvicorn — Production REST API ($PORT + /health)</option>
+                <option value="web">Python BaseHTTP — Лёгкий HTTP-микросервис без внешних зависимостей</option>
+                <option value="node_api">Node.js HTTP API — Микросервис на JavaScript ($PORT + /health + SDK)</option>
+                <option value="node">Node.js Worker — Фоновый сервис / скрипт (index.js + SDK beacon.js)</option>
+                <option value="webhook_job">Webhook / Pipeline Job — Задача с параметрами PARAM_* и цепочками</option>
                 <option value="cookie_parser">Python + Куки/Антибот — поддержка Cookie-Editor и beacon.ask()</option>
-                <option value="tg_bot">Telegram-бот проекта — со своим BOT_TOKEN и прокси 127.0.0.1:10808</option>
-                <option value="node">Node.js — Скрипт/сервис на JavaScript (index.js + SDK beacon.js)</option>
-                <option value="bash">Bash — Системный скрипт командной строки Linux (main.sh)</option>
+                <option value="tg_bot">Telegram-бот — со своим BOT_TOKEN и опциональным прокси</option>
+                <option value="bash">Bash — Системный Linux-скрипт обслуживания / бэкапа (main.sh)</option>
               </select>
             </div>
           )}
@@ -575,7 +618,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
                         : 'bg-[#111622] text-slate-300 border-slate-800'
                     }`}
                   >
-                    Вручную
+                    Вручную / Webhook
                   </button>
                 </div>
 
@@ -622,14 +665,33 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ isOpen, 
             )}
 
             <div className="pt-2 border-t border-slate-800/80 space-y-2">
-              <label className="flex items-center gap-2 text-xs text-slate-200 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={template === 'tg_bot' || template === 'cookie_parser' ? true : useProxy}
-                  onChange={(e) => setUseProxy(e.target.checked)}
-                />
-                Использовать прокси (<code className="font-mono text-indigo-300">127.0.0.1:10808</code> или индивидуальный)
-              </label>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <label className="flex items-center gap-2 text-xs text-slate-200 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={useProxy}
+                    onChange={(e) => setUseProxy(e.target.checked)}
+                  />
+                  <span>
+                    Маршрутизировать трафик через прокси (
+                    <code className="font-mono text-indigo-300">
+                      {globalProxyUrl || 'глобальный не задан'}
+                    </code>{' '}
+                    или свой)
+                  </span>
+                </label>
+                <span
+                  className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
+                    globalProxyUrl && globalProxyOnline
+                      ? 'bg-emerald-950/60 text-emerald-300 border-emerald-700/50'
+                      : 'bg-slate-900 text-slate-400 border-slate-800'
+                  }`}
+                >
+                  {globalProxyUrl && globalProxyOnline
+                    ? 'Прокси ONLINE'
+                    : 'Прямой выход (прокси выкл)'}
+                </span>
+              </div>
 
               {useProxy && (
                 <div className="flex items-center gap-2">

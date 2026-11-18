@@ -1102,6 +1102,61 @@ class TestSecurityAndRbac(unittest.TestCase):
                 asyncio.run(api_exec_project_command(op_req, int(proj_a["id"])))  # type: ignore[arg-type]
             self.assertEqual(ctx_exec.exception.status_code, 403)
 
+    def test_stage1_and_stage2_audit_fixes(self) -> None:
+        from pathlib import Path
+        from hub.api.routes_ui import api_project_runs, api_put_project_yaml
+        from hub.db import bump_db_generation, get_connection
+        from hub.templates_mgr import create_project_from_template
+        from hub.web_auth_mgr import _validate_web_auth_target_url
+
+        with create_temp_hub():
+            proj = make_project("yaml-val-proj")
+            pid = int(proj["id"])
+
+            # 1. PUT /api/projects/{id}/yaml отклоняет невалидный type, runtime и привилегированный порт
+            for bad_yaml in (
+                "name: yaml-val-proj\ntype: invalid_type\nruntime: python\ncmd: python3 main.py\n",
+                "name: yaml-val-proj\ntype: service\nruntime: invalid_rt\ncmd: python3 main.py\n",
+                "name: yaml-val-proj\ntype: web\nruntime: python\nport: 80\ncmd: python3 main.py\n",
+            ):
+                req_bad = DummyRequest(body={"content": bad_yaml})
+                req_bad.state.session = {"role": "admin", "user": "admin"}
+                with self.assertRaises(HTTPException) as ctx_yaml:
+                    asyncio.run(api_put_project_yaml(req_bad, pid))  # type: ignore[arg-type]
+                self.assertEqual(ctx_yaml.exception.status_code, 400)
+
+            # 2. _validate_web_auth_target_url блокирует RFC1918 приватные IP по умолчанию
+            with self.assertRaises(ValueError):
+                _validate_web_auth_target_url("http://192.168.1.1/login")
+
+            # 3. bump_db_generation принудительно обновляет thread-local соединение с SQLite
+            conn1 = get_connection()
+            bump_db_generation()
+            conn2 = get_connection()
+            self.assertIsNot(conn1, conn2)
+
+            # 4. Новые универсальные шаблоны (fastapi, node_api, webhook_job) создаются корректно
+            for tpl_id, rt, ptype in (
+                ("fastapi", "python", "web"),
+                ("node_api", "node", "web"),
+                ("webhook_job", "python", "job"),
+            ):
+                meta = create_project_from_template(f"tpl-{tpl_id}", tpl_id, rt, ptype)
+                wdir = Path(meta["workdir"])
+                self.assertTrue((wdir / "project.yaml").exists())
+                self.assertTrue(meta["cmd"])
+
+            # 5. Запись и возврат triggered_by в истории запусков
+            execute_sql(
+                """INSERT INTO runs (project_id, status, trigger, triggered_by, started_at, log_path, run_token)
+                   VALUES (?, 'success', 'manual', 'operator_alex', 100, '/tmp/r.log', 'rtok_alex')""",
+                (pid,),
+            )
+            runs_list = asyncio.run(api_project_runs(DummyRequest(), pid))  # type: ignore[arg-type]
+            self.assertGreaterEqual(len(runs_list), 1)
+            self.assertEqual(runs_list[0]["triggered_by"], "operator_alex")
+
 
 if __name__ == "__main__":
     unittest.main()
+
