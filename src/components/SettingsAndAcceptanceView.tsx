@@ -19,9 +19,17 @@ import {
   Download,
   Upload,
   Terminal,
+  Activity,
+  Copy,
 } from 'lucide-react';
 import { AcceptanceCheckItem, AuditEntry, ProjectItem } from '../types/hub';
-import { describeScheduleHuman, formatBytes, isPortAllowed, validateNewPassword } from '../utils/hubLogic';
+import {
+  buildPrometheusScrapeConfig,
+  describeScheduleHuman,
+  formatBytes,
+  isPortAllowed,
+  validateNewPassword,
+} from '../utils/hubLogic';
 
 interface SettingsAndAcceptanceViewProps {
   mode: 'settings' | 'acceptance';
@@ -66,6 +74,10 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
   const [tgCmdPreview, setTgCmdPreview] = useState<string>('');
   const [auditLogs, setAuditLogs] = useState<AuditEntry[]>([]);
   const [auditSearch, setAuditSearch] = useState<string>('');
+  const [exportingAudit, setExportingAudit] = useState<'csv' | 'json' | null>(null);
+  const [prometheusMetricsText, setPrometheusMetricsText] = useState<string>('');
+  const [loadingMetrics, setLoadingMetrics] = useState<boolean>(false);
+  const [metricsCopied, setMetricsCopied] = useState<boolean>(false);
   const [settingsSubTab, setSettingsSubTab] = useState<
     'all' | 'security_net' | 'notifications' | 'resources_power' | 'rbac_backup' | 'audit'
   >('security_net');
@@ -149,6 +161,44 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
       }
     } finally {
       setRunningDoctor(false);
+    }
+  };
+
+  const handleExportAudit = async (fmt: 'csv' | 'json') => {
+    setExportingAudit(fmt);
+    try {
+      const qs = new URLSearchParams({ format: fmt });
+      if (auditSearch.trim()) qs.set('q', auditSearch.trim());
+      const res = await apiFetch(`/api/system/audit/export?${qs.toString()}`);
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `beacon_audit.${fmt}`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      }
+    } finally {
+      setExportingAudit(null);
+    }
+  };
+
+  const handleLoadPrometheusMetrics = async () => {
+    setLoadingMetrics(true);
+    try {
+      const res = await apiFetch('/api/metrics');
+      if (res.ok) {
+        setPrometheusMetricsText(await res.text());
+      } else {
+        setPrometheusMetricsText('# Ошибка загрузки /api/metrics');
+      }
+    } catch {
+      setPrometheusMetricsText('# Ошибка сети при чтении /api/metrics');
+    } finally {
+      setLoadingMetrics(false);
     }
   };
 
@@ -757,7 +807,7 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
               { id: 'notifications', label: '2. Telegram-бот и Оповещения' },
               { id: 'resources_power', label: '3. Диск, Логи и Питание' },
               { id: 'rbac_backup', label: `4. Пользователи (${users.length}), Бэкап и Systemd` },
-              { id: 'audit', label: `5. Журнал аудита (${auditLogs.length})` },
+              { id: 'audit', label: `5. Аудит и Prometheus (${auditLogs.length})` },
               { id: 'all', label: 'Все разделы сразу' },
             ] as const
           ).map((tab) => (
@@ -1236,11 +1286,15 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
                 </div>
 
                 <div className="p-3.5 bg-[#0f172a]/80 border border-slate-800 rounded-xl space-y-2">
-                  <div className="text-xs font-semibold text-white">Внешний Webhook для алертов</div>
-                  <p className="text-[11px] text-slate-400">POST JSON при сбоях, OOM и истечении кук</p>
+                  <div className="text-xs font-semibold text-white">
+                    Универсальный Webhook (Discord / Slack / Mattermost / n8n)
+                  </div>
+                  <p className="text-[11px] text-slate-400">
+                    Автоматически определяет формат Discord (<code className="font-mono">content</code>), Slack (<code className="font-mono">text</code>) или полный JSON при сбоях, OOM и истечении кук
+                  </p>
                   <input
                     type="text"
-                    placeholder="https://example.com/api/alerts"
+                    placeholder="https://discord.com/api/webhooks/... или https://hooks.slack.com/..."
                     value={settings.webhook_url || ''}
                     onChange={(e) => setSettings({ ...settings, webhook_url: e.target.value })}
                     className="w-full bg-[#0b0f17] border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono text-white"
@@ -1870,14 +1924,34 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <input
                 type="text"
                 value={auditSearch}
                 onChange={(e) => setAuditSearch(e.target.value)}
                 placeholder="Фильтр по событию, IP, актору..."
-                className="bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-500 w-56"
+                className="bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-500 w-52"
               />
+              <button
+                type="button"
+                disabled={exportingAudit === 'csv'}
+                onClick={() => handleExportAudit('csv')}
+                className="px-2.5 py-1.5 text-xs font-mono text-emerald-200 bg-emerald-950/50 hover:bg-emerald-900/60 border border-emerald-700/60 rounded-lg inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                title="Экспортировать журнал аудита в CSV (с защитой от Excel Formula Injection)"
+              >
+                <Download className="w-3.5 h-3.5" />
+                {exportingAudit === 'csv' ? '...' : 'CSV'}
+              </button>
+              <button
+                type="button"
+                disabled={exportingAudit === 'json'}
+                onClick={() => handleExportAudit('json')}
+                className="px-2.5 py-1.5 text-xs font-mono text-indigo-200 bg-indigo-950/50 hover:bg-indigo-900/60 border border-indigo-700/60 rounded-lg inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                title="Экспортировать журнал аудита в JSON"
+              >
+                <Download className="w-3.5 h-3.5" />
+                {exportingAudit === 'json' ? '...' : 'JSON'}
+              </button>
               <button
                 type="button"
                 onClick={loadSettingsAndAudit}
@@ -1914,6 +1988,69 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
                 ))}
               </tbody>
             </table>
+          </div>
+        </section>
+      )}
+
+      {showAudit && (
+        <section className="bg-[#1e293b] border border-slate-800 rounded-xl p-5 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
+            <div className="flex items-center gap-2.5">
+              <Activity className="w-4 h-4 text-amber-400 shrink-0" />
+              <div>
+                <h3 className="text-sm font-semibold text-white">
+                  Мониторинг Prometheus / Grafana (<code className="font-mono text-amber-300">/api/metrics</code>)
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Экспорт метрик OpenMetrics (ОЗУ Beacon, CPU/RAM хоста, аптайм, RSS/Peak RSS и счётчики запусков по каждому проекту). Защищён сессией или Bearer-токеном с правом <code className="font-mono text-slate-300">read</code>.
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                disabled={loadingMetrics}
+                onClick={handleLoadPrometheusMetrics}
+                className="px-3.5 py-2 text-xs font-semibold bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-slate-950 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+              >
+                <Activity className="w-3.5 h-3.5" />
+                {loadingMetrics ? 'Загрузка...' : 'Показать живые метрики'}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const cfg = buildPrometheusScrapeConfig(
+                    typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:8050'
+                  );
+                  navigator.clipboard?.writeText(cfg);
+                  setMetricsCopied(true);
+                  setTimeout(() => setMetricsCopied(false), 2000);
+                }}
+                className="px-3 py-2 text-xs font-mono text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+              >
+                <Copy className="w-3.5 h-3.5" />
+                {metricsCopied ? 'Скопировано!' : 'Копировать prometheus.yml'}
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="space-y-1.5">
+              <div className="text-xs font-mono text-slate-400">Пример секции для prometheus.yml:</div>
+              <pre className="p-3.5 rounded-lg bg-[#0b0f17] border border-slate-800 text-[11px] font-mono text-indigo-200 overflow-x-auto leading-relaxed">
+                {buildPrometheusScrapeConfig(
+                  typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:8050'
+                )}
+              </pre>
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="text-xs font-mono text-slate-400">Живой вывод GET /api/metrics:</div>
+              <pre className="p-3.5 rounded-lg bg-[#0b0f17] border border-slate-800 text-[11px] font-mono text-emerald-200 max-h-56 overflow-auto leading-relaxed">
+                {prometheusMetricsText ||
+                  '# Нажмите «Показать живые метрики» выше для предпросмотра OpenMetrics'}
+              </pre>
+            </div>
           </div>
         </section>
       )}

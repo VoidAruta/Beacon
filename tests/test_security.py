@@ -1156,7 +1156,249 @@ class TestSecurityAndRbac(unittest.TestCase):
             self.assertGreaterEqual(len(runs_list), 1)
             self.assertEqual(runs_list[0]["triggered_by"], "operator_alex")
 
+            # 6. Stage 3: RBAC и групповая операция api_batch_project_action + журнал входящих вебхуков
+            from hub.api.routes_ui import api_batch_project_action, api_get_project_webhooks, api_test_project_webhook
+
+            self.assertTrue(_check_rbac_permission("operator", "POST", "/api/projects/batch_action"))
+            self.assertFalse(_check_rbac_permission("viewer", "POST", "/api/projects/batch_action"))
+            self.assertTrue(_check_rbac_permission("viewer", "GET", f"/api/projects/{pid}/webhooks"))
+
+            batch_req = DummyRequest(body={"action": "stop", "project_ids": [pid]})
+            batch_req.state.session = {"role": "operator", "user": "op_batch"}
+            batch_res = asyncio.run(api_batch_project_action(batch_req))  # type: ignore[arg-type]
+            self.assertTrue(batch_res["ok"])
+            self.assertEqual(batch_res["affected"], 1)
+
+            wh_proj = make_project(
+                "wh-payload-proj",
+                proj_type="job",
+                cmd="python3 -c 'import os; print(os.getenv(\"BEACON_WEBHOOK_EVENT\", \"\"), os.getenv(\"BEACON_WEBHOOK_PAYLOAD\", \"\"))'",
+            )
+            wh_pid = int(wh_proj["id"])
+            wh_req = DummyRequest(body={"event": "github.push", "payload": {"branch": "main", "commit": "abc1234"}})
+            wh_req.state.session = {"role": "operator", "user": "op_wh"}
+            wh_test_res = asyncio.run(api_test_project_webhook(wh_req, wh_pid))  # type: ignore[arg-type]
+            self.assertTrue(wh_test_res["ok"])
+            self.assertEqual(wh_test_res["delivery"]["event"], "github.push")
+            self.assertIn("abc1234", wh_test_res["delivery"]["payload_preview"])
+
+            wh_list = asyncio.run(api_get_project_webhooks(DummyRequest(), wh_pid))  # type: ignore[arg-type]
+            self.assertEqual(len(wh_list["deliveries"]), 1)
+            self.assertEqual(wh_list["deliveries"][0]["status_code"], 200)
+
+            # 7. Stage 4: SSRF Guard для исходящих вебхуков, Тихий режим (Maintenance Mute) и Клонирование проектов
+            from hub.api.routes_ui import api_clone_project, api_set_maintenance_mute
+            from hub.notifier import _is_safe_outbound_webhook_url, send_notification
+
+            self.assertFalse(_is_safe_outbound_webhook_url("http://127.0.0.1:8050/api")[0])
+            self.assertFalse(_is_safe_outbound_webhook_url("http://169.254.169.254/latest/meta-data")[0])
+            self.assertFalse(_is_safe_outbound_webhook_url("http://localhost:9000/hook")[0])
+            self.assertFalse(_is_safe_outbound_webhook_url("file:///etc/passwd")[0])
+
+            mute_req = DummyRequest(body={"duration_sec": 3600})
+            mute_req.state.session = {"role": "operator", "user": "op_mute"}
+            mute_res = asyncio.run(api_set_maintenance_mute(mute_req))  # type: ignore[arg-type]
+            self.assertTrue(mute_res["ok"])
+            self.assertTrue(mute_res["muted"])
+
+            muted_notify = asyncio.run(send_notification("Test during maintenance", level="warn"))
+            self.assertTrue(muted_notify.get("muted"))
+            self.assertEqual(muted_notify.get("channels"), [])
+
+            unmute_req = DummyRequest(body={"duration_sec": 0})
+            unmute_req.state.session = {"role": "operator", "user": "op_mute"}
+            unmute_res = asyncio.run(api_set_maintenance_mute(unmute_req))  # type: ignore[arg-type]
+            self.assertFalse(unmute_res["muted"])
+
+            clone_req = DummyRequest(body={"name": "wh-payload-clone"})
+            clone_req.state.session = {"role": "admin", "user": "admin"}
+            clone_res = asyncio.run(api_clone_project(clone_req, wh_pid))  # type: ignore[arg-type]
+            self.assertTrue(clone_res["ok"])
+            self.assertEqual(clone_res["project"]["name"], "wh-payload-clone")
+
+            # 8. Stage 5: Локальные снапшоты файлов (история версий), Git Info/Rollback и DEPENDS_ON
+            import subprocess
+            from hub.api.routes_ui import (
+                _enrich_project,
+                api_list_file_snapshots,
+                api_project_git_info,
+                api_project_git_rollback,
+                api_put_file_content,
+                api_restore_file_snapshot,
+            )
+            from hub.process_mgr import ACTIVE_RUNS, start_project_run, stop_project
+
+            snap_proj = make_project("snap-git-proj")
+            snap_pid = int(snap_proj["id"])
+            snap_wdir = Path(snap_proj["workdir"])
+            (snap_wdir / "app.py").write_text("print('version_1')\n", encoding="utf-8")
+
+            put_req = DummyRequest(body={"path": "app.py", "content": "print('version_2')\n"})
+            put_req.state.session = {"role": "admin", "user": "admin"}
+            put_res = asyncio.run(api_put_file_content(put_req, snap_pid))  # type: ignore[arg-type]
+            self.assertTrue(put_res["ok"])
+            self.assertIsNotNone(put_res["snapshot_id"])
+
+            list_snap_req = DummyRequest(query_params={"path": "app.py"})
+            list_snap_req.state.session = {"role": "admin", "user": "admin"}
+            snaps_res = asyncio.run(api_list_file_snapshots(list_snap_req, snap_pid))  # type: ignore[arg-type]
+            self.assertEqual(len(snaps_res["snapshots"]), 1)
+            snap_id = snaps_res["snapshots"][0]["id"]
+
+            restore_req = DummyRequest(body={"path": "app.py", "snapshot_id": snap_id})
+            restore_req.state.session = {"role": "admin", "user": "admin"}
+            restored_res = asyncio.run(api_restore_file_snapshot(restore_req, snap_pid))  # type: ignore[arg-type]
+            self.assertTrue(restored_res["ok"])
+            self.assertEqual((snap_wdir / "app.py").read_text(encoding="utf-8"), "print('version_1')\n")
+
+            # Git Info без .git -> is_git=False
+            git_info_none = asyncio.run(api_project_git_info(DummyRequest(), snap_pid))  # type: ignore[arg-type]
+            self.assertFalse(git_info_none["is_git"])
+
+            # Инициализируем локальный git-репозиторий с 2 коммитами и проверяем откат (rollback)
+            subprocess.run(["git", "init"], cwd=str(snap_wdir), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "ci@beacon.local"], cwd=str(snap_wdir), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Beacon CI"], cwd=str(snap_wdir), check=True, capture_output=True)
+            subprocess.run(["git", "add", "app.py"], cwd=str(snap_wdir), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "Commit 1"], cwd=str(snap_wdir), check=True, capture_output=True)
+            (snap_wdir / "app.py").write_text("print('commit_2')\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=str(snap_wdir), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "Commit 2"], cwd=str(snap_wdir), check=True, capture_output=True)
+
+            git_info_ok = asyncio.run(api_project_git_info(DummyRequest(), snap_pid))  # type: ignore[arg-type]
+            self.assertTrue(git_info_ok["is_git"])
+            self.assertEqual(len(git_info_ok["commits"]), 2)
+            first_commit_hash = git_info_ok["commits"][1]["hash"]
+
+            rb_req = DummyRequest(body={"commit": first_commit_hash, "restart_after": False})
+            rb_req.state.session = {"role": "admin", "user": "admin"}
+            rb_res = asyncio.run(api_project_git_rollback(rb_req, snap_pid))  # type: ignore[arg-type]
+            self.assertTrue(rb_res["ok"])
+            self.assertEqual((snap_wdir / "app.py").read_text(encoding="utf-8"), "print('version_1')\n")
+
+            # DEPENDS_ON: запуск зависимого проекта автоматически стартует сервис-зависимость
+            dep_base = make_project(
+                "dep-base-svc",
+                proj_type="service",
+                cmd="python3 -c 'import time; time.sleep(30)'",
+            )
+            dep_child = make_project(
+                "dep-child-job",
+                proj_type="job",
+                cmd="python3 -c 'print(\"child ok\")'",
+                env_json=json.dumps({"DEPENDS_ON": "dep-base-svc", "AUTO_GIT_PULL": "1"}),
+            )
+            enriched_child = _enrich_project(dep_child)
+            self.assertEqual(enriched_child["depends_on"], "dep-base-svc")
+            self.assertTrue(enriched_child["auto_git_pull"])
+            try:
+                asyncio.run(start_project_run(int(dep_child["id"]), trigger="manual"))
+                self.assertTrue(
+                    any(info.get("project_id") == int(dep_base["id"]) for info in ACTIVE_RUNS.values())
+                )
+            finally:
+                asyncio.run(stop_project(int(dep_child["id"])))
+                asyncio.run(stop_project(int(dep_base["id"])))
+
+            # 9. Stage 6: Кросс-поиск по логам, SLA-аналитика, Prometheus /api/metrics и экспорт аудита CSV/JSON
+            from hub.api.routes_ui import (
+                api_analytics_summary,
+                api_export_audit_logs,
+                api_prometheus_metrics,
+                api_search_all_logs,
+            )
+
+            # RBAC: viewer может читать поиск логов, SLA и metrics, но НЕ экспорт аудита
+            self.assertTrue(_check_rbac_permission("viewer", "GET", "/api/logs/search"))
+            self.assertTrue(_check_rbac_permission("viewer", "GET", "/api/analytics/summary"))
+            self.assertTrue(_check_rbac_permission("viewer", "GET", "/api/metrics"))
+            self.assertFalse(_check_rbac_permission("viewer", "GET", "/api/system/audit/export"))
+            self.assertFalse(_check_rbac_permission("operator", "GET", "/api/system/audit/export"))
+
+            # Создаём лог-файл с ошибкой и проверяем api_search_all_logs
+            log_file = Path(snap_wdir) / "test_run.log"
+            log_file.write_text(
+                "2026-11-19 [INFO] Service booted\n2026-11-19 [ERROR] Database connection timeout on shard-7\n",
+                encoding="utf-8",
+            )
+            execute_sql(
+                """INSERT INTO runs (project_id, status, trigger, started_at, finished_at, log_path, run_token)
+                   VALUES (?, 'failed', 'manual', ?, ?, ?, 'rtok_stage6')""",
+                (snap_pid, int(time.time()) - 30, int(time.time()) - 20, str(log_file)),
+            )
+            search_res = asyncio.run(
+                api_search_all_logs(DummyRequest(query_params={"q": "shard-7", "level": "error_only"}))  # type: ignore[arg-type]
+            )
+            self.assertTrue(search_res["ok"])
+            self.assertEqual(search_res["total_matches"], 1)
+            self.assertEqual(search_res["matches"][0]["project_id"], snap_pid)
+            self.assertEqual(search_res["matches"][0]["level"], "error")
+
+            # SLA-аналитика
+            sla_res = asyncio.run(api_analytics_summary(DummyRequest(query_params={"days": "7"})))  # type: ignore[arg-type]
+            self.assertTrue(sla_res["ok"])
+            snap_sla = next(item for item in sla_res["projects"] if item["project_id"] == snap_pid)
+            self.assertGreaterEqual(snap_sla["failed_runs"], 1)
+            self.assertIn("failed", snap_sla["recent_statuses"])
+
+            # Prometheus OpenMetrics
+            metrics_resp = asyncio.run(api_prometheus_metrics(DummyRequest()))  # type: ignore[arg-type]
+            metrics_text = metrics_resp.body.decode("utf-8")
+            self.assertIn("beacon_hub_rss_bytes", metrics_text)
+            self.assertIn('beacon_project_up{project="snap-git-proj"', metrics_text)
+
+            # Экспорт аудита CSV (с защитой от Formula Injection) и JSON
+            execute_sql(
+                "INSERT INTO audit_log (timestamp, ip, actor, action, details) VALUES (?, ?, ?, ?, ?)",
+                (int(time.time()), "127.0.0.1", "admin", "FORMULA_TEST", "=HYPERLINK(\"http://evil\")"),
+            )
+            csv_req = DummyRequest(query_params={"format": "csv", "q": "FORMULA_TEST"})
+            csv_req.state.session = {"role": "admin", "user": "admin"}
+            csv_resp = asyncio.run(api_export_audit_logs(csv_req))  # type: ignore[arg-type]
+            csv_text = csv_resp.body.decode("utf-8")
+            self.assertIn("'=HYPERLINK", csv_text)
+
+            json_req = DummyRequest(query_params={"format": "json", "q": "FORMULA_TEST"})
+            json_req.state.session = {"role": "admin", "user": "admin"}
+            json_resp = asyncio.run(api_export_audit_logs(json_req))  # type: ignore[arg-type]
+            json_data = json.loads(json_resp.body.decode("utf-8"))
+            self.assertEqual(json_data["count"], 1)
+
+            # 10. Stage 7: Карта портов (/api/system/ports), Дерево PGID (/api/projects/{id}/processes) и RBAC
+            from hub.api.routes_ui import api_project_processes, api_system_ports
+
+            self.assertTrue(_check_rbac_permission("viewer", "GET", "/api/system/ports"))
+            self.assertTrue(_check_rbac_permission("viewer", "GET", f"/api/projects/{snap_pid}/processes"))
+            self.assertTrue(_check_rbac_permission("operator", "GET", "/api/system/ports"))
+
+            # Порт-мэппинг: настраиваем порт проекта и проверяем ответ api_system_ports
+            execute_sql("UPDATE projects SET port = 18099 WHERE id = ?", (snap_pid,))
+            ports_res = asyncio.run(api_system_ports(DummyRequest()))  # type: ignore[arg-type]
+            self.assertTrue(ports_res["ok"])
+            self.assertGreaterEqual(ports_res["suggested_free_port"], 18080)
+            self.assertNotEqual(ports_res["suggested_free_port"], 18099)
+            snap_port_entry = next((e for e in ports_res["ports"] if e["port"] == 18099), None)
+            self.assertIsNotNone(snap_port_entry)
+            self.assertEqual(snap_port_entry["project_id"], snap_pid)
+
+            # Дерево процессов PGID для остановленного и запущенного проекта
+            stopped_procs = asyncio.run(api_project_processes(DummyRequest(), snap_pid))  # type: ignore[arg-type]
+            self.assertTrue(stopped_procs["ok"])
+            self.assertFalse(stopped_procs["running"])
+            self.assertEqual(stopped_procs["processes"], [])
+
+            proc_proj = make_project("pgid-tree-svc", proj_type="service", cmd="python3 -c 'import time; time.sleep(30)'")
+            try:
+                asyncio.run(start_project_run(int(proc_proj["id"]), trigger="manual"))
+                live_procs = asyncio.run(api_project_processes(DummyRequest(), int(proc_proj["id"])))  # type: ignore[arg-type]
+                self.assertTrue(live_procs["ok"])
+                self.assertTrue(live_procs["running"])
+                self.assertGreaterEqual(live_procs["process_count"], 1)
+                self.assertEqual(live_procs["processes"][0]["pid"], live_procs["root_pid"])
+                self.assertTrue(live_procs["processes"][0]["is_root"])
+            finally:
+                asyncio.run(stop_project(int(proc_proj["id"])))
+
 
 if __name__ == "__main__":
     unittest.main()
-

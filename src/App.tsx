@@ -18,6 +18,8 @@ import {
   BookOpen,
   DownloadCloud,
   Globe,
+  BellOff,
+  Bell,
 } from 'lucide-react';
 import { DashboardData, ProjectItem, SecretItem, WorkspaceSubTab } from './types/hub';
 import { GlobalAlertBanners } from './components/GlobalAlertBanners';
@@ -482,6 +484,20 @@ export function App() {
     setCsrfToken('');
   };
 
+  const isMaintenanceMuted = Boolean(
+    dashboard?.system?.alerts_muted_until &&
+      dashboard.system.alerts_muted_until > Math.floor(Date.now() / 1000)
+  );
+
+  const handleToggleMaintenanceMute = async () => {
+    const durationSec = isMaintenanceMuted ? 0 : 3600;
+    await apiFetch('/api/settings/maintenance', {
+      method: 'POST',
+      body: JSON.stringify({ duration_sec: durationSec }),
+    });
+    await loadAllData();
+  };
+
   const handleStartProject = async (id: number, params?: Record<string, string>) => {
     const res = await apiFetch(`/api/projects/${id}/start`, {
       method: 'POST',
@@ -508,6 +524,17 @@ export function App() {
       body: JSON.stringify({}),
     });
     const data = await res.json();
+    await loadAllData();
+    return data;
+  };
+
+  const handleBatchProjectAction = async (action: 'start' | 'stop' | 'restart', projectIds: number[]) => {
+    if (!projectIds.length) return;
+    const res = await apiFetch('/api/projects/batch_action', {
+      method: 'POST',
+      body: JSON.stringify({ action, project_ids: projectIds }),
+    });
+    const data = await res.json().catch(() => ({}));
     await loadAllData();
     return data;
   };
@@ -568,10 +595,10 @@ export function App() {
     setActiveTab('projects');
   };
 
-  const handleCloneProject = async (id: number) => {
+  const handleCloneProject = async (id: number, newName?: string) => {
     const res = await apiFetch(`/api/projects/${id}/clone`, {
       method: 'POST',
-      body: JSON.stringify({}),
+      body: JSON.stringify(newName ? { name: newName } : {}),
     });
     if (res.ok) {
       const data = await res.json();
@@ -824,6 +851,37 @@ export function App() {
             >
               Войти в панель
             </button>
+
+            <div className="pt-3 border-t border-slate-800/80 space-y-2 text-[11px] text-slate-400">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <span>Быстрая подстановка для превью / тестов:</span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLoginUsername('admin');
+                      setLoginPassword('admin');
+                    }}
+                    className="px-2 py-0.5 font-mono text-[11px] bg-slate-800 hover:bg-slate-700 text-indigo-300 rounded border border-slate-700 cursor-pointer"
+                  >
+                    admin
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLoginUsername('admin');
+                      setLoginPassword('BeaconAdmin2026!');
+                    }}
+                    className="px-2 py-0.5 font-mono text-[11px] bg-slate-800 hover:bg-slate-700 text-emerald-300 rounded border border-slate-700 cursor-pointer"
+                  >
+                    BeaconAdmin2026!
+                  </button>
+                </div>
+              </div>
+              <p className="text-[10px] text-slate-500">
+                Сброс пароля на сервере через CLI: <code className="font-mono text-slate-300">python3 -m hub --reset-password</code>
+              </p>
+            </div>
           </form>
         </div>
       </div>
@@ -1305,6 +1363,35 @@ export function App() {
                 <span className="hidden sm:inline">{t('Обновить', 'Update')}</span>
               </button>
 
+              {/* Кнопка тихого режима (Пауза внешних уведомлений на 1 час во время техработ) */}
+              {userRole !== 'viewer' && (
+                <button
+                  type="button"
+                  onClick={handleToggleMaintenanceMute}
+                  className={`px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition-colors inline-flex items-center gap-1.5 cursor-pointer ${
+                    isMaintenanceMuted
+                      ? 'bg-amber-950/80 text-amber-300 border-amber-500/50 hover:bg-amber-900'
+                      : 'bg-[#111622] text-slate-300 hover:text-white border-slate-800'
+                  }`}
+                  title={t(
+                    'Тихий режим (Maintenance): поставить внешние алерты Telegram/Discord/Slack/ntfy на паузу на 1 час',
+                    'Maintenance Mode: mute outbound Telegram/Discord/Slack/ntfy alerts for 1 hour'
+                  )}
+                >
+                  {isMaintenanceMuted ? (
+                    <>
+                      <BellOff className="w-3.5 h-3.5 text-amber-400" />
+                      <span className="hidden md:inline">{t('Алерты: пауза', 'Alerts Muted')}</span>
+                    </>
+                  ) : (
+                    <>
+                      <Bell className="w-3.5 h-3.5 text-slate-400" />
+                      <span className="hidden md:inline">{t('Тихий режим', 'Mute Alerts')}</span>
+                    </>
+                  )}
+                </button>
+              )}
+
               {/* Кнопка экстренной блокировки ИИ (Пауза ИИ) в шапке (Фаза B.6) */}
               <button
                 type="button"
@@ -1360,6 +1447,7 @@ export function App() {
                 onStartProject={handleStartProject}
                 onStopProject={handleStopProject}
                 onRestartProject={handleRestartProject}
+                onBatchProjectAction={handleBatchProjectAction}
                 onCloneProject={handleCloneProject}
                 onImportExamples={handleImportExamples}
                 onOpenCommandPalette={() => setCommandPaletteOpen(true)}
@@ -1375,6 +1463,7 @@ export function App() {
                 onTriggerDemoExpiredCookie={() => handleExpireCookie('cookie-checker-job_cookies')}
                 onTestHubRestartSurvival={handleTestHubRestartSurvival}
                 restartTestResult={restartTestResult}
+                apiFetch={apiFetch}
               />
             )}
 

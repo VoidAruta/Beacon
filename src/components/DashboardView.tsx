@@ -28,13 +28,18 @@ import {
   Layers,
   FlaskConical,
   HelpCircle,
+  BarChart3,
+  RefreshCw,
 } from 'lucide-react';
 import { DashboardData, ProjectItem, WorkspaceSubTab } from '../types/hub';
 import {
+  classifyPortOwnerBadge,
+  classifySlaTier,
   filterDashboardProjects,
   formatBytes,
   formatDurationSeconds,
   getRunStatusBadge,
+  getSlaStatusBarColor,
   ProjectTypeFilter,
 } from '../utils/hubLogic';
 
@@ -48,6 +53,7 @@ interface DashboardViewProps {
   onStartProject: (id: number) => void;
   onStopProject: (id: number) => void;
   onRestartProject: (id: number) => void;
+  onBatchProjectAction?: (action: 'start' | 'stop' | 'restart', projectIds: number[]) => Promise<any>;
   onCloneProject: (id: number, newName: string) => void;
   onImportExamples: () => void;
   onOpenCommandPalette: () => void;
@@ -57,6 +63,7 @@ interface DashboardViewProps {
   onTriggerDemoExpiredCookie: () => void;
   onTestHubRestartSurvival: () => void;
   restartTestResult: string | null;
+  apiFetch?: (path: string, options?: RequestInit) => Promise<Response>;
 }
 
 function formatRateKbps(kbps: number): string {
@@ -85,6 +92,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onStartProject,
   onStopProject,
   onRestartProject,
+  onBatchProjectAction,
   onCloneProject,
   onImportExamples,
   onOpenCommandPalette,
@@ -94,14 +102,81 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onTriggerDemoExpiredCookie,
   onTestHubRestartSurvival,
   restartTestResult,
+  apiFetch,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState<ProjectTypeFilter>('all');
   const [groupFilter, setGroupFilter] = useState<string>('all');
   const [hideTests, setHideTests] = useState(false);
+  const [batchBusy, setBatchBusy] = useState<string | null>(null);
   const [cloningProjectId, setCloningProjectId] = useState<number | null>(null);
   const [cloneNameInput, setCloneNameInput] = useState('');
-  const [activeLogTab, setActiveLogTab] = useState<'errors' | 'notifications' | 'schedule'>('errors');
+  const [activeLogTab, setActiveLogTab] = useState<'errors' | 'notifications' | 'schedule' | 'log_search' | 'sla' | 'ports'>('errors');
+  const [logSearchText, setLogSearchText] = useState('');
+  const [logSearchLevel, setLogSearchLevel] = useState<'all' | 'warn_error' | 'error_only'>('error_only');
+  const [logSearchProjId, setLogSearchProjId] = useState<string>('');
+  const [logSearchLoading, setLogSearchLoading] = useState(false);
+  const [logSearchResult, setLogSearchResult] = useState<{
+    total_matches: number;
+    scanned_projects: number;
+    matches: Array<{
+      project_id: number;
+      project_name: string;
+      run_id: number;
+      run_status: string;
+      line_number: number;
+      level: string;
+      text: string;
+    }>;
+  } | null>(null);
+
+  const [slaDays, setSlaDays] = useState<number>(7);
+  const [slaLoading, setSlaLoading] = useState(false);
+  const [slaData, setSlaData] = useState<{
+    days: number;
+    fleet: {
+      projects_count: number;
+      total_runs: number;
+      failed_runs: number;
+      oom_kills: number;
+      overall_sla_pct: number;
+    };
+    projects: Array<{
+      project_id: number;
+      project_name: string;
+      type: string;
+      current_status: string;
+      total_runs: number;
+      success_runs: number;
+      failed_runs: number;
+      oom_kills: number;
+      timeouts: number;
+      crash_loops: number;
+      success_rate_pct: number | null;
+      avg_duration_sec: number;
+      peak_rss_mb: number;
+      recent_statuses: string[];
+    }>;
+  } | null>(null);
+  const [portMapLoading, setPortMapLoading] = useState(false);
+  const [portMapData, setPortMapData] = useState<{
+    hub_port: number;
+    listening_count: number;
+    configured_count: number;
+    conflict_count: number;
+    suggested_free_port: number;
+    ports: Array<{
+      port: number;
+      bind_addr: string;
+      listening: boolean;
+      owner_kind: string;
+      pid: number | null;
+      process_name: string;
+      project_id: number | null;
+      project_name: string;
+      note: string;
+    }>;
+  } | null>(null);
   const [showSelfTestDrawer, setShowSelfTestDrawer] = useState(false);
   const [showDashboardHelp, setShowDashboardHelp] = useState(false);
   const [onboardingDismissed, setOnboardingDismissed] = useState<boolean>(() => {
@@ -158,6 +233,68 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       totalProcs,
     };
   }, [projects]);
+
+  const runGlobalLogSearch = async (
+    overrideQuery?: string,
+    overrideLevel?: 'all' | 'warn_error' | 'error_only',
+    overrideProjId?: string
+  ) => {
+    if (!apiFetch) return;
+    const q = (overrideQuery !== undefined ? overrideQuery : logSearchText).trim();
+    const lvl = overrideLevel !== undefined ? overrideLevel : logSearchLevel;
+    const pid = overrideProjId !== undefined ? overrideProjId : logSearchProjId;
+    setLogSearchLoading(true);
+    try {
+      const qs = new URLSearchParams({ q, level: lvl, limit: '100' });
+      if (pid) qs.set('project_id', pid);
+      const res = await apiFetch(`/api/logs/search?${qs.toString()}`);
+      if (res.ok) {
+        const payload = await res.json();
+        setLogSearchResult({
+          total_matches: Number(payload.total_matches || 0),
+          scanned_projects: Number(payload.scanned_projects || 0),
+          matches: Array.isArray(payload.matches) ? payload.matches : [],
+        });
+      }
+    } catch {
+      // ignore transient error
+    } finally {
+      setLogSearchLoading(false);
+    }
+  };
+
+  const loadSlaAnalytics = async (daysVal: number) => {
+    if (!apiFetch) return;
+    setSlaDays(daysVal);
+    setSlaLoading(true);
+    try {
+      const res = await apiFetch(`/api/analytics/summary?days=${daysVal}`);
+      if (res.ok) {
+        const payload = await res.json();
+        setSlaData(payload);
+      }
+    } catch {
+      // ignore transient error
+    } finally {
+      setSlaLoading(false);
+    }
+  };
+
+  const loadPortMap = async () => {
+    if (!apiFetch) return;
+    setPortMapLoading(true);
+    try {
+      const res = await apiFetch('/api/system/ports');
+      if (res.ok) {
+        const payload = await res.json();
+        setPortMapData(payload);
+      }
+    } catch {
+      // ignore transient error
+    } finally {
+      setPortMapLoading(false);
+    }
+  };
 
   if (!data) {
     return (
@@ -758,6 +895,74 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </select>
             )}
 
+            {!isViewer && onBatchProjectAction && filteredProjects.length > 0 && (
+              <div className="flex items-center gap-1 bg-[#0f172a] border border-slate-800 rounded-lg p-1">
+                <span className="text-[10px] font-mono text-slate-400 px-1.5">
+                  Группа ({filteredProjects.length}):
+                </span>
+                <button
+                  type="button"
+                  disabled={batchBusy !== null}
+                  onClick={async () => {
+                    setBatchBusy('start');
+                    try {
+                      await onBatchProjectAction(
+                        'start',
+                        filteredProjects.map((p) => p.id)
+                      );
+                    } finally {
+                      setBatchBusy(null);
+                    }
+                  }}
+                  title="Запустить все проекты в текущем фильтре/группе"
+                  className="px-2 py-1 text-[11px] font-semibold bg-emerald-600/20 hover:bg-emerald-600/35 text-emerald-300 border border-emerald-500/30 rounded inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                >
+                  <Play className="w-3 h-3" />
+                  <span>Старт</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={batchBusy !== null}
+                  onClick={async () => {
+                    setBatchBusy('restart');
+                    try {
+                      await onBatchProjectAction(
+                        'restart',
+                        filteredProjects.map((p) => p.id)
+                      );
+                    } finally {
+                      setBatchBusy(null);
+                    }
+                  }}
+                  title="Перезапустить все проекты в текущем фильтре/группе"
+                  className="px-2 py-1 text-[11px] font-semibold bg-indigo-600/20 hover:bg-indigo-600/35 text-indigo-300 border border-indigo-500/30 rounded inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                >
+                  <RotateCw className="w-3 h-3" />
+                  <span>Рестарт</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={batchBusy !== null}
+                  onClick={async () => {
+                    setBatchBusy('stop');
+                    try {
+                      await onBatchProjectAction(
+                        'stop',
+                        filteredProjects.map((p) => p.id)
+                      );
+                    } finally {
+                      setBatchBusy(null);
+                    }
+                  }}
+                  title="Остановить все проекты в текущем фильтре/группе"
+                  className="px-2 py-1 text-[11px] font-semibold bg-rose-600/20 hover:bg-rose-600/35 text-rose-300 border border-rose-500/30 rounded inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                >
+                  <Square className="w-3 h-3" />
+                  <span>Стоп</span>
+                </button>
+              </div>
+            )}
+
             {!productionMode && (
               <label className="flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer select-none px-2 py-1 bg-[#0f172a] border border-slate-800 rounded-lg">
                 <input
@@ -1073,6 +1278,60 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <Clock className="w-3.5 h-3.5 text-indigo-400" />
               Очередь Cron ({upcoming_runs.length})
             </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setActiveLogTab('log_search');
+                if (!logSearchResult) {
+                  runGlobalLogSearch(logSearchText, logSearchLevel, logSearchProjId);
+                }
+              }}
+              className={`px-3 py-1.5 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer ${
+                activeLogTab === 'log_search'
+                  ? 'bg-cyan-500/20 text-cyan-200 border border-cyan-500/40'
+                  : 'bg-slate-800 text-slate-400 hover:text-white'
+              }`}
+            >
+              <Search className="w-3.5 h-3.5 text-cyan-400" />
+              Поиск по логам
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setActiveLogTab('sla');
+                if (!slaData) {
+                  loadSlaAnalytics(slaDays);
+                }
+              }}
+              className={`px-3 py-1.5 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer ${
+                activeLogTab === 'sla'
+                  ? 'bg-amber-500/20 text-amber-200 border border-amber-500/40'
+                  : 'bg-slate-800 text-slate-400 hover:text-white'
+              }`}
+            >
+              <BarChart3 className="w-3.5 h-3.5 text-amber-400" />
+              SLA и Стабильность
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setActiveLogTab('ports');
+                if (!portMapData) {
+                  loadPortMap();
+                }
+              }}
+              className={`px-3 py-1.5 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer ${
+                activeLogTab === 'ports'
+                  ? 'bg-teal-500/20 text-teal-200 border border-teal-500/40'
+                  : 'bg-slate-800 text-slate-400 hover:text-white'
+              }`}
+            >
+              <Network className="w-3.5 h-3.5 text-teal-400" />
+              Карта портов
+            </button>
           </div>
         </div>
 
@@ -1173,6 +1432,367 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     </span>
                   </div>
                 ))
+              )}
+            </div>
+          )}
+
+          {activeLogTab === 'log_search' && (
+            <div className="space-y-3">
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  runGlobalLogSearch();
+                }}
+                className="flex flex-wrap items-center gap-2"
+              >
+                <div className="relative flex-1 min-w-[200px]">
+                  <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="text"
+                    aria-label="Поиск по логам всех проектов"
+                    value={logSearchText}
+                    onChange={(e) => setLogSearchText(e.target.value)}
+                    placeholder="Поиск текста, Traceback, кода ошибки по всем проектам..."
+                    className="w-full bg-slate-900 border border-slate-700 focus:border-cyan-500 rounded-lg pl-8 pr-3 py-1.5 text-xs font-mono text-white outline-none"
+                  />
+                </div>
+                <select
+                  aria-label="Уровень логов для кросс-поиска"
+                  value={logSearchLevel}
+                  onChange={(e) => {
+                    const nextLvl = e.target.value as 'all' | 'warn_error' | 'error_only';
+                    setLogSearchLevel(nextLvl);
+                    runGlobalLogSearch(logSearchText, nextLvl, logSearchProjId);
+                  }}
+                  className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono text-slate-200"
+                >
+                  <option value="error_only">Только ERROR</option>
+                  <option value="warn_error">WARN + ERROR</option>
+                  <option value="all">Все уровни</option>
+                </select>
+                <select
+                  aria-label="Фильтр проекта для кросс-поиска"
+                  value={logSearchProjId}
+                  onChange={(e) => {
+                    setLogSearchProjId(e.target.value);
+                    runGlobalLogSearch(logSearchText, logSearchLevel, e.target.value);
+                  }}
+                  className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono text-slate-200 max-w-[180px]"
+                >
+                  <option value="">Все проекты ({projects.length})</option>
+                  {projects.map((p) => (
+                    <option key={p.id} value={String(p.id)}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="submit"
+                  disabled={logSearchLoading}
+                  className="px-3.5 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-xs font-semibold cursor-pointer"
+                >
+                  {logSearchLoading ? 'Поиск...' : 'Искать'}
+                </button>
+              </form>
+
+              {logSearchResult && (
+                <div className="text-[11px] font-mono text-slate-400">
+                  Найдено совпадений: <strong className="text-white">{logSearchResult.total_matches}</strong> (просканировано проектов с логами: {logSearchResult.scanned_projects})
+                </div>
+              )}
+
+              <div className="space-y-1.5 max-h-72 overflow-y-auto">
+                {!logSearchResult || logSearchResult.matches.length === 0 ? (
+                  <div className="text-xs font-mono text-slate-400 py-4 text-center">
+                    {logSearchLoading
+                      ? 'Сканирование свежих логов проектов...'
+                      : 'Совпадений не найдено. Введите ключевое слово или выберите уровень WARN+ / ERROR.'}
+                  </div>
+                ) : (
+                  logSearchResult.matches.map((m, idx) => {
+                    const targetProj = projects.find((p) => p.id === m.project_id);
+                    return (
+                      <div
+                        key={`${m.project_id}-${m.run_id}-${m.line_number}-${idx}`}
+                        className="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs font-mono"
+                      >
+                        <div className="min-w-0 flex-1 space-y-1">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="px-1.5 py-0.5 rounded bg-indigo-950/70 text-indigo-200 border border-indigo-700/50 text-[10px] font-semibold">
+                              {m.project_name}
+                            </span>
+                            <span
+                              className={`px-1.5 py-0.5 rounded text-[10px] uppercase ${
+                                m.level === 'error'
+                                  ? 'bg-rose-500/20 text-rose-300'
+                                  : m.level === 'warn'
+                                  ? 'bg-amber-500/20 text-amber-300'
+                                  : 'bg-slate-800 text-slate-300'
+                              }`}
+                            >
+                              {m.level}
+                            </span>
+                            <span className="text-[10px] text-slate-500">
+                              Run #{m.run_id} · стр. {m.line_number}
+                            </span>
+                          </div>
+                          <div className="text-slate-200 break-all text-[11px]">{m.text}</div>
+                        </div>
+                        {targetProj && (
+                          <button
+                            type="button"
+                            onClick={() => onOpenProjectWorkspace(targetProj, 'editor')}
+                            className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-indigo-300 text-[11px] border border-slate-700 cursor-pointer shrink-0"
+                          >
+                            Открыть
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          )}
+
+          {activeLogTab === 'sla' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
+                  {slaData && (
+                    <>
+                      <span className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 text-slate-300">
+                        Общий SLA:{' '}
+                        <strong className="text-emerald-300">{slaData.fleet.overall_sla_pct}%</strong>
+                      </span>
+                      <span className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 text-slate-300">
+                        Запусков: <strong className="text-white">{slaData.fleet.total_runs}</strong>
+                      </span>
+                      <span className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 text-slate-300">
+                        Сбоев: <strong className="text-rose-300">{slaData.fleet.failed_runs}</strong>
+                      </span>
+                      <span className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 text-slate-300">
+                        OOM Kill: <strong className="text-amber-300">{slaData.fleet.oom_kills}</strong>
+                      </span>
+                    </>
+                  )}
+                </div>
+
+                <div className="inline-flex items-center rounded-lg bg-slate-900 border border-slate-800 p-0.5 text-xs font-mono">
+                  {[
+                    { d: 1, label: '24ч' },
+                    { d: 7, label: '7д' },
+                    { d: 30, label: '30д' },
+                  ].map((opt) => (
+                    <button
+                      key={opt.d}
+                      type="button"
+                      onClick={() => loadSlaAnalytics(opt.d)}
+                      className={`px-2.5 py-1 rounded cursor-pointer ${
+                        slaDays === opt.d
+                          ? 'bg-indigo-600 text-white font-semibold'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {slaLoading && !slaData ? (
+                <div className="text-xs font-mono text-slate-400 py-4 text-center">
+                  Расчёт SLA-метрик за {slaDays} дн...
+                </div>
+              ) : !slaData || slaData.projects.length === 0 ? (
+                <div className="text-xs font-mono text-slate-400 py-4 text-center">
+                  Нет данных о проектах за выбранный период.
+                </div>
+              ) : (
+                <div className="overflow-x-auto border border-slate-800 rounded-lg">
+                  <table className="w-full text-left border-collapse text-xs font-mono tabular-nums">
+                    <thead>
+                      <tr className="bg-slate-900/90 text-slate-400 border-b border-slate-800">
+                        <th className="py-2 px-3">Проект</th>
+                        <th className="py-2 px-3">SLA</th>
+                        <th className="py-2 px-3">Запуски (OK / Сбой)</th>
+                        <th className="py-2 px-3">OOM</th>
+                        <th className="py-2 px-3">Ср. время</th>
+                        <th className="py-2 px-3">Последние 10 запусков</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/70">
+                      {slaData.projects.map((item) => {
+                        const tier = classifySlaTier(item.success_rate_pct);
+                        const targetProj = projects.find((p) => p.id === item.project_id);
+                        return (
+                          <tr
+                            key={item.project_id}
+                            onClick={() => targetProj && onOpenProjectWorkspace(targetProj, 'terminal_git')}
+                            className="hover:bg-slate-900/60 cursor-pointer"
+                          >
+                            <td className="py-2 px-3 text-white font-semibold">
+                              {item.project_name}
+                              <span className="ml-1.5 text-[10px] text-slate-500">({item.type})</span>
+                            </td>
+                            <td className="py-2 px-3">
+                              <span className={`px-2 py-0.5 rounded border text-[11px] font-semibold ${tier.colorCls}`}>
+                                {tier.label}
+                              </span>
+                            </td>
+                            <td className="py-2 px-3 text-slate-300">
+                              {item.total_runs} (<span className="text-emerald-300">{item.success_runs}</span> /{' '}
+                              <span className={item.failed_runs > 0 ? 'text-rose-300' : 'text-slate-500'}>
+                                {item.failed_runs}
+                              </span>
+                              )
+                            </td>
+                            <td className="py-2 px-3">
+                              <span className={item.oom_kills > 0 ? 'text-rose-300 font-bold' : 'text-slate-500'}>
+                                {item.oom_kills}
+                              </span>
+                            </td>
+                            <td className="py-2 px-3 text-slate-400">
+                              {item.avg_duration_sec > 0 ? formatDurationSeconds(Math.round(item.avg_duration_sec)) : '—'}
+                            </td>
+                            <td className="py-2 px-3">
+                              {item.recent_statuses.length === 0 ? (
+                                <span className="text-slate-600 text-[11px]">нет запусков</span>
+                              ) : (
+                                <div className="flex items-center gap-1">
+                                  {item.recent_statuses.map((st, sIdx) => (
+                                    <span
+                                      key={sIdx}
+                                      title={`Статус запуска: ${st}`}
+                                      className={`w-2 h-4 rounded-xs inline-block ${getSlaStatusBarColor(st)}`}
+                                    />
+                                  ))}
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
+          {activeLogTab === 'ports' && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
+                  <span className="px-2.5 py-1 rounded bg-slate-900 border border-slate-800 text-slate-300">
+                    Слушают TCP: <strong className="text-emerald-300">{portMapData?.listening_count ?? '—'}</strong>
+                  </span>
+                  <span className="px-2.5 py-1 rounded bg-slate-900 border border-slate-800 text-slate-300">
+                    Портов проектов: <strong className="text-cyan-300">{portMapData?.configured_count ?? '—'}</strong>
+                  </span>
+                  <span
+                    className={`px-2.5 py-1 rounded border ${
+                      (portMapData?.conflict_count || 0) > 0
+                        ? 'bg-rose-950/50 border-rose-700/60 text-rose-200'
+                        : 'bg-slate-900 border-slate-800 text-slate-300'
+                    }`}
+                  >
+                    Конфликты: <strong>{portMapData?.conflict_count ?? 0}</strong>
+                  </span>
+                  {portMapData?.suggested_free_port && (
+                    <span className="px-2.5 py-1 rounded bg-teal-950/50 border border-teal-700/50 text-teal-200">
+                      Свободный порт: <strong>:{portMapData.suggested_free_port}</strong>
+                    </span>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => loadPortMap()}
+                  disabled={portMapLoading}
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${portMapLoading ? 'animate-spin' : ''}`} />
+                  Обновить сокеты
+                </button>
+              </div>
+
+              {portMapLoading && !portMapData ? (
+                <div className="text-xs font-mono text-slate-400 py-4 text-center">
+                  Сканирование TCP-портов сервера...
+                </div>
+              ) : !portMapData || portMapData.ports.length === 0 ? (
+                <div className="text-xs font-mono text-slate-400 py-4 text-center">
+                  Активных TCP-портов не обнаружено.
+                </div>
+              ) : (
+                <div className="overflow-x-auto border border-slate-800 rounded-lg max-h-72 overflow-y-auto">
+                  <table className="w-full text-left border-collapse text-xs font-mono tabular-nums">
+                    <thead>
+                      <tr className="bg-slate-900/90 text-slate-400 border-b border-slate-800">
+                        <th className="py-2 px-3">Порт</th>
+                        <th className="py-2 px-3">Адрес / Сокет</th>
+                        <th className="py-2 px-3">Владелец</th>
+                        <th className="py-2 px-3">Проект / Процесс</th>
+                        <th className="py-2 px-3">PID</th>
+                        <th className="py-2 px-3 text-right">Переход</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/70">
+                      {portMapData.ports.map((entry) => {
+                        const badge = classifyPortOwnerBadge(entry.owner_kind);
+                        const targetProj = entry.project_id
+                          ? projects.find((p) => p.id === entry.project_id)
+                          : undefined;
+                        return (
+                          <tr key={`${entry.port}-${entry.project_id ?? 'ext'}`} className="hover:bg-slate-900/60">
+                            <td className="py-2 px-3 font-bold text-white">:{entry.port}</td>
+                            <td className="py-2 px-3 text-slate-300">
+                              <span
+                                className={`inline-block w-2 h-2 rounded-full mr-1.5 ${
+                                  entry.owner_kind === 'conflict'
+                                    ? 'bg-rose-400'
+                                    : entry.listening
+                                    ? 'bg-emerald-400'
+                                    : 'bg-slate-600'
+                                }`}
+                              />
+                              {entry.bind_addr} · {entry.listening ? 'LISTEN' : 'OFFLINE'}
+                            </td>
+                            <td className="py-2 px-3">
+                              <span className={`px-2 py-0.5 rounded border text-[11px] font-semibold ${badge.colorCls}`}>
+                                {badge.label}
+                              </span>
+                            </td>
+                            <td className="py-2 px-3 text-slate-200">
+                              <div className="font-semibold text-white">
+                                {entry.project_name || entry.process_name}
+                              </div>
+                              {entry.note && (
+                                <div className="text-[11px] text-slate-400 mt-0.5">{entry.note}</div>
+                              )}
+                            </td>
+                            <td className="py-2 px-3 text-slate-400">{entry.pid ?? '—'}</td>
+                            <td className="py-2 px-3 text-right">
+                              {targetProj ? (
+                                <button
+                                  type="button"
+                                  aria-label={`Настроить ${entry.project_name}`}
+                                  onClick={() => onOpenProjectWorkspace(targetProj, 'simple_cfg')}
+                                  className="px-2.5 py-1 rounded bg-indigo-600/20 hover:bg-indigo-600/35 text-indigo-200 border border-indigo-500/40 text-[11px] font-medium cursor-pointer"
+                                >
+                                  Настроить
+                                </button>
+                              ) : (
+                                <span className="text-slate-600 text-[11px]">—</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
               )}
             </div>
           )}

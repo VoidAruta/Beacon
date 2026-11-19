@@ -116,10 +116,17 @@ _RBAC_ALLOWLIST: dict[str, tuple[tuple[str, re.Pattern[str]], ...]] = {
         ("GET", re.compile(r"^/api/projects$")),
         ("GET", re.compile(r"^/api/projects/\d+$")),
         ("GET", re.compile(r"^/api/projects/\d+/runs$")),
+        ("GET", re.compile(r"^/api/projects/\d+/webhooks$")),
+        ("GET", re.compile(r"^/api/projects/\d+/git_info$")),
+        ("GET", re.compile(r"^/api/projects/\d+/processes$")),
+        ("GET", re.compile(r"^/api/logs/search$")),
+        ("GET", re.compile(r"^/api/analytics/summary$")),
+        ("GET", re.compile(r"^/api/metrics$")),
         ("GET", re.compile(r"^/api/runs/\d+/log$")),
         ("GET", re.compile(r"^/api/runs/\d+/stream$")),
         ("GET", re.compile(r"^/api/auth/me$")),
         ("GET", re.compile(r"^/api/system/health$")),
+        ("GET", re.compile(r"^/api/system/ports$")),
         ("GET", re.compile(r"^/api/system/update_status$")),
         ("POST", re.compile(r"^/api/auth/logout$")),
         ("POST", re.compile(r"^/api/auth/stream_ticket$")),
@@ -128,6 +135,10 @@ _RBAC_ALLOWLIST: dict[str, tuple[tuple[str, re.Pattern[str]], ...]] = {
         ("POST", re.compile(r"^/api/projects/\d+/start$")),
         ("POST", re.compile(r"^/api/projects/\d+/stop$")),
         ("POST", re.compile(r"^/api/projects/\d+/restart$")),
+        ("POST", re.compile(r"^/api/projects/batch_action$")),
+        ("POST", re.compile(r"^/api/projects/\d+/webhook_test$")),
+        ("POST", re.compile(r"^/api/projects/\d+/cookies_fixed$")),
+        ("POST", re.compile(r"^/api/settings/maintenance$")),
         ("POST", re.compile(r"^/api/runs/\d+/stdin$")),
         ("POST", re.compile(r"^/api/asks/[^/]+/answer$")),
     ),
@@ -309,6 +320,21 @@ async def security_and_auth_middleware(request: Request, call_next: Callable[[Re
                     return _finish(JSONResponse({"detail": "Недействительный или просроченный SSE-тикет"}, status_code=401))
                 if not session:
                     session = {"sub": "stream_ticket", "user": "stream_ticket", "role": "viewer", "csrf": ""}
+
+        # Разрешаем скрапинг Prometheus GET /api/metrics по Bearer-токену с правом 'read' (без открытого доступа)
+        if not session and path == "/api/metrics" and request.method == "GET":
+            auth_hdr = request.headers.get("authorization", "")
+            if auth_hdr.lower().startswith("bearer "):
+                from hub.api.routes_ai import authenticate_ai_token
+
+                tok_row, _tok_err = authenticate_ai_token(request)
+                if tok_row and "read" in (tok_row.get("scopes") or []):
+                    session = {
+                        "sub": f"metrics_token:{tok_row.get('name', 'prometheus')}",
+                        "user": f"metrics:{tok_row.get('name', 'prometheus')}",
+                        "role": "viewer",
+                        "csrf": "",
+                    }
 
         if not session:
             return _finish(

@@ -12,6 +12,7 @@
 import asyncio
 import base64
 import binascii
+import csv
 import hashlib
 import hmac
 import io
@@ -66,9 +67,11 @@ from hub.config import (
     BACKUPS_DIR,
     BASE_DIR,
     EXAMPLES_DIR,
+    FORBIDDEN_PORTS,
     GENERATED_DIR,
     LOGS_DIR,
     PROJECTS_DIR,
+    get_runtime_port,
     is_runtime_safe_mode,
     parse_reserved_ports,
     validate_project_name,
@@ -561,6 +564,8 @@ def _enrich_project(
     pid = None
     pgid = None
     rss_mb = 0.0
+    peak_rss_mb = 0.0
+    rss_history: list[float] = []
     cpu_pct = 0.0
     proc_cnt = 0
     active_run_id = None
@@ -570,6 +575,8 @@ def _enrich_project(
         pid = active_run["pid"]
         pgid = active_run["pgid"]
         rss_mb = active_run.get("rss_mb", 0.0)
+        peak_rss_mb = active_run.get("peak_rss_mb", rss_mb)
+        rss_history = list(active_run.get("rss_history") or [])
         cpu_pct = active_run.get("cpu_percent", 0.0)
         proc_cnt = int(active_run.get("proc_count") or 1)
         if preloaded is not None:
@@ -595,6 +602,8 @@ def _enrich_project(
     out["pid"] = pid
     out["pgid"] = pgid
     out["rss_mb"] = rss_mb
+    out["peak_rss_mb"] = peak_rss_mb
+    out["rss_history"] = rss_history
     out["cpu_percent"] = cpu_pct
     out["proc_count"] = proc_cnt
     out["last_run"] = last_run
@@ -627,6 +636,9 @@ def _enrich_project(
     out["group_tag"] = str(out["env"].get("PROJECT_GROUP") or default_group)
     out["custom_proxy"] = str(out["env"].get("CUSTOM_PROXY_URL", ""))
     out["git_repo_url"] = str(out["env"].get("GIT_REPO_URL", ""))
+    out["depends_on"] = str(out["env"].get("DEPENDS_ON", ""))
+    out["auto_git_pull"] = str(out["env"].get("AUTO_GIT_PULL", "0")) == "1"
+    out["has_git"] = (Path(p["workdir"]) / ".git").exists()
     out["webhook_hmac_secret"] = str(p.get("webhook_hmac_secret") or "")
     out["ping_token"] = str(p.get("ping_token") or "")
     if mask_sensitive:
@@ -1216,6 +1228,7 @@ def _build_dashboard_payload_sync(mask_sensitive: bool) -> dict[str, Any]:
             "ai_access_enabled": get_setting("ai_access_enabled", "0") == "1" and not default_pw,
             "ai_access_paused": get_setting("ai_access_paused", "0") == "1",
             "pending_ai_approvals_count": pending_ai_approvals_count,
+            "alerts_muted_until": int(get_setting("alerts_muted_until", "0") or 0),
         },
         "pending_asks": active_asks,
         "expired_cookies": expired_cookies,
@@ -1242,6 +1255,12 @@ def _validate_project_port(port: int, exclude_project_id: int = 0) -> None:
         raise HTTPException(
             status_code=400,
             detail=f"Порт {port} недопустим: используйте непривилегированный порт в диапазоне 1024..65535",
+        )
+    hub_port = int(get_runtime_port() or int(get_setting("port", "8050") or 8050))
+    if port == hub_port:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Порт {port} занят самой панелью Beacon Control Panel",
         )
     reserved = parse_reserved_ports(get_setting("reserved_ports", ""))
     if port in reserved:
@@ -1449,9 +1468,8 @@ async def api_update_project(request: Request, project_id: int) -> dict[str, Any
     use_proxy = 1 if body.get("use_proxy", existing["use_proxy"]) else 0
     ram_limit_mb = parse_int_param(body.get("ram_limit_mb", existing["ram_limit_mb"]), "ram_limit_mb", default=0, min_val=0)
     proj_port = parse_int_param(body.get("port", existing.get("port", 0)), "port", default=0, min_val=0, max_val=65535)
-    reserved = parse_reserved_ports(get_setting("reserved_ports", ""))
-    if proj_port > 0 and proj_port in reserved:
-        raise HTTPException(status_code=400, detail=f"Порт {proj_port} зарезервирован в настройках reserved_ports")
+    if proj_port > 0:
+        _validate_project_port(proj_port, exclude_project_id=project_id)
 
     healthcheck_url = str(body.get("healthcheck_url", existing.get("healthcheck_url", ""))).strip()
     healthcheck_interval_sec = parse_int_param(
@@ -1723,6 +1741,70 @@ async def api_restart_project(request: Request, project_id: int) -> dict[str, An
         return {"ok": True, "run": run, "project": _enrich_project(proj or {})}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.post("/projects/batch_action")
+async def api_batch_project_action(request: Request) -> dict[str, Any]:
+    """Групповой запуск, остановка или перезапуск выбранных проектов (доступно admin и operator)."""
+    actor = _session_actor(request)
+    body = await read_json(request)
+    action = str(body.get("action", "")).strip().lower()
+    if action not in ("start", "stop", "restart"):
+        raise HTTPException(status_code=400, detail="Поле 'action' должно быть 'start', 'stop' или 'restart'")
+
+    raw_ids = body.get("project_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise HTTPException(status_code=400, detail="Список 'project_ids' не может быть пустым")
+
+    project_ids: list[int] = []
+    for item in raw_ids[:100]:
+        try:
+            pid = int(item)
+            if pid > 0 and pid not in project_ids:
+                project_ids.append(pid)
+        except (TypeError, ValueError):
+            continue
+
+    if not project_ids:
+        raise HTTPException(status_code=400, detail="Не передано ни одного корректного ID проекта")
+
+    results: list[dict[str, Any]] = []
+    for pid in project_ids:
+        proj = query_one("SELECT * FROM projects WHERE id = ?", (pid,))
+        if not proj:
+            results.append({"project_id": pid, "ok": False, "error": "Проект не найден"})
+            continue
+        try:
+            if action == "stop":
+                await stop_project(pid)
+                results.append({"project_id": pid, "name": proj["name"], "ok": True, "status": "stopped"})
+            elif action == "restart":
+                await stop_project(pid)
+                await asyncio.sleep(0.1)
+                execute_sql("UPDATE projects SET crash_loop_count = 0 WHERE id = ?", (pid,))
+                run = await start_project_run(pid, trigger="manual")
+                if run and run.get("id"):
+                    execute_sql("UPDATE runs SET triggered_by = ? WHERE id = ?", (actor, int(run["id"])))
+                results.append({"project_id": pid, "name": proj["name"], "ok": True, "run_id": run.get("id") if run else None})
+            else:
+                if is_project_running(pid):
+                    results.append({"project_id": pid, "name": proj["name"], "ok": True, "skipped": "already_running"})
+                else:
+                    run = await start_project_run(pid, trigger="manual")
+                    if run and run.get("id"):
+                        execute_sql("UPDATE runs SET triggered_by = ? WHERE id = ?", (actor, int(run["id"])))
+                    results.append({"project_id": pid, "name": proj["name"], "ok": True, "run_id": run.get("id") if run else None})
+        except Exception as exc:
+            results.append({"project_id": pid, "name": proj["name"], "ok": False, "error": str(exc)})
+
+    ok_count = sum(1 for r in results if r.get("ok"))
+    log_audit(
+        _client_ip(request),
+        f"BATCH_{action.upper()}",
+        f"Групповая операция {action} для {ok_count}/{len(results)} проектов",
+        actor=actor,
+    )
+    return {"ok": True, "action": action, "affected": ok_count, "total": len(results), "results": results}
 
 
 @router.post("/projects/{project_id}/install_deps")
@@ -2371,6 +2453,7 @@ async def api_clear_project_logs(request: Request, project_id: int) -> dict[str,
     )
     proj_log_dir = LOGS_DIR / proj["name"]
     removed_files = 0
+    truncated_active = 0
     if proj_log_dir.exists():
         active_log_paths = {
             str(r["log_path"])
@@ -2386,10 +2469,56 @@ async def api_clear_project_logs(request: Request, project_id: int) -> dict[str,
                     removed_files += 1
                 except OSError:
                     pass
+            else:
+                # Truncate active log file in-place on the same inode so buffering=0 child FD stays valid
+                try:
+                    os.truncate(lf, 0)
+                    truncated_active += 1
+                except OSError:
+                    pass
 
     _invalidate_dir_size_cache(proj_log_dir)
     updated_proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
-    return {"ok": True, "removed_files": removed_files, "project": _enrich_project(updated_proj or {})}
+    return {
+        "ok": True,
+        "removed_files": removed_files,
+        "truncated_active": truncated_active,
+        "project": _enrich_project(updated_proj or {}),
+    }
+
+
+@router.post("/settings/maintenance")
+async def api_set_maintenance_mute(request: Request) -> dict[str, Any]:
+    """
+    Включает или выключает режим тишины (паузу внешних уведомлений Telegram/ntfy/Webhook на время техработ).
+    duration_sec > 0 ставит паузу на указанное число секунд, duration_sec <= 0 снимает паузу.
+    """
+    try:
+        raw = await request.body()
+        body = json.loads(raw.decode("utf-8")) if (raw and raw.strip()) else {}
+    except Exception:
+        body = {}
+    duration_sec = parse_int_param(
+        (body.get("duration_sec") if isinstance(body, dict) else 0),
+        "duration_sec",
+        default=0,
+        min_val=0,
+        max_val=86400 * 7,
+    )
+    now_ts = int(time.time())
+    muted_until = (now_ts + duration_sec) if duration_sec > 0 else 0
+    set_setting("alerts_muted_until", str(muted_until))
+    log_audit(
+        _client_ip(request),
+        "MAINTENANCE_MUTE",
+        f"alerts_muted_until={muted_until} (duration_sec={duration_sec})",
+    )
+    return {
+        "ok": True,
+        "alerts_muted_until": muted_until,
+        "muted": muted_until > now_ts,
+        "remaining_sec": max(0, muted_until - now_ts),
+    }
 
 
 @router.post("/projects/git_clone")
@@ -2663,7 +2792,7 @@ async def api_clone_existing_project(request: Request, project_id: int) -> dict[
         raise HTTPException(status_code=404, detail="Исходный проект не найден")
 
     body = await read_json(request)
-    requested_name = str(body.get("new_name", "")).strip()
+    requested_name = str(body.get("new_name") or body.get("name") or "").strip()
     if not requested_name:
         base_name = f"{src['name']}-acc2"
         idx = 2
@@ -2754,6 +2883,169 @@ async def api_clone_existing_project(request: Request, project_id: int) -> dict[
     return {"ok": True, "project": _enrich_project(created or {})}
 
 
+api_clone_project = api_clone_existing_project
+
+
+async def _run_git_cmd(workdir: Path, args: list[str], use_proxy: bool = False, custom_proxy: str = "", timeout_sec: float = 15.0) -> tuple[int, str]:
+    git_env = dict(os.environ)
+    git_env["GIT_TERMINAL_PROMPT"] = "0"
+    if use_proxy:
+        target_proxy = custom_proxy or get_setting("proxy_url", "").strip()
+        if target_proxy:
+            git_env["HTTP_PROXY"] = target_proxy
+            git_env["HTTPS_PROXY"] = target_proxy
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            *args,
+            cwd=str(workdir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=git_env,
+        )
+        out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+        text = out_bytes.decode("utf-8", errors="replace").strip()
+        return int(proc.returncode or 0), _mask_url_userinfo(redact_log_text(text))
+    except asyncio.TimeoutError:
+        return 124, f"Таймаут выполнения git {' '.join(args)} ({timeout_sec} сек)"
+    except Exception as exc:
+        return 1, str(exc)
+
+
+@router.get("/projects/{project_id}/git_info")
+async def api_project_git_info(request: Request, project_id: int) -> dict[str, Any]:
+    """Возвращает состояние Git-репозитория проекта: ветку, remote URL, изменённые файлы и историю коммитов."""
+    proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    workdir = Path(proj["workdir"]).resolve()
+    if not (workdir / ".git").exists():
+        return {"ok": True, "is_git": False, "branch": "", "remote_url": "", "dirty_files": [], "commits": []}
+
+    rc_b, branch = await _run_git_cmd(workdir, ["rev-parse", "--abbrev-ref", "HEAD"], timeout_sec=4.0)
+    _, remote_url = await _run_git_cmd(workdir, ["config", "--get", "remote.origin.url"], timeout_sec=4.0)
+    _, status_out = await _run_git_cmd(workdir, ["status", "--porcelain"], timeout_sec=4.0)
+    _, log_out = await _run_git_cmd(
+        workdir,
+        ["log", "-n", "12", "--pretty=format:%h|%an|%ct|%s"],
+        timeout_sec=5.0,
+    )
+    dirty_files = [line.strip() for line in status_out.splitlines() if line.strip()]
+    commits: list[dict[str, Any]] = []
+    for line in log_out.splitlines():
+        parts = line.split("|", 3)
+        if len(parts) == 4:
+            try:
+                ts_val = int(parts[2])
+            except ValueError:
+                ts_val = 0
+            commits.append(
+                {
+                    "hash": parts[0].strip(),
+                    "author": parts[1].strip(),
+                    "timestamp": ts_val,
+                    "subject": parts[3].strip(),
+                }
+            )
+    return {
+        "ok": rc_b == 0,
+        "is_git": True,
+        "branch": branch if rc_b == 0 else "HEAD",
+        "remote_url": remote_url,
+        "dirty_files": dirty_files,
+        "dirty_count": len(dirty_files),
+        "commits": commits,
+    }
+
+
+@router.post("/projects/{project_id}/git_pull")
+async def api_project_git_pull(request: Request, project_id: int) -> dict[str, Any]:
+    """Выполняет git pull --ff-only и опционально перезапускает сервис в 1 клик."""
+    _require_admin_session(request)
+    proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    workdir = Path(proj["workdir"]).resolve()
+    if not (workdir / ".git").exists():
+        raise HTTPException(status_code=400, detail="В рабочей директории проекта не инициализирован Git-репозиторий (.git)")
+
+    try:
+        raw = await request.body()
+        body = json.loads(raw.decode("utf-8")) if (raw and raw.strip()) else {}
+    except Exception:
+        body = {}
+    restart_after = bool(body.get("restart_after", False)) if isinstance(body, dict) else False
+
+    try:
+        env_map = json.loads(proj.get("env_json") or "{}")
+    except Exception:
+        env_map = {}
+    custom_proxy = str(env_map.get("CUSTOM_PROXY_URL", "")) if isinstance(env_map, dict) else ""
+
+    rc, out = await _run_git_cmd(
+        workdir,
+        ["pull", "--ff-only"],
+        use_proxy=bool(proj.get("use_proxy")),
+        custom_proxy=custom_proxy,
+        timeout_sec=60.0,
+    )
+    _invalidate_dir_size_cache(workdir)
+
+    restarted = False
+    if rc == 0 and (restart_after or is_project_running(project_id)):
+        if is_project_running(project_id):
+            await stop_project(project_id)
+        await start_project_run(project_id, trigger="manual")
+        restarted = True
+
+    git_info = await api_project_git_info(request, project_id)
+    log_audit(_client_ip(request), "PROJECT_GIT_PULL", f"{proj['name']}: rc={rc}, restarted={restarted}")
+    return {
+        "ok": rc == 0,
+        "exit_code": rc,
+        "output": out or ("Already up to date." if rc == 0 else "Ошибка git pull"),
+        "restarted": restarted,
+        "git_info": git_info,
+    }
+
+
+@router.post("/projects/{project_id}/git_rollback")
+async def api_project_git_rollback(request: Request, project_id: int) -> dict[str, Any]:
+    """Откатывает Git-репозиторий проекта к указанному коммиту (git reset --hard <hash>) и перезапускает при необходимости."""
+    _require_admin_session(request)
+    proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    workdir = Path(proj["workdir"]).resolve()
+    if not (workdir / ".git").exists():
+        raise HTTPException(status_code=400, detail="В проекте нет Git-репозитория (.git)")
+
+    body = await read_json(request)
+    commit_hash = str(body.get("commit", "")).strip()
+    restart_after = bool(body.get("restart_after", True))
+    if not re.match(r"^[0-9a-fA-F]{6,40}$", commit_hash):
+        raise HTTPException(status_code=400, detail="Некорректный хеш коммита (ожидается 6..40 hex-символов)")
+
+    rc, out = await _run_git_cmd(workdir, ["reset", "--hard", commit_hash], timeout_sec=15.0)
+    _invalidate_dir_size_cache(workdir)
+
+    restarted = False
+    if rc == 0 and restart_after and is_project_running(project_id):
+        await stop_project(project_id)
+        await start_project_run(project_id, trigger="manual")
+        restarted = True
+
+    git_info = await api_project_git_info(request, project_id)
+    log_audit(_client_ip(request), "PROJECT_GIT_ROLLBACK", f"{proj['name']} -> {commit_hash} (rc={rc})")
+    return {
+        "ok": rc == 0,
+        "commit": commit_hash,
+        "output": out,
+        "restarted": restarted,
+        "git_info": git_info,
+    }
+
+
 @router.post("/projects/{project_id}/exec")
 async def api_exec_project_command(request: Request, project_id: int) -> dict[str, Any]:
     """
@@ -2828,6 +3120,112 @@ async def api_web_auth_cancel(request: Request, project_id: int) -> dict[str, An
     return cancel_web_auth_session(project_id)
 
 
+# Кольцевой буфер последних входящих Webhook-вызовов по project_id (до 25 записей на проект)
+_RECENT_WEBHOOK_DELIVERIES: dict[int, list[dict[str, Any]]] = {}
+_MAX_WEBHOOK_HISTORY_PER_PROJECT = 25
+_MAX_WEBHOOK_PAYLOAD_ENV_BYTES = 16384
+
+
+def _record_webhook_delivery(
+    project_id: int,
+    client_ip: str,
+    event_name: str,
+    status_code: int,
+    payload_preview: str,
+    run_id: Optional[int] = None,
+    detail: str = "",
+) -> dict[str, Any]:
+    entry = {
+        "timestamp": int(time.time()),
+        "client_ip": client_ip,
+        "event": event_name or "webhook",
+        "status_code": status_code,
+        "run_id": run_id,
+        "payload_preview": payload_preview[:500],
+        "detail": detail,
+    }
+    bucket = _RECENT_WEBHOOK_DELIVERIES.setdefault(project_id, [])
+    bucket.insert(0, entry)
+    if len(bucket) > _MAX_WEBHOOK_HISTORY_PER_PROJECT:
+        del bucket[_MAX_WEBHOOK_HISTORY_PER_PROJECT:]
+    return entry
+
+
+@router.get("/projects/{project_id}/webhooks")
+async def api_get_project_webhooks(request: Request, project_id: int) -> dict[str, Any]:
+    """Возвращает журнал последних входящих Webhook-вызовов проекта."""
+    proj = query_one("SELECT id, name FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    return {
+        "project_id": project_id,
+        "deliveries": list(_RECENT_WEBHOOK_DELIVERIES.get(project_id, [])),
+    }
+
+
+@router.post("/projects/{project_id}/webhook_test")
+async def api_test_project_webhook(request: Request, project_id: int) -> dict[str, Any]:
+    """Позволяет протестировать запуск проекта по вебхуку с произвольным JSON/текстовым payload прямо из UI."""
+    actor = _session_actor(request)
+    proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+
+    body = await read_json(request)
+    raw_payload = body.get("payload", {"event": "manual_test", "triggered_by": actor})
+    event_name = str(body.get("event", "test.ping")).strip() or "test.ping"
+    if isinstance(raw_payload, (dict, list)):
+        payload_str = json.dumps(raw_payload, ensure_ascii=False)
+    else:
+        payload_str = str(raw_payload or "")
+    payload_str = payload_str[:_MAX_WEBHOOK_PAYLOAD_ENV_BYTES]
+
+    if is_project_running(project_id):
+        _record_webhook_delivery(
+            project_id,
+            _client_ip(request),
+            event_name,
+            409,
+            payload_str,
+            detail="Проект уже выполняется",
+        )
+        raise HTTPException(status_code=409, detail=f"Проект «{proj['name']}» уже выполняется")
+
+    try:
+        run = await start_project_run(
+            project_id,
+            trigger="webhook",
+            extra_env={
+                "BEACON_WEBHOOK_PAYLOAD": payload_str,
+                "BEACON_WEBHOOK_EVENT": event_name,
+                "BEACON_WEBHOOK_CONTENT_TYPE": "application/json",
+            },
+        )
+        if run and run.get("id"):
+            execute_sql("UPDATE runs SET triggered_by = ? WHERE id = ?", (f"webhook:{actor}", int(run["id"])))
+            run["triggered_by"] = f"webhook:{actor}"
+        entry = _record_webhook_delivery(
+            project_id,
+            _client_ip(request),
+            event_name,
+            200,
+            payload_str,
+            run_id=int(run["id"]) if run and run.get("id") else None,
+            detail=f"Тест из UI (@{actor})",
+        )
+        return {"ok": True, "run": run, "delivery": entry}
+    except Exception as exc:
+        _record_webhook_delivery(
+            project_id,
+            _client_ip(request),
+            event_name,
+            400,
+            payload_str,
+            detail=str(exc),
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/webhook/{webhook_token}")
 async def api_trigger_webhook(request: Request, webhook_token: str) -> Response:
     client_ip = _client_ip(request)
@@ -2850,6 +3248,17 @@ async def api_trigger_webhook(request: Request, webhook_token: str) -> Response:
             )
         raise HTTPException(status_code=404, detail="Недействительный webhook_token")
 
+    proj_id = int(proj["id"])
+    raw_body = await request.body()
+    event_hdr = (
+        request.headers.get("x-beacon-event")
+        or request.headers.get("x-github-event")
+        or request.headers.get("x-gitlab-event")
+        or "webhook"
+    ).strip()[:64]
+    content_type_hdr = (request.headers.get("content-type") or "application/json").strip()[:120]
+    payload_str = raw_body[:_MAX_WEBHOOK_PAYLOAD_ENV_BYTES].decode("utf-8", errors="replace").replace("\x00", "")
+
     hmac_secret = str(proj.get("webhook_hmac_secret") or "").strip()
     if hmac_secret:
         sig_hdr = (
@@ -2857,25 +3266,89 @@ async def api_trigger_webhook(request: Request, webhook_token: str) -> Response:
             or request.headers.get("x-hub-signature-256")
             or ""
         ).strip()
-        raw_body = await request.body()
         expected = "sha256=" + hmac.new(hmac_secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
         if not sig_hdr or not hmac.compare_digest(expected, sig_hdr):
+            _record_webhook_delivery(
+                proj_id,
+                client_ip,
+                event_hdr,
+                401,
+                payload_str,
+                detail="Недействительная HMAC-подпись",
+            )
             raise HTTPException(status_code=401, detail="Недействительная HMAC-подпись X-Beacon-Signature")
 
-    proj_id = int(proj["id"])
-    if is_project_running(proj_id):
-        return JSONResponse(
-            {"detail": f"Проект «{proj['name']}» уже выполняется"},
-            status_code=409,
+    try:
+        proj_env_map = json.loads(proj.get("env_json") or "{}")
+    except Exception:
+        proj_env_map = {}
+    auto_git_pull = (
+        str(request.query_params.get("git_pull", "")).lower() in ("1", "true", "yes")
+        or (isinstance(proj_env_map, dict) and str(proj_env_map.get("AUTO_GIT_PULL", "0")) == "1")
+    )
+    allow_restart = (
+        auto_git_pull
+        or str(request.query_params.get("restart", "")).lower() in ("1", "true", "yes")
+    )
+
+    git_pull_note = ""
+    workdir = Path(proj["workdir"]).resolve()
+    if auto_git_pull and (workdir / ".git").exists():
+        custom_proxy = str(proj_env_map.get("CUSTOM_PROXY_URL", "")) if isinstance(proj_env_map, dict) else ""
+        rc_gp, gp_out = await _run_git_cmd(
+            workdir,
+            ["pull", "--ff-only"],
+            use_proxy=bool(proj.get("use_proxy")),
+            custom_proxy=custom_proxy,
+            timeout_sec=45.0,
         )
+        git_pull_note = f" | git pull: {'OK' if rc_gp == 0 else 'ERR'} ({gp_out[:80]})"
+
+    if is_project_running(proj_id):
+        if allow_restart and proj.get("type") in ("service", "web"):
+            await stop_project(proj_id)
+        else:
+            _record_webhook_delivery(
+                proj_id,
+                client_ip,
+                event_hdr,
+                409,
+                payload_str,
+                detail="Проект уже выполняется",
+            )
+            return JSONResponse(
+                {"detail": f"Проект «{proj['name']}» уже выполняется"},
+                status_code=409,
+            )
 
     try:
-        run = await start_project_run(proj_id, trigger="webhook")
+        run = await start_project_run(
+            proj_id,
+            trigger="webhook",
+            extra_env={
+                "BEACON_WEBHOOK_PAYLOAD": payload_str,
+                "BEACON_WEBHOOK_EVENT": event_hdr,
+                "BEACON_WEBHOOK_CONTENT_TYPE": content_type_hdr,
+            },
+        )
+        if run and run.get("id"):
+            execute_sql("UPDATE runs SET triggered_by = ? WHERE id = ?", (f"webhook:{client_ip}", int(run["id"])))
     except RuntimeError as exc:
         if "уже выполняется" in str(exc):
+            _record_webhook_delivery(proj_id, client_ip, event_hdr, 409, payload_str, detail=str(exc))
             return JSONResponse({"detail": str(exc)}, status_code=409)
+        _record_webhook_delivery(proj_id, client_ip, event_hdr, 400, payload_str, detail=str(exc))
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return JSONResponse({"ok": True, "project": proj["name"], "run_id": run["id"]})
+    _record_webhook_delivery(
+        proj_id,
+        client_ip,
+        event_hdr,
+        200,
+        payload_str,
+        run_id=int(run["id"]),
+        detail=f"Запущен по вебхуку{git_pull_note}",
+    )
+    return JSONResponse({"ok": True, "project": proj["name"], "run_id": run["id"], "git_pull": bool(auto_git_pull)})
 
 
 # ==============================================================================
@@ -2917,6 +3390,94 @@ async def api_get_file_content(request: Request, project_id: int) -> dict[str, A
     return {"path": rel_path, "content": content, "size": target.stat().st_size}
 
 
+def _snapshot_dir_for_file(workdir: Path, rel_path: str) -> Path:
+    safe_key = hashlib.sha256(rel_path.strip().lstrip("/").encode("utf-8")).hexdigest()[:24]
+    return workdir / ".home" / "snapshots" / safe_key
+
+
+def _save_file_snapshot(workdir: Path, rel_path: str, current_file: Path, new_content: str) -> Optional[str]:
+    if not current_file.exists() or not current_file.is_file() or current_file.is_symlink():
+        return None
+    try:
+        old_content = current_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if old_content == new_content:
+        return None
+    snap_dir = _snapshot_dir_for_file(workdir, rel_path)
+    try:
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        snap_id = f"{int(time.time() * 1000)}"
+        snap_path = snap_dir / f"{snap_id}.bak"
+        snap_path.write_text(old_content, encoding="utf-8")
+        # Keep up to 12 most recent snapshots per file
+        snaps = sorted(snap_dir.glob("*.bak"), key=lambda p: p.name, reverse=True)
+        for old_s in snaps[12:]:
+            old_s.unlink(missing_ok=True)
+        return snap_id
+    except OSError:
+        return None
+
+
+@router.get("/projects/{project_id}/files/snapshots")
+async def api_list_file_snapshots(request: Request, project_id: int) -> dict[str, Any]:
+    _require_admin_session(request)
+    proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    rel_path = (request.query_params.get("path") or "").strip()
+    if not rel_path:
+        raise HTTPException(status_code=400, detail="Параметр path обязателен")
+    workdir = Path(proj["workdir"]).resolve()
+    _safe_project_path(workdir, rel_path)
+    snap_dir = _snapshot_dir_for_file(workdir, rel_path)
+    items: list[dict[str, Any]] = []
+    if snap_dir.exists():
+        for sp in sorted(snap_dir.glob("*.bak"), key=lambda p: p.name, reverse=True):
+            try:
+                st = sp.stat()
+                txt = sp.read_text(encoding="utf-8", errors="replace")
+                first_line = next((ln.strip() for ln in txt.splitlines() if ln.strip()), "")[:100]
+                snap_id = sp.stem
+                ts_sec = int(snap_id) // 1000 if snap_id.isdigit() else int(st.st_mtime)
+                items.append(
+                    {
+                        "id": snap_id,
+                        "timestamp": ts_sec,
+                        "size": st.st_size,
+                        "lines": len(txt.splitlines()),
+                        "preview": first_line,
+                    }
+                )
+            except OSError:
+                pass
+    return {"ok": True, "path": rel_path, "snapshots": items}
+
+
+@router.post("/projects/{project_id}/files/restore_snapshot")
+async def api_restore_file_snapshot(request: Request, project_id: int) -> dict[str, Any]:
+    _require_admin_session(request)
+    proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    body = await read_json(request)
+    rel_path = str(body.get("path", "")).strip()
+    snap_id = str(body.get("snapshot_id", "")).strip()
+    if not rel_path or not re.match(r"^\d{10,16}$", snap_id):
+        raise HTTPException(status_code=400, detail="Необходимо указать path и корректный snapshot_id")
+    workdir = Path(proj["workdir"]).resolve()
+    target = _safe_project_path(workdir, rel_path)
+    snap_path = _snapshot_dir_for_file(workdir, rel_path) / f"{snap_id}.bak"
+    if not snap_path.exists():
+        raise HTTPException(status_code=404, detail="Версия файла не найдена")
+    restored_content = snap_path.read_text(encoding="utf-8", errors="replace")
+    _save_file_snapshot(workdir, rel_path, target, restored_content)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(restored_content, encoding="utf-8")
+    _invalidate_dir_size_cache(workdir)
+    return {"ok": True, "path": rel_path, "restored_snapshot_id": snap_id, "content": restored_content}
+
+
 @router.put("/projects/{project_id}/files/content")
 async def api_put_file_content(request: Request, project_id: int) -> dict[str, Any]:
     proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
@@ -2929,11 +3490,13 @@ async def api_put_file_content(request: Request, project_id: int) -> dict[str, A
     if not rel_path:
         raise HTTPException(status_code=400, detail="Не указан путь к файлу")
 
-    target = _safe_project_path(proj["workdir"], rel_path)
+    workdir = Path(proj["workdir"]).resolve()
+    target = _safe_project_path(workdir, rel_path)
+    snap_id = _save_file_snapshot(workdir, rel_path, target, content)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
-    _invalidate_dir_size_cache(Path(proj["workdir"]))
-    return {"ok": True, "path": rel_path, "size": target.stat().st_size}
+    _invalidate_dir_size_cache(workdir)
+    return {"ok": True, "path": rel_path, "size": target.stat().st_size, "snapshot_id": snap_id}
 
 
 @router.post("/projects/{project_id}/files/mkdir")
@@ -3841,6 +4404,647 @@ async def api_run_acceptance_suite(request: Request) -> dict[str, Any]:
 async def api_system_audit(request: Request) -> list[dict[str, Any]]:
     _require_admin_session(request)
     return query_all("SELECT id, timestamp, ip, actor, action, details FROM audit_log ORDER BY id DESC LIMIT 100")
+
+
+def _csv_safe_cell(val: Any) -> str:
+    s = "" if val is None else str(val)
+    if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + s
+    return s
+
+
+@router.get("/system/audit/export")
+async def api_export_audit_logs(request: Request) -> Response:
+    """Экспортирует журнал безопасности и аудита в CSV (с защитой от Formula Injection) или JSON."""
+    _require_admin_session(request)
+    fmt = (request.query_params.get("format") or "csv").strip().lower()
+    if fmt not in ("csv", "json"):
+        raise HTTPException(status_code=400, detail="Формат должен быть 'csv' или 'json'")
+    q = (request.query_params.get("q") or "").strip().lower()
+    rows = query_all("SELECT id, timestamp, ip, actor, action, details FROM audit_log ORDER BY id DESC LIMIT 2000")
+    if q:
+        rows = [
+            r
+            for r in rows
+            if q in str(r.get("action") or "").lower()
+            or q in str(r.get("details") or "").lower()
+            or q in str(r.get("ip") or "").lower()
+            or q in str(r.get("actor") or "").lower()
+        ]
+
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+    if fmt == "json":
+        payload = json.dumps({"exported_at": int(time.time()), "count": len(rows), "entries": rows}, ensure_ascii=False, indent=2)
+        return Response(
+            content=payload,
+            media_type="application/json; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="beacon_audit_{stamp}.json"'},
+        )
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["id", "timestamp_utc", "ip", "actor", "action", "details"])
+    for r in rows:
+        ts_val = int(r.get("timestamp") or 0)
+        ts_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_val)) if ts_val > 0 else ""
+        writer.writerow(
+            [
+                r.get("id", ""),
+                ts_iso,
+                _csv_safe_cell(r.get("ip", "")),
+                _csv_safe_cell(r.get("actor", "")),
+                _csv_safe_cell(r.get("action", "")),
+                _csv_safe_cell(r.get("details", "")),
+            ]
+        )
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="beacon_audit_{stamp}.csv"'},
+    )
+
+
+_LOG_ERROR_RE = re.compile(r"\b(error|exception|traceback|critical|fatal|errno|oom|killed)\b|\[error\]", re.IGNORECASE)
+_LOG_WARN_RE = re.compile(r"\b(warn|warning|deprecated|retry|timeout)\b|\[warn", re.IGNORECASE)
+
+
+@router.get("/logs/search")
+async def api_search_all_logs(request: Request) -> dict[str, Any]:
+    """
+    Кросс-поиск по последним файлам логов всех проектов сразу.
+    Читает только хвост до 256 КБ на файл (без перерасхода ОЗУ) и автоматически редактирует секреты.
+    """
+    q = (request.query_params.get("q") or "").strip()
+    level = (request.query_params.get("level") or "all").strip().lower()
+    if level not in ("all", "warn_error", "error_only"):
+        level = "all"
+    limit = parse_int_param(request.query_params.get("limit"), "limit", default=80, min_val=1, max_val=200)
+    proj_filter_raw = (request.query_params.get("project_id") or "").strip()
+    proj_filter = int(proj_filter_raw) if proj_filter_raw.isdigit() else 0
+
+    if not q and level == "all":
+        return {
+            "ok": True,
+            "query": "",
+            "level": level,
+            "total_matches": 0,
+            "scanned_projects": 0,
+            "matches": [],
+        }
+
+    q_lower = q.lower()
+    projects = query_all("SELECT id, name FROM projects ORDER BY id ASC")
+    if proj_filter > 0:
+        projects = [p for p in projects if int(p["id"]) == proj_filter]
+
+    matches: list[dict[str, Any]] = []
+    scanned_projects = 0
+    max_tail_bytes = 256 * 1024
+
+    for proj in projects:
+        pid = int(proj["id"])
+        latest_run = query_one(
+            "SELECT id, status, log_path, started_at FROM runs WHERE project_id = ? AND log_path != '' ORDER BY id DESC LIMIT 1",
+            (pid,),
+        )
+        if not latest_run or not latest_run.get("log_path"):
+            continue
+        lp = Path(str(latest_run["log_path"]))
+        if not lp.exists() or not lp.is_file():
+            continue
+        scanned_projects += 1
+        try:
+            fsize = lp.stat().st_size
+            with lp.open("rb") as fh:
+                if fsize > max_tail_bytes:
+                    fh.seek(fsize - max_tail_bytes)
+                raw_chunk = fh.read(max_tail_bytes)
+            text = redact_log_text(raw_chunk.decode("utf-8", errors="replace"))
+        except OSError:
+            continue
+
+        lines = text.splitlines()
+        # Сканируем с конца, чтобы сначала показать самые свежие совпадения
+        for idx in range(len(lines) - 1, -1, -1):
+            ln = lines[idx]
+            if not ln.strip():
+                continue
+            is_err = bool(_LOG_ERROR_RE.search(ln))
+            is_warn = bool(_LOG_WARN_RE.search(ln))
+            line_level = "error" if is_err else ("warn" if is_warn else "info")
+            if level == "error_only" and not is_err:
+                continue
+            if level == "warn_error" and not (is_err or is_warn):
+                continue
+            if q_lower and q_lower not in ln.lower():
+                continue
+            matches.append(
+                {
+                    "project_id": pid,
+                    "project_name": proj["name"],
+                    "run_id": int(latest_run["id"]),
+                    "run_status": str(latest_run.get("status") or ""),
+                    "line_number": idx + 1,
+                    "level": line_level,
+                    "text": ln[:320],
+                }
+            )
+            if len(matches) >= limit:
+                break
+        if len(matches) >= limit:
+            break
+
+    return {
+        "ok": True,
+        "query": q,
+        "level": level,
+        "total_matches": len(matches),
+        "scanned_projects": scanned_projects,
+        "matches": matches,
+    }
+
+
+@router.get("/analytics/summary")
+async def api_analytics_summary(request: Request) -> dict[str, Any]:
+    """Сводная аналитика надёжности (SLA %), аварий, OOM и последних 10 статусов по всем проектам."""
+    days = parse_int_param(request.query_params.get("days"), "days", default=7, min_val=1, max_val=90)
+    now = int(time.time())
+    since_ts = now - days * 86400
+
+    projects = query_all("SELECT id, name, type FROM projects ORDER BY id ASC")
+    all_runs = query_all(
+        """SELECT id, project_id, status, started_at, finished_at
+           FROM runs
+           WHERE started_at >= ?
+           ORDER BY id ASC""",
+        (since_ts,),
+    )
+
+    runs_by_proj: dict[int, list[dict[str, Any]]] = {}
+    for r in all_runs:
+        runs_by_proj.setdefault(int(r["project_id"]), []).append(r)
+
+    active_by_proj: dict[int, dict[str, Any]] = {}
+    for info in ACTIVE_RUNS.values():
+        active_by_proj[int(info["project_id"])] = info
+
+    items: list[dict[str, Any]] = []
+    fleet_total = 0
+    fleet_ok = 0
+    fleet_fail = 0
+    fleet_oom = 0
+
+    for proj in projects:
+        pid = int(proj["id"])
+        p_runs = runs_by_proj.get(pid, [])
+        total = len(p_runs)
+        ok_cnt = 0
+        fail_cnt = 0
+        oom_cnt = 0
+        timeout_cnt = 0
+        crash_cnt = 0
+        durations: list[int] = []
+
+        for r in p_runs:
+            st = str(r.get("status") or "")
+            if st in ("success", "stopped", "running", "waiting_input"):
+                ok_cnt += 1
+            elif st == "killed_oom":
+                oom_cnt += 1
+                fail_cnt += 1
+            elif st == "killed_timeout":
+                timeout_cnt += 1
+                fail_cnt += 1
+            elif st == "crash_loop":
+                crash_cnt += 1
+                fail_cnt += 1
+            elif st in ("failed", "error"):
+                fail_cnt += 1
+
+            s_at = int(r.get("started_at") or 0)
+            f_at = int(r.get("finished_at") or 0)
+            if s_at > 0 and f_at >= s_at:
+                durations.append(f_at - s_at)
+
+        denom = ok_cnt + fail_cnt
+        sla_pct = round((ok_cnt / denom) * 100.0, 1) if denom > 0 else None
+        avg_dur = round(sum(durations) / len(durations), 1) if durations else 0.0
+        act = active_by_proj.get(pid)
+        cur_status = "running" if act else (str(p_runs[-1]["status"]) if p_runs else "stopped")
+        peak_rss = float(act.get("peak_rss_mb", 0.0)) if act else 0.0
+
+        fleet_total += total
+        fleet_ok += ok_cnt
+        fleet_fail += fail_cnt
+        fleet_oom += oom_cnt
+
+        items.append(
+            {
+                "project_id": pid,
+                "project_name": proj["name"],
+                "type": proj["type"],
+                "current_status": cur_status,
+                "total_runs": total,
+                "success_runs": ok_cnt,
+                "failed_runs": fail_cnt,
+                "oom_kills": oom_cnt,
+                "timeouts": timeout_cnt,
+                "crash_loops": crash_cnt,
+                "success_rate_pct": sla_pct,
+                "avg_duration_sec": avg_dur,
+                "peak_rss_mb": round(peak_rss, 1),
+                "recent_statuses": [str(r.get("status") or "stopped") for r in p_runs[-10:]],
+            }
+        )
+
+    fleet_denom = fleet_ok + fleet_fail
+    overall_sla = round((fleet_ok / fleet_denom) * 100.0, 1) if fleet_denom > 0 else 100.0
+    return {
+        "ok": True,
+        "days": days,
+        "generated_at": now,
+        "fleet": {
+            "projects_count": len(items),
+            "total_runs": fleet_total,
+            "failed_runs": fleet_fail,
+            "oom_kills": fleet_oom,
+            "overall_sla_pct": overall_sla,
+        },
+        "projects": items,
+    }
+
+
+def _prom_escape_label(val: str) -> str:
+    return str(val or "").replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+@router.get("/metrics")
+async def api_prometheus_metrics(request: Request) -> Response:
+    """Экспортирует живые метрики Beacon и всех управляемых процессов в формате Prometheus / OpenMetrics."""
+    lines: list[str] = []
+    vm = psutil.virtual_memory()
+    cpu_pct = psutil.cpu_percent(interval=None)
+    hub_proc = psutil.Process(os.getpid())
+    hub_rss = int(hub_proc.memory_info().rss)
+    disk_st = get_disk_status()
+    disk_free_bytes = int(float(disk_st.get("free_mb", 0.0)) * 1024 * 1024)
+
+    lines.extend(
+        [
+            "# HELP beacon_hub_rss_bytes Resident memory used by the Beacon supervisor process in bytes.",
+            "# TYPE beacon_hub_rss_bytes gauge",
+            f"beacon_hub_rss_bytes {hub_rss}",
+            "# HELP beacon_system_ram_total_bytes Total host RAM in bytes.",
+            "# TYPE beacon_system_ram_total_bytes gauge",
+            f"beacon_system_ram_total_bytes {int(vm.total)}",
+            "# HELP beacon_system_ram_used_bytes Used host RAM in bytes.",
+            "# TYPE beacon_system_ram_used_bytes gauge",
+            f"beacon_system_ram_used_bytes {int(vm.used)}",
+            "# HELP beacon_system_cpu_percent Host CPU utilization percent.",
+            "# TYPE beacon_system_cpu_percent gauge",
+            f"beacon_system_cpu_percent {float(cpu_pct):.2f}",
+            "# HELP beacon_system_disk_free_bytes Free disk space on Beacon data partition in bytes.",
+            "# TYPE beacon_system_disk_free_bytes gauge",
+            f"beacon_system_disk_free_bytes {disk_free_bytes}",
+        ]
+    )
+
+    projects = query_all("SELECT * FROM projects ORDER BY id ASC")
+    active_by_proj: dict[int, dict[str, Any]] = {}
+    for info in ACTIVE_RUNS.values():
+        active_by_proj[int(info["project_id"])] = info
+
+    run_counts = query_all("SELECT project_id, status, COUNT(*) AS cnt FROM runs GROUP BY project_id, status")
+    counts_by_proj: dict[int, list[tuple[str, int]]] = {}
+    for row in run_counts:
+        counts_by_proj.setdefault(int(row["project_id"]), []).append((str(row["status"]), int(row["cnt"])))
+
+    lines.extend(
+        [
+            "# HELP beacon_projects_total Total number of configured projects.",
+            "# TYPE beacon_projects_total gauge",
+            f"beacon_projects_total {len(projects)}",
+            "# HELP beacon_projects_running Number of currently running projects.",
+            "# TYPE beacon_projects_running gauge",
+            f"beacon_projects_running {len(active_by_proj)}",
+            "# HELP beacon_project_up 1 if the project process is currently running, 0 otherwise.",
+            "# TYPE beacon_project_up gauge",
+            "# HELP beacon_project_rss_bytes Current PGID RSS memory usage in bytes.",
+            "# TYPE beacon_project_rss_bytes gauge",
+            "# HELP beacon_project_peak_rss_bytes Peak PGID RSS memory usage for the active run in bytes.",
+            "# TYPE beacon_project_peak_rss_bytes gauge",
+            "# HELP beacon_project_cpu_percent Current PGID CPU usage percent.",
+            "# TYPE beacon_project_cpu_percent gauge",
+            "# HELP beacon_project_runs_total Total recorded runs by project and status.",
+            "# TYPE beacon_project_runs_total counter",
+        ]
+    )
+
+    for proj in projects:
+        pid = int(proj["id"])
+        pname = _prom_escape_label(proj["name"])
+        ptype = _prom_escape_label(proj.get("type", "service"))
+        act = active_by_proj.get(pid)
+        is_up = 1 if act else 0
+        rss_bytes = int(float(act.get("rss_mb", 0.0)) * 1024 * 1024) if act else 0
+        peak_bytes = int(float(act.get("peak_rss_mb", 0.0)) * 1024 * 1024) if act else 0
+        p_cpu = float(act.get("cpu_percent", 0.0)) if act else 0.0
+        labels = f'project="{pname}",type="{ptype}"'
+        lines.append(f"beacon_project_up{{{labels}}} {is_up}")
+        lines.append(f"beacon_project_rss_bytes{{{labels}}} {rss_bytes}")
+        lines.append(f"beacon_project_peak_rss_bytes{{{labels}}} {peak_bytes}")
+        lines.append(f"beacon_project_cpu_percent{{{labels}}} {p_cpu:.2f}")
+        for st_name, cnt in counts_by_proj.get(pid, []):
+            st_lbl = _prom_escape_label(st_name)
+            lines.append(f'beacon_project_runs_total{{project="{pname}",status="{st_lbl}"}} {cnt}')
+
+    body = "\n".join(lines) + "\n"
+    return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+def _scan_proc_net_tcp_listening() -> list[tuple[int, str]]:
+    """Резервное чтение слушающих TCP-портов из /proc/net/tcp и /proc/net/tcp6 (работает без root)."""
+    found: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for path_str, is_v6 in (("/proc/net/tcp", False), ("/proc/net/tcp6", True)):
+        p = Path(path_str)
+        if not p.exists():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for line in text.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            if parts[3] != "0A":  # TCP_LISTEN
+                continue
+            local = parts[1]
+            if ":" not in local:
+                continue
+            addr_hex, port_hex = local.rsplit(":", 1)
+            try:
+                port = int(port_hex, 16)
+            except ValueError:
+                continue
+            if port <= 0:
+                continue
+            if not is_v6 and len(addr_hex) == 8:
+                try:
+                    octets = [str(int(addr_hex[i : i + 2], 16)) for i in (6, 4, 2, 0)]
+                    bind_addr = ".".join(octets)
+                except ValueError:
+                    bind_addr = "0.0.0.0"
+            else:
+                bind_addr = "::" if addr_hex == "0" * 32 else "::1"
+            key = (port, bind_addr)
+            if key not in seen:
+                seen.add(key)
+                found.append(key)
+    return found
+
+
+@router.get("/system/ports")
+async def api_system_ports(request: Request) -> dict[str, Any]:
+    """Карта TCP-портов хоста и проектов Beacon с определением владельцев, конфликтов и свободного порта."""
+    hub_pid = os.getpid()
+    hub_port = int(get_runtime_port() or 8050)
+    settings = get_all_settings()
+    reserved = parse_reserved_ports(settings.get("reserved_ports", ""))
+
+    projects = query_all("SELECT id, name, type, port, health_status FROM projects ORDER BY id ASC")
+    proj_by_id = {int(p["id"]): p for p in projects}
+    proj_by_port: dict[int, dict[str, Any]] = {}
+    for p in projects:
+        p_port = int(p.get("port") or 0)
+        if p_port > 0:
+            proj_by_port[p_port] = p
+
+    active_by_proj: dict[int, dict[str, Any]] = {}
+    active_by_pgid: dict[int, dict[str, Any]] = {}
+    active_by_pid: dict[int, dict[str, Any]] = {}
+    for info in ACTIVE_RUNS.values():
+        pid_proj = int(info.get("project_id") or 0)
+        active_by_proj[pid_proj] = info
+        if info.get("pgid"):
+            active_by_pgid[int(info["pgid"])] = info
+        if info.get("pid"):
+            active_by_pid[int(info["pid"])] = info
+
+    raw_listeners: dict[int, dict[str, Any]] = {}
+    try:
+        conns = psutil.net_connections(kind="inet")
+        for c in conns:
+            if getattr(c, "status", "") != "LISTEN":
+                continue
+            laddr = getattr(c, "laddr", None)
+            if not laddr or not getattr(laddr, "port", 0):
+                continue
+            port = int(laddr.port)
+            bind_ip = str(getattr(laddr, "ip", "0.0.0.0") or "0.0.0.0")
+            pid = int(c.pid) if c.pid else None
+            existing = raw_listeners.get(port)
+            if existing is None or (existing.get("pid") is None and pid is not None):
+                raw_listeners[port] = {"port": port, "bind_addr": bind_ip, "pid": pid}
+    except Exception:
+        pass
+
+    for port, bind_ip in _scan_proc_net_tcp_listening():
+        if port not in raw_listeners:
+            raw_listeners[port] = {"port": port, "bind_addr": bind_ip, "pid": None}
+
+    entries: list[dict[str, Any]] = []
+    seen_project_ports: set[int] = set()
+
+    for port, sock in sorted(raw_listeners.items()):
+        pid = sock.get("pid")
+        proc_name = ""
+        pgid: Optional[int] = None
+        if pid:
+            try:
+                proc_name = psutil.Process(pid).name()
+            except Exception:
+                proc_name = ""
+            try:
+                pgid = os.getpgid(pid)
+            except OSError:
+                pgid = None
+
+        matched_proj: Optional[dict[str, Any]] = None
+        if pid and pid in active_by_pid:
+            matched_proj = proj_by_id.get(int(active_by_pid[pid]["project_id"]))
+        elif pgid and pgid in active_by_pgid:
+            matched_proj = proj_by_id.get(int(active_by_pgid[pgid]["project_id"]))
+
+        configured_proj = proj_by_port.get(port)
+        owner_kind = "external"
+        project_id: Optional[int] = None
+        project_name = ""
+        note = ""
+
+        if pid == hub_pid or port == hub_port:
+            owner_kind = "beacon_hub"
+            project_name = "Beacon Control Panel"
+            proc_name = proc_name or "python3 (beacon)"
+        elif matched_proj is not None:
+            owner_kind = "beacon_project"
+            project_id = int(matched_proj["id"])
+            project_name = str(matched_proj["name"])
+            seen_project_ports.add(port)
+        elif configured_proj is not None:
+            cfg_pid_id = int(configured_proj["id"])
+            seen_project_ports.add(port)
+            if cfg_pid_id in active_by_proj:
+                owner_kind = "beacon_project"
+                project_id = cfg_pid_id
+                project_name = str(configured_proj["name"])
+            else:
+                owner_kind = "conflict"
+                project_id = cfg_pid_id
+                project_name = str(configured_proj["name"])
+                note = f"Порт занят внешним процессом ({proc_name or 'PID ' + str(pid or '?')}), пока проект остановлен"
+
+        entries.append(
+            {
+                "port": port,
+                "bind_addr": sock["bind_addr"],
+                "listening": True,
+                "owner_kind": owner_kind,
+                "pid": pid,
+                "process_name": proc_name or ("beacon" if owner_kind == "beacon_hub" else "—"),
+                "project_id": project_id,
+                "project_name": project_name,
+                "note": note,
+            }
+        )
+
+    for p in projects:
+        p_port = int(p.get("port") or 0)
+        if p_port > 0 and p_port not in seen_project_ports:
+            p_id = int(p["id"])
+            is_running = p_id in active_by_proj
+            entries.append(
+                {
+                    "port": p_port,
+                    "bind_addr": "127.0.0.1",
+                    "listening": False,
+                    "owner_kind": "beacon_configured",
+                    "pid": active_by_proj[p_id].get("pid") if is_running else None,
+                    "process_name": p.get("type", "web"),
+                    "project_id": p_id,
+                    "project_name": str(p["name"]),
+                    "note": "Запущен, ожидает открытия сокета" if is_running else "Проект остановлен (порт зарезервирован в Beacon)",
+                }
+            )
+
+    entries.sort(key=lambda item: (0 if item["owner_kind"] == "conflict" else 1, item["port"]))
+
+    busy_ports = set(raw_listeners.keys()) | set(proj_by_port.keys()) | set(FORBIDDEN_PORTS) | set(reserved) | {hub_port}
+    suggested_free_port = 18080
+    for candidate in range(18080, 18300):
+        if candidate not in busy_ports:
+            suggested_free_port = candidate
+            break
+
+    return {
+        "ok": True,
+        "hub_port": hub_port,
+        "listening_count": sum(1 for e in entries if e["listening"]),
+        "configured_count": sum(1 for e in entries if e["project_id"] is not None),
+        "conflict_count": sum(1 for e in entries if e["owner_kind"] == "conflict"),
+        "suggested_free_port": suggested_free_port,
+        "ports": entries,
+    }
+
+
+@router.get("/projects/{project_id}/processes")
+async def api_project_processes(request: Request, project_id: int) -> dict[str, Any]:
+    """Возвращает живое дерево процессов внутри группы PGID активного запуска проекта."""
+    proj = query_one("SELECT id, name, type FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+
+    active_run: Optional[dict[str, Any]] = None
+    for info in ACTIVE_RUNS.values():
+        if int(info.get("project_id") or 0) == project_id:
+            active_run = info
+            break
+
+    if not active_run or not active_run.get("pid"):
+        return {
+            "ok": True,
+            "running": False,
+            "project_id": project_id,
+            "project_name": proj["name"],
+            "run_id": None,
+            "root_pid": None,
+            "pgid": None,
+            "process_count": 0,
+            "total_rss_mb": 0.0,
+            "total_cpu_percent": 0.0,
+            "processes": [],
+        }
+
+    root_pid = int(active_run["pid"])
+    target_pgid = int(active_run.get("pgid") or root_pid)
+    now_ts = time.time()
+    procs: list[dict[str, Any]] = []
+    total_rss_mb = 0.0
+    total_cpu_pct = 0.0
+
+    for p in psutil.process_iter():
+        try:
+            pid_val = int(p.pid)
+            try:
+                p_pgid = os.getpgid(pid_val)
+            except OSError:
+                continue
+            if p_pgid != target_pgid and pid_val != root_pid:
+                continue
+            mem = p.memory_info()
+            rss_mb = round(float(mem.rss) / (1024 * 1024), 1)
+            cpu_pct = round(float(p.cpu_percent(interval=None) or 0.0), 1)
+            raw_cmd = p.cmdline() or []
+            cmd_str = " ".join(str(x) for x in raw_cmd) if isinstance(raw_cmd, list) else str(raw_cmd)
+            cmd_clean = redact_log_text(cmd_str)[:180]
+            p_name = str(p.name() or "process")
+            p_status = str(p.status() or "running")
+            p_ppid = int(p.ppid() or 0)
+            ctime = float(p.create_time() or now_ts)
+            uptime_sec = max(0, int(now_ts - ctime))
+            total_rss_mb += rss_mb
+            total_cpu_pct += cpu_pct
+            procs.append(
+                {
+                    "pid": pid_val,
+                    "ppid": p_ppid,
+                    "is_root": pid_val == root_pid,
+                    "name": p_name,
+                    "status": p_status,
+                    "rss_mb": rss_mb,
+                    "cpu_percent": cpu_pct,
+                    "uptime_sec": uptime_sec,
+                    "cmdline": cmd_clean or p_name,
+                }
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            continue
+
+    procs.sort(key=lambda item: (0 if item["is_root"] else 1, item["pid"]))
+    return {
+        "ok": True,
+        "running": len(procs) > 0,
+        "project_id": project_id,
+        "project_name": proj["name"],
+        "run_id": int(active_run.get("run_id") or 0),
+        "root_pid": root_pid,
+        "pgid": target_pgid,
+        "process_count": len(procs),
+        "total_rss_mb": round(total_rss_mb, 1),
+        "total_cpu_percent": round(total_cpu_pct, 1),
+        "processes": procs,
+    }
 
 
 @router.get("/system/bundle")

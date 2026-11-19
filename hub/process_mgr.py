@@ -697,7 +697,7 @@ def _build_process_env(
     if extra_env and isinstance(extra_env, dict):
         for ek, ev in extra_env.items():
             key_str = str(ek).strip()
-            if key_str.startswith("PARAM_") or not is_reserved_param_name(key_str):
+            if key_str.startswith(("PARAM_", "BEACON_WEBHOOK_")) or not is_reserved_param_name(key_str):
                 env[key_str] = str(ev)
     workdir = Path(project.get("workdir", "")).resolve()
 
@@ -974,6 +974,39 @@ async def start_project_run(
         if info["project_id"] == project_id and not is_auxiliary:
             raise RuntimeError(f"Проект «{project['name']}» уже выполняется (run_id={r_id}, PID={info['pid']})")
 
+    # Автоматический каскадный запуск зависимости DEPENDS_ON (до глубины 3, защита от циклов)
+    if not is_auxiliary and chain_depth < 3:
+        try:
+            proj_env_map = json.loads(project.get("env_json") or "{}")
+        except Exception:
+            proj_env_map = {}
+        dep_ref = str(proj_env_map.get("DEPENDS_ON", "")).strip() if isinstance(proj_env_map, dict) else ""
+        if dep_ref and dep_ref != str(project_id) and dep_ref != str(project.get("name")):
+            dep_proj = (
+                query_one("SELECT id, name FROM projects WHERE id = ?", (int(dep_ref),))
+                if dep_ref.isdigit()
+                else query_one("SELECT id, name FROM projects WHERE name = ?", (dep_ref,))
+            )
+            if dep_proj and int(dep_proj["id"]) != int(project_id) and not _has_other_active_runs(int(dep_proj["id"])):
+                try:
+                    dep_run = await start_project_run(
+                        int(dep_proj["id"]),
+                        trigger="chain",
+                        chain_depth=chain_depth + 1,
+                    )
+                    if dep_run and dep_run.get("id"):
+                        execute_sql(
+                            "UPDATE runs SET triggered_by = ? WHERE id = ?",
+                            (f"depends_on:{project['name']}", int(dep_run["id"])),
+                        )
+                except Exception as dep_exc:
+                    logger.warning(
+                        "Не удалось автоматически запустить зависимый проект %s для %s: %s",
+                        dep_proj["name"],
+                        project["name"],
+                        dep_exc,
+                    )
+
     settings = get_all_settings()
     reserved_ports = parse_reserved_ports(settings.get("reserved_ports", "")) | FORBIDDEN_PORTS
     panel_port = int(settings.get("port", "8050") or 8050)
@@ -1154,6 +1187,8 @@ async def start_project_run(
             "stdin_keepalive_fd": stdin_w_fd,
             "popen": proc,
             "rss_mb": 0.0,
+            "peak_rss_mb": 0.0,
+            "rss_history": [],
             "cpu_percent": 0.0,
             "is_deps_install": is_auxiliary,
             "chain_depth": int(chain_depth),
@@ -1591,6 +1626,12 @@ async def watch_processes_loop() -> None:
                     info["rss_mb"] = rss_mb
                     info["cpu_percent"] = cpu_pct
                     info["proc_count"] = proc_cnt
+                    info["peak_rss_mb"] = max(float(info.get("peak_rss_mb") or 0.0), float(rss_mb))
+                    rss_hist = list(info.get("rss_history") or [])
+                    rss_hist.append(round(float(rss_mb), 1))
+                    if len(rss_hist) > 16:
+                        del rss_hist[:-16]
+                    info["rss_history"] = rss_hist
 
                     # 3. Контроль лимита ОЗУ (ram_limit_mb)
                     ram_limit_mb = int(project.get("ram_limit_mb") or 0)

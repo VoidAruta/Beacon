@@ -222,7 +222,14 @@ test('classifyStatusNotice, formatLiveUptime, getRuntimeSdkSnippets, and generat
   assert.ok(yamlTpl.includes('name: demo_bot'));
 });
 
-import { parseDotEnvText, isSensitiveEnvKey, AI_TOKEN_PRESETS } from './hubLogic';
+import {
+  parseDotEnvText,
+  isSensitiveEnvKey,
+  AI_TOKEN_PRESETS,
+  filterLogLinesByLevel,
+  SCHEDULE_PRESETS,
+  computeNextScheduleRunPreview,
+} from './hubLogic';
 
 test('parseDotEnvText parses .env lines, strips quotes/export/comments, and detects sensitive keys', () => {
   const sample = `
@@ -247,4 +254,87 @@ test('parseDotEnvText parses .env lines, strips quotes/export/comments, and dete
   assert.equal(AI_TOKEN_PRESETS.length, 3);
 });
 
+test('filterLogLinesByLevel counts WARN/ERROR lines and preserves Python/Node stack traces', () => {
+  const raw = [
+    '2026-11-18 10:00:00 [INFO] Server started on :8080',
+    '2026-11-18 10:01:00 [WARNING] High latency detected (450ms)',
+    'Traceback (most recent call last):',
+    '  File "/app/main.py", line 14, in <module>',
+    '    raise ValueError("Invalid token")',
+    'ValueError: Invalid token',
+    '2026-11-18 10:02:00 [INFO] Healthcheck OK',
+  ].join('\n');
 
+  const allRes = filterLogLinesByLevel(raw, 'all');
+  assert.equal(allRes.totalLines, 7);
+  assert.equal(allRes.errorCount, 1); // Contiguous Traceback block counted as 1 error event
+  assert.equal(allRes.warnCount, 1);
+
+  const errOnly = filterLogLinesByLevel(raw, 'error_only');
+  assert.equal(errOnly.matchedLines, 4); // Traceback + 2 indented stack lines + ValueError
+  assert.ok(errOnly.text.includes('File "/app/main.py"'));
+  assert.ok(!errOnly.text.includes('Healthcheck OK'));
+
+  const warnErr = filterLogLinesByLevel(raw, 'warn_error');
+  assert.equal(warnErr.matchedLines, 5);
+  assert.ok(warnErr.text.includes('High latency detected'));
+});
+
+test('computeNextScheduleRunPreview validates presets and calculates upcoming run summaries', () => {
+  assert.equal(SCHEDULE_PRESETS.length, 6);
+  const fixedNow = new Date('2026-11-18T10:10:00Z').getTime();
+  for (const preset of SCHEDULE_PRESETS) {
+    const res = computeNextScheduleRunPreview(preset.type, preset.expr, fixedNow);
+    assert.equal(res.valid, true, `Preset ${preset.label} must be valid`);
+    assert.ok(res.nextRunText.length > 0);
+  }
+  const invalidCron = computeNextScheduleRunPreview('cron', 'bad cron', fixedNow);
+  assert.equal(invalidCron.valid, false);
+});
+
+import {
+  classifySlaTier,
+  getSlaStatusBarColor,
+  buildPrometheusScrapeConfig,
+} from './hubLogic';
+
+test('classifySlaTier, getSlaStatusBarColor, and buildPrometheusScrapeConfig work deterministically', () => {
+  assert.equal(classifySlaTier(null).label, 'Нет данных');
+  assert.ok(classifySlaTier(99.5).colorCls.includes('emerald'));
+  assert.ok(classifySlaTier(94.0).colorCls.includes('amber'));
+  assert.ok(classifySlaTier(72.5).colorCls.includes('rose'));
+
+  assert.equal(getSlaStatusBarColor('success'), 'bg-emerald-400');
+  assert.equal(getSlaStatusBarColor('killed_oom'), 'bg-rose-500');
+  assert.equal(getSlaStatusBarColor('killed_timeout'), 'bg-amber-400');
+
+  const yamlCfg = buildPrometheusScrapeConfig('https://panel.example.com:8443');
+  assert.ok(yamlCfg.includes('metrics_path: "/api/metrics"'));
+  assert.ok(yamlCfg.includes('scheme: "https"'));
+  assert.ok(yamlCfg.includes('targets: ["panel.example.com:8443"]'));
+});
+
+import {
+  buildReverseProxyConfig,
+  classifyPortOwnerBadge,
+  normalizeProjectGroupTag,
+} from './hubLogic';
+
+test('buildReverseProxyConfig, classifyPortOwnerBadge, and normalizeProjectGroupTag work for Stage 7', () => {
+  const nginxCfg = buildReverseProxyConfig('nginx', 'https://api.mybox.dev/v1', 18081, 'web-status-api');
+  assert.ok(nginxCfg.includes('server_name api.mybox.dev;'));
+  assert.ok(nginxCfg.includes('proxy_pass http://127.0.0.1:18081;'));
+  assert.ok(nginxCfg.includes('Upgrade $http_upgrade'));
+
+  const caddyCfg = buildReverseProxyConfig('caddy', 'bot.mybox.dev', 18082, 'tg-hook');
+  assert.ok(caddyCfg.includes('bot.mybox.dev {'));
+  assert.ok(caddyCfg.includes('reverse_proxy 127.0.0.1:18082'));
+
+  const cfCfg = buildReverseProxyConfig('cloudflared', '', 9000, 'demo');
+  assert.ok(cfCfg.includes('hostname: api.example.com'));
+  assert.ok(cfCfg.includes('service: http://127.0.0.1:9000'));
+
+  assert.equal(classifyPortOwnerBadge('conflict').label, 'Конфликт порта');
+  assert.ok(classifyPortOwnerBadge('beacon_project').colorCls.includes('emerald'));
+  assert.equal(normalizeProjectGroupTag('  Продакшн   API  '), 'Продакшн API');
+});

@@ -121,6 +121,7 @@ export interface SystemStatus {
   ai_access_enabled?: boolean;
   ai_access_paused?: boolean;
   pending_ai_approvals_count?: number;
+  alerts_muted_until?: number;
 }
 
 export interface WebAuthSession {
@@ -178,7 +179,7 @@ export interface RunItem {
   project_id: number;
   project_name?: string;
   status: 'running' | 'waiting_input' | 'success' | 'failed' | 'timeout' | 'stopped' | 'killed_oom' | 'crash_loop';
-  trigger: 'manual' | 'schedule' | 'webhook' | 'autostart' | 'restart' | 'retry' | 'chain' | 'cron_restart' | 'ai';
+  trigger: 'manual' | 'schedule' | 'webhook' | 'autostart' | 'restart' | 'retry' | 'chain' | 'cron_restart' | 'ai' | 'dependency';
   triggered_by?: string;
   pid: number | null;
   pgid: number | null;
@@ -253,6 +254,8 @@ export interface ProjectItem {
   pid: number | null;
   pgid: number | null;
   rss_mb: number;
+  peak_rss_mb?: number;
+  rss_history?: number[];
   cpu_percent: number;
   proc_count?: number;
   last_run: RunItem | null;
@@ -264,6 +267,9 @@ export interface ProjectItem {
   group_tag?: string;
   custom_proxy?: string;
   git_repo_url?: string;
+  depends_on?: string;
+  auto_git_pull?: boolean;
+  has_git?: boolean;
   has_browser_profile?: boolean;
   active_web_auth?: boolean;
   cookie_status: ProjectCookieStatus;

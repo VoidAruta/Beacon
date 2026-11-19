@@ -48,9 +48,26 @@ import {
   ArrowDown,
   MoreVertical,
   KeyRound,
+  History,
+  GitBranch,
+  RefreshCw,
+  Link2,
+  Tag,
+  Layers,
 } from 'lucide-react';
 import { ProjectItem, RunItem, SecretItem, SystemStatus, WorkspaceSubTab, WebAuthSession } from '../types/hub';
-import { formatBytes, isSensitiveEnvKey, parseDotEnvText } from '../utils/hubLogic';
+import {
+  buildReverseProxyConfig,
+  computeNextScheduleRunPreview,
+  filterLogLinesByLevel,
+  formatBytes,
+  isSensitiveEnvKey,
+  LogLevelFilter,
+  normalizeProjectGroupTag,
+  parseDotEnvText,
+  ReverseProxyProvider,
+  SCHEDULE_PRESETS,
+} from '../utils/hubLogic';
 import {
   DEFAULTS,
   LABELS,
@@ -252,6 +269,29 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   const [cliRunning, setCliRunning] = useState<boolean>(false);
   const [cliOutput, setCliOutput] = useState<string>('');
 
+  // Локальные снапшоты файлов (История версий без Git)
+  const [showSnapshotsBar, setShowSnapshotsBar] = useState<boolean>(false);
+  const [fileSnapshots, setFileSnapshots] = useState<
+    Array<{ id: string; timestamp: number; size: number; lines: number; preview: string }>
+  >([]);
+  const [snapshotsLoading, setSnapshotsLoading] = useState<boolean>(false);
+  const [restoringSnapshotId, setRestoringSnapshotId] = useState<string | null>(null);
+
+  // Менеджер Git-репозитория (Auto-Deploy, Pull & 1-Click Rollback)
+  const [gitInfo, setGitInfo] = useState<{
+    ok: boolean;
+    is_git: boolean;
+    branch: string;
+    remote_url: string;
+    dirty_files: string[];
+    dirty_count?: number;
+    commits: Array<{ hash: string; author: string; timestamp: number; subject: string }>;
+  } | null>(null);
+  const [gitLoading, setGitLoading] = useState<boolean>(false);
+  const [gitPullBusy, setGitPullBusy] = useState<boolean>(false);
+  const [gitRollbackHash, setGitRollbackHash] = useState<string | null>(null);
+  const [gitStatusMsg, setGitStatusMsg] = useState<string>('');
+
   // Вкладка 4/5: Настройки, Расписание, Супервизор, Лимиты и Секреты (используем DEFAULTS Audit #19)
   const [cfgName, setCfgName] = useState<string>('');
   const [cfgType, setCfgType] = useState<'service' | 'web' | 'job'>('service');
@@ -291,10 +331,37 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   const [newEnvVal, setNewEnvVal] = useState<string>('');
   const [cfgSelectedSecrets, setCfgSelectedSecrets] = useState<string[]>([]);
   const [cfgWebhookHmacSecret, setCfgWebhookHmacSecret] = useState<string>('');
+  const [cfgGroupTag, setCfgGroupTag] = useState<string>('');
   const [cfgParamsSchema, setCfgParamsSchema] = useState<Array<{ name: string; label: string; default: string }>>([]);
   const [cfgStatus, setCfgStatus] = useState<string>('');
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState<boolean>(false);
   const [deleteFilesCheckbox, setDeleteFilesCheckbox] = useState<boolean>(false);
+
+  // Stage 7: Инспектор дерева процессов PGID и генератор Reverse Proxy (Nginx / Caddy / Cloudflared)
+  const [showPgidTree, setShowPgidTree] = useState<boolean>(false);
+  const [pgidTreeLoading, setPgidTreeLoading] = useState<boolean>(false);
+  const [pgidTreeData, setPgidTreeData] = useState<{
+    running: boolean;
+    root_pid: number | null;
+    pgid: number | null;
+    process_count: number;
+    total_rss_mb: number;
+    total_cpu_percent: number;
+    processes: Array<{
+      pid: number;
+      ppid: number;
+      is_root: boolean;
+      name: string;
+      status: string;
+      rss_mb: number;
+      cpu_percent: number;
+      uptime_sec: number;
+      cmdline: string;
+    }>;
+  } | null>(null);
+  const [proxyProvider, setProxyProvider] = useState<ReverseProxyProvider>('nginx');
+  const [proxyDomain, setProxyDomain] = useState<string>('api.example.com');
+  const [proxyCopied, setProxyCopied] = useState<boolean>(false);
 
   // Конструктор расписания
   const [schedBuilderMode, setSchedBuilderMode] = useState<'minutes' | 'hours' | 'daily' | 'interval' | 'raw'>('minutes');
@@ -307,6 +374,22 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   const [bottomConsoleTab, setBottomConsoleTab] = useState<'logs' | 'kv' | 'shell'>('logs');
   const [consoleExpanded, setConsoleExpanded] = useState<boolean>(false);
   const [logSearchQuery, setLogSearchQuery] = useState<string>('');
+  const [logLevelFilter, setLogLevelFilter] = useState<LogLevelFilter>('all');
+  const [webhookDeliveries, setWebhookDeliveries] = useState<
+    Array<{
+      timestamp: number;
+      client_ip: string;
+      event: string;
+      status_code: number;
+      run_id?: number | null;
+      payload_preview: string;
+      detail: string;
+    }>
+  >([]);
+  const [webhookTestEvent, setWebhookTestEvent] = useState<string>('push');
+  const [webhookTestPayload, setWebhookTestPayload] = useState<string>('{"event": "deploy", "branch": "main"}');
+  const [webhookTestBusy, setWebhookTestBusy] = useState<boolean>(false);
+  const [webhookTestMsg, setWebhookTestMsg] = useState<string>('');
   const [kvItems, setKvItems] = useState<Array<{ key: string; value: any; updated_at: number }>>([]);
   const [newKvKey, setNewKvKey] = useState<string>('');
   const [newKvVal, setNewKvVal] = useState<string>('');
@@ -379,7 +462,10 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     setCfgNotifyOnCrash(activeProj.notify_on_crash === undefined ? true : Boolean(activeProj.notify_on_crash));
     setCfgNotifyOnSuccess(Boolean(activeProj.notify_on_success));
     setCfgEnvJson(activeProj.env_json || '{}');
+    setCfgGroupTag(String(activeProj.env?.PROJECT_GROUP || activeProj.group_tag || ''));
     setCfgWebhookHmacSecret(activeProj.webhook_hmac_secret || '');
+    setShowPgidTree(false);
+    setPgidTreeData(null);
     const schemaList = Array.isArray(activeProj.params_schema)
       ? activeProj.params_schema.map((item) => ({
           name: String(item.name || ''),
@@ -479,11 +565,186 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     setDraftContents({});
     setRenamingPath(null);
     setFileActionMode('none');
+    setShowSnapshotsBar(false);
+    setFileSnapshots([]);
+    setGitInfo(null);
+    setGitStatusMsg('');
 
     loadProjectFiles(activeProj.id);
     loadProjectRuns(activeProj.id);
     loadProjectKv(activeProj.id);
   }, [activeProj?.id]);
+
+  const loadFileSnapshots = useCallback(
+    async (projId: number, relPath: string) => {
+      if (!relPath) {
+        setFileSnapshots([]);
+        return;
+      }
+      setSnapshotsLoading(true);
+      try {
+        const res = await apiFetch(
+          `/api/projects/${projId}/files/snapshots?path=${encodeURIComponent(relPath)}`
+        );
+        if (res.ok) {
+          const data = await res.json();
+          setFileSnapshots(Array.isArray(data.snapshots) ? data.snapshots : []);
+        } else {
+          setFileSnapshots([]);
+        }
+      } catch {
+        setFileSnapshots([]);
+      } finally {
+        setSnapshotsLoading(false);
+      }
+    },
+    [apiFetch]
+  );
+
+  const handleRestoreSnapshot = async (snapshotId: string) => {
+    if (!activeProj || !activeFilePath || restoringSnapshotId) return;
+    setRestoringSnapshotId(snapshotId);
+    try {
+      const res = await apiFetch(`/api/projects/${activeProj.id}/files/restore_snapshot`, {
+        method: 'POST',
+        body: JSON.stringify({ path: activeFilePath, snapshot_id: snapshotId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        const restoredText = String(data.content ?? '');
+        setFileContent(restoredText);
+        setSavedContents((prev) => ({ ...prev, [activeFilePath]: restoredText }));
+        setDraftContents((prev) => ({ ...prev, [activeFilePath]: restoredText }));
+        setFileStatus(`Версия файла восстановлена (снимок ${snapshotId})`);
+        await loadFileSnapshots(activeProj.id, activeFilePath);
+        onRefreshAll();
+        if (activeProj.current_status === 'running' || activeProj.current_status === 'waiting_input') {
+          setDirtyDeployMap((prev) => ({
+            ...prev,
+            [activeProj.id]: `Файл «${activeFilePath}» откачен из снапшота (${formatShortTime(Date.now())})`,
+          }));
+        }
+        setTimeout(() => setFileStatus(''), DEFAULTS.STATUS_CLEAR_MS);
+      } else {
+        setFileStatus(`Ошибка восстановления версии: ${data.detail || 'Не удалось откатить файл'}`);
+      }
+    } catch (err: any) {
+      setFileStatus(`Ошибка сети при откате файла: ${err?.message || 'Сбой сети'}`);
+    } finally {
+      setRestoringSnapshotId(null);
+    }
+  };
+
+  const loadProjectGitInfo = useCallback(
+    async (projId: number) => {
+      setGitLoading(true);
+      try {
+        const res = await apiFetch(`/api/projects/${projId}/git_info`);
+        if (res.ok) {
+          const data = await res.json();
+          setGitInfo(data);
+        }
+      } catch {
+        // ignore transient network error
+      } finally {
+        setGitLoading(false);
+      }
+    },
+    [apiFetch]
+  );
+
+  const handleGitPull = async (restartAfter: boolean) => {
+    if (!activeProj || gitPullBusy) return;
+    setGitPullBusy(true);
+    setGitStatusMsg(restartAfter ? 'Выполнение git pull --ff-only и перезапуск...' : 'Выполнение git pull --ff-only...');
+    try {
+      const res = await apiFetch(`/api/projects/${activeProj.id}/git_pull`, {
+        method: 'POST',
+        body: JSON.stringify({ restart_after: restartAfter }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        if (data.git_info) setGitInfo(data.git_info);
+        setCliOutput(`$ git pull --ff-only\n${data.output || 'Already up to date.'}`);
+        setGitStatusMsg(
+          data.restarted
+            ? 'Git Pull выполнен, проект перезапущен!'
+            : `Git Pull выполнен: ${String(data.output || 'OK').slice(0, 120)}`
+        );
+        loadProjectFiles(activeProj.id, activeFilePath);
+        loadProjectRuns(activeProj.id);
+        onRefreshAll();
+      } else {
+        setGitStatusMsg(`Ошибка Git Pull: ${data.detail || data.output || 'Сбой команды'}`);
+        if (data.output) setCliOutput(`$ git pull --ff-only\n${data.output}`);
+      }
+    } catch (err: any) {
+      setGitStatusMsg(`Ошибка сети при Git Pull: ${err?.message || 'Сбой сети'}`);
+    } finally {
+      setGitPullBusy(false);
+    }
+  };
+
+  const handleGitRollback = async (commitHash: string) => {
+    if (!activeProj || gitRollbackHash) return;
+    setGitRollbackHash(commitHash);
+    setGitStatusMsg(`Откат репозитория к коммиту ${commitHash}...`);
+    try {
+      const res = await apiFetch(`/api/projects/${activeProj.id}/git_rollback`, {
+        method: 'POST',
+        body: JSON.stringify({ commit: commitHash, restart_after: true }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        if (data.git_info) setGitInfo(data.git_info);
+        setCliOutput(`$ git reset --hard ${commitHash}\n${data.output || 'OK'}`);
+        setGitStatusMsg(
+          data.restarted
+            ? `Откат к ${commitHash} выполнен, процесс перезапущен!`
+            : `Откат к коммиту ${commitHash} выполнен.`
+        );
+        loadProjectFiles(activeProj.id, activeFilePath);
+        loadProjectRuns(activeProj.id);
+        onRefreshAll();
+      } else {
+        setGitStatusMsg(`Ошибка отката Git: ${data.detail || data.output || 'Сбой команды'}`);
+      }
+    } catch (err: any) {
+      setGitStatusMsg(`Ошибка сети при откате Git: ${err?.message || 'Сбой сети'}`);
+    } finally {
+      setGitRollbackHash(null);
+    }
+  };
+
+  const loadPgidProcesses = useCallback(
+    async (projId: number) => {
+      setPgidTreeLoading(true);
+      try {
+        const res = await apiFetch(`/api/projects/${projId}/processes`);
+        if (res.ok) {
+          const data = await res.json();
+          setPgidTreeData(data);
+        }
+      } catch {
+        // ignore transient errors
+      } finally {
+        setPgidTreeLoading(false);
+      }
+    },
+    [apiFetch]
+  );
+
+  useEffect(() => {
+    if (subTab === 'terminal_git' && activeProj?.id) {
+      loadProjectGitInfo(activeProj.id);
+    }
+  }, [subTab, activeProj?.id, loadProjectGitInfo]);
+
+  useEffect(() => {
+    if (showSnapshotsBar && activeProj?.id && activeFilePath) {
+      loadFileSnapshots(activeProj.id, activeFilePath);
+    }
+  }, [showSnapshotsBar, activeProj?.id, activeFilePath, loadFileSnapshots]);
 
   // Защищённые обёртки действий над процессом (Audit #2, #3, #12)
   const triggerStartProjectSafe = useCallback(
@@ -816,6 +1077,9 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
         setSavedContents((prev) => ({ ...prev, [targetPath]: targetContent }));
         setDraftContents((prev) => ({ ...prev, [targetPath]: targetContent }));
         loadProjectFiles(activeProj.id, targetPath);
+        if (showSnapshotsBar && targetPath === activeFilePath) {
+          loadFileSnapshots(activeProj.id, targetPath);
+        }
         onRefreshAll();
 
         const isRunningNow =
@@ -1531,6 +1795,23 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
         .filter((p) => p.name.trim())
         .map((p) => ({ name: p.name.trim(), label: p.label.trim(), default: p.default }));
 
+      let finalEnvJson = cfgEnvJson;
+      try {
+        const parsedEnv = JSON.parse(cfgEnvJson || '{}');
+        if (parsedEnv && typeof parsedEnv === 'object' && !Array.isArray(parsedEnv)) {
+          const normGroup = normalizeProjectGroupTag(cfgGroupTag);
+          if (normGroup) {
+            parsedEnv.PROJECT_GROUP = normGroup;
+          } else {
+            delete parsedEnv.PROJECT_GROUP;
+          }
+          finalEnvJson = JSON.stringify(parsedEnv, null, 2);
+          setCfgEnvJson(finalEnvJson);
+        }
+      } catch {
+        // keep original cfgEnvJson if user entered custom JSON
+      }
+
       await onUpdateProject(activeProj.id, {
         name: cfgName,
         type: cfgType,
@@ -1561,7 +1842,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
         notify_on_error: cfgNotifyOnError ? 1 : 0,
         notify_on_crash: cfgNotifyOnCrash ? 1 : 0,
         notify_on_success: cfgNotifyOnSuccess ? 1 : 0,
-        env_json: cfgEnvJson,
+        env_json: finalEnvJson,
         secrets_json: JSON.stringify(cfgSelectedSecrets),
         webhook_hmac_secret: cfgWebhookHmacSecret.trim(),
         params_schema: cleanParams,
@@ -2543,6 +2824,25 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                   PID {activeProj.pid} / PGID {activeProj.pgid || activeProj.pid}
                   {activeProcCount > 1 ? ` (${activeProcCount} воркера)` : ''}
                 </span>
+                <button
+                  type="button"
+                  aria-label="Инспектор дерева процессов PGID"
+                  onClick={() => {
+                    const nextOpen = !showPgidTree;
+                    setShowPgidTree(nextOpen);
+                    if (nextOpen) {
+                      loadPgidProcesses(activeProj.id);
+                    }
+                  }}
+                  className={`px-2 py-0.5 rounded border text-[11px] font-medium inline-flex items-center gap-1 cursor-pointer ${
+                    showPgidTree
+                      ? 'bg-emerald-950/70 text-emerald-200 border-emerald-600'
+                      : 'bg-[#0b0f17] text-slate-300 border-[#1e2638] hover:text-white hover:border-emerald-500/50'
+                  }`}
+                >
+                  <Layers className="w-3 h-3 text-emerald-400" />
+                  Дерево PGID
+                </button>
               </>
             )}
             {liveUptimeStr && (
@@ -2566,6 +2866,14 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
               <span>
                 ОЗУ {activeRamUsed} / {activeRamLimit > 0 ? `${activeRamLimit} МБ` : 'Без лимита'}
               </span>
+              {(activeProj.peak_rss_mb || 0) > 0 && (
+                <span
+                  className="px-1.5 py-0.5 rounded bg-slate-800/80 text-amber-200 border border-slate-700/80 text-[11px]"
+                  title="Пиковое потребление ОЗУ (Peak RSS) за текущий запуск процесса — помогает выявлять утечки памяти"
+                >
+                  Пик: {activeProj.peak_rss_mb} МБ
+                </span>
+              )}
               {activeRamLimit > 0 && (
                 <span className="w-14 h-1.5 bg-slate-800 rounded-full overflow-hidden inline-block align-middle">
                   <span
@@ -2584,6 +2892,87 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
             <span className="text-slate-600">·</span>
             <span>Диск {formatBytes(activeProj.total_size_bytes || 0)}</span>
           </div>
+
+          {/* Stage 7: Живой инспектор дерева процессов группы PGID */}
+          {showPgidTree && (
+            <div className="mt-2.5 bg-[#0b0f17] border border-emerald-900/60 rounded-xl p-3 space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-2 font-semibold text-emerald-300">
+                  <Layers className="w-3.5 h-3.5" />
+                  Дерево процессов группы PGID {pgidTreeData?.pgid ?? activeProj.pgid ?? activeProj.pid ?? '—'}
+                  {pgidTreeData && (
+                    <span className="font-mono font-normal text-slate-400">
+                      ({pgidTreeData.process_count} проц. · Σ RSS {pgidTreeData.total_rss_mb} МБ · CPU{' '}
+                      {pgidTreeData.total_cpu_percent.toFixed(1)}%)
+                    </span>
+                  )}
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={pgidTreeLoading}
+                    onClick={() => loadPgidProcesses(activeProj.id)}
+                    className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[11px] inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${pgidTreeLoading ? 'animate-spin' : ''}`} />
+                    Обновить
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="Закрыть дерево PGID"
+                    onClick={() => setShowPgidTree(false)}
+                    className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+
+              {pgidTreeLoading && !pgidTreeData ? (
+                <div className="text-xs font-mono text-slate-400 py-2">Чтение процессов группы PGID из /proc...</div>
+              ) : !pgidTreeData || pgidTreeData.processes.length === 0 ? (
+                <div className="text-xs font-mono text-slate-400 py-2">
+                  Активных процессов в этой группе PGID сейчас нет.
+                </div>
+              ) : (
+                <div className="overflow-x-auto border border-slate-800 rounded-lg">
+                  <table className="w-full text-left border-collapse text-[11px] font-mono tabular-nums">
+                    <thead>
+                      <tr className="bg-slate-900/90 text-slate-400 border-b border-slate-800">
+                        <th className="py-1.5 px-2.5">PID</th>
+                        <th className="py-1.5 px-2.5">PPID</th>
+                        <th className="py-1.5 px-2.5">Процесс</th>
+                        <th className="py-1.5 px-2.5">Статус</th>
+                        <th className="py-1.5 px-2.5">ОЗУ (RSS)</th>
+                        <th className="py-1.5 px-2.5">Команда</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/70">
+                      {pgidTreeData.processes.map((proc) => (
+                        <tr key={proc.pid} className="hover:bg-slate-900/50">
+                          <td className="py-1.5 px-2.5 text-emerald-300 font-semibold whitespace-nowrap">
+                            {proc.pid}
+                            {proc.is_root && (
+                              <span className="ml-1 px-1 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-800 text-[9px]">
+                                ROOT
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-1.5 px-2.5 text-slate-400 whitespace-nowrap">{proc.ppid}</td>
+                          <td className="py-1.5 px-2.5 text-white whitespace-nowrap">{proc.name}</td>
+                          <td className="py-1.5 px-2.5 text-slate-300 whitespace-nowrap">{proc.status}</td>
+                          <td className="py-1.5 px-2.5 text-amber-200 whitespace-nowrap">{proc.rss_mb} МБ</td>
+                          <td className="py-1.5 px-2.5 text-slate-400 truncate max-w-md" title={proc.cmdline}>
+                            {proc.cmdline}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Индикатор Dirty Deploy (#12): предупреждение, когда код или конфиг сохранён, а процесс ещё работает на старой версии */}
           {isProjectCurrentlyRunning && dirtyDeployReason && (
@@ -2885,58 +3274,105 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                     </button>
                   </div>
 
-                  {bottomConsoleTab === 'logs' && (
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <input
-                        type="text"
-                        value={logSearchQuery}
-                        onChange={(e) => setLogSearchQuery(e.target.value)}
-                        placeholder="Фильтр лога..."
-                        className="bg-[#111622] border border-[#1e2638] rounded-lg px-2 py-1 text-xs text-white font-mono w-28 sm:w-36"
-                      />
-                      <select
-                        value={selectedRunId || ''}
-                        onChange={(e) => setSelectedRunId(Number(e.target.value))}
-                        aria-label="Выбор запуска для просмотра лога"
-                        className="bg-[#111622] border border-[#1e2638] rounded-lg px-2 py-1 text-xs font-mono text-slate-200 max-w-[190px]"
-                      >
-                        {runs.map((r) => (
-                          <option key={r.id} value={r.id}>
-                            #{r.id} · {r.status} ({formatShortTime(r.started_at)})
-                          </option>
-                        ))}
-                      </select>
-                      {!isSideBySide && (
+                  {bottomConsoleTab === 'logs' && (() => {
+                    const logStats = filterLogLinesByLevel(logText || '', logLevelFilter, logSearchQuery);
+                    return (
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <div className="inline-flex items-center rounded-lg bg-[#111622] border border-[#1e2638] p-0.5 text-[11px] font-mono">
+                          <button
+                            type="button"
+                            onClick={() => setLogLevelFilter('all')}
+                            className={`px-2 py-0.5 rounded cursor-pointer ${
+                              logLevelFilter === 'all' ? 'bg-indigo-600 text-white font-semibold' : 'text-slate-400 hover:text-white'
+                            }`}
+                          >
+                            Все ({logStats.totalLines})
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setLogLevelFilter('warn_error')}
+                            className={`px-2 py-0.5 rounded cursor-pointer ${
+                              logLevelFilter === 'warn_error' ? 'bg-amber-600 text-slate-950 font-semibold' : 'text-amber-300/80 hover:text-amber-200'
+                            }`}
+                          >
+                            WARN+ ({logStats.warnCount + logStats.errorCount})
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setLogLevelFilter('error_only')}
+                            className={`px-2 py-0.5 rounded cursor-pointer ${
+                              logLevelFilter === 'error_only' ? 'bg-rose-600 text-white font-semibold' : 'text-rose-300/80 hover:text-rose-200'
+                            }`}
+                          >
+                            ERROR ({logStats.errorCount})
+                          </button>
+                        </div>
+                        <input
+                          type="text"
+                          value={logSearchQuery}
+                          onChange={(e) => setLogSearchQuery(e.target.value)}
+                          placeholder="Фильтр лога..."
+                          className="bg-[#111622] border border-[#1e2638] rounded-lg px-2 py-1 text-xs text-white font-mono w-28 sm:w-36"
+                        />
+                        <select
+                          value={selectedRunId || ''}
+                          onChange={(e) => setSelectedRunId(Number(e.target.value))}
+                          aria-label="Выбор запуска для просмотра лога"
+                          className="bg-[#111622] border border-[#1e2638] rounded-lg px-2 py-1 text-xs font-mono text-slate-200 max-w-[190px]"
+                        >
+                          {runs.map((r) => (
+                            <option key={r.id} value={r.id}>
+                              #{r.id} · {r.status} ({formatShortTime(r.started_at)})
+                            </option>
+                          ))}
+                        </select>
                         <button
                           type="button"
-                          onClick={() => setConsoleExpanded((v) => !v)}
-                          className="p-1 text-slate-400 hover:text-white bg-[#111622] border border-[#1e2638] rounded-lg cursor-pointer"
-                          title={consoleExpanded ? 'Свернуть консоль' : 'Развернуть консоль по высоте'}
+                          onClick={() => {
+                            const blob = new Blob([logText || ''], { type: 'text/plain;charset=utf-8' });
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.href = url;
+                            a.download = `${activeProj.name}-run-${selectedRunId || 'latest'}.log`;
+                            document.body.appendChild(a);
+                            a.click();
+                            document.body.removeChild(a);
+                            URL.revokeObjectURL(url);
+                          }}
+                          className="p-1 text-slate-300 hover:text-white bg-[#111622] border border-[#1e2638] rounded-lg cursor-pointer"
+                          title="Скачать текущий лог (.log)"
                         >
-                          {consoleExpanded ? (
-                            <Minimize2 className="w-3.5 h-3.5" />
-                          ) : (
-                            <Maximize2 className="w-3.5 h-3.5" />
-                          )}
+                          <Download className="w-3.5 h-3.5" />
                         </button>
-                      )}
-                    </div>
-                  )}
+                        {!isSideBySide && (
+                          <button
+                            type="button"
+                            onClick={() => setConsoleExpanded((v) => !v)}
+                            className="p-1 text-slate-400 hover:text-white bg-[#111622] border border-[#1e2638] rounded-lg cursor-pointer"
+                            title={consoleExpanded ? 'Свернуть консоль' : 'Развернуть консоль по высоте'}
+                          >
+                            {consoleExpanded ? (
+                              <Minimize2 className="w-3.5 h-3.5" />
+                            ) : (
+                              <Maximize2 className="w-3.5 h-3.5" />
+                            )}
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
 
-                {bottomConsoleTab === 'logs' && (
-                  <div className="flex flex-col flex-1 min-h-0">
-                    <pre
-                      ref={logBoxRef}
-                      className={`p-3.5 text-xs font-mono text-slate-200 overflow-y-auto whitespace-pre-wrap leading-relaxed bg-[#070b14] ${logHeightCls}`}
-                    >
-                      {(logSearchQuery.trim()
-                        ? (logText || '')
-                            .split('\n')
-                            .filter((line) => line.toLowerCase().includes(logSearchQuery.toLowerCase()))
-                            .join('\n')
-                        : logText) || 'Ожидание вывода процесса...'}
-                    </pre>
+                {bottomConsoleTab === 'logs' && (() => {
+                  const filteredLog = filterLogLinesByLevel(logText || '', logLevelFilter, logSearchQuery);
+                  return (
+                    <div className="flex flex-col flex-1 min-h-0">
+                      <pre
+                        ref={logBoxRef}
+                        className={`p-3.5 text-xs font-mono text-slate-200 overflow-y-auto whitespace-pre-wrap leading-relaxed bg-[#070b14] ${logHeightCls}`}
+                      >
+                        {filteredLog.text || (logLevelFilter !== 'all' || logSearchQuery.trim() ? 'Нет строк лога, совпадающих с выбранным фильтром.' : 'Ожидание вывода процесса...')}
+                      </pre>
 
                     <form
                       onSubmit={handleSendStdin}
@@ -2960,7 +3396,8 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                       </button>
                     </form>
                   </div>
-                )}
+                  );
+                })()}
 
                 {bottomConsoleTab === 'kv' && (
                   <div className="p-3.5 space-y-3 bg-[#070b14] flex-1 overflow-y-auto">
@@ -3919,6 +4356,27 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                                 )}
                               </button>
 
+                              <button
+                                type="button"
+                                disabled={!activeFilePath}
+                                onClick={() => {
+                                  const next = !showSnapshotsBar;
+                                  setShowSnapshotsBar(next);
+                                  if (next && activeProj && activeFilePath) {
+                                    loadFileSnapshots(activeProj.id, activeFilePath);
+                                  }
+                                }}
+                                className={`px-2 py-1 text-[11px] font-mono border rounded-lg inline-flex items-center gap-1 cursor-pointer disabled:opacity-40 ${
+                                  showSnapshotsBar
+                                    ? 'bg-amber-950/60 text-amber-200 border-amber-600/60'
+                                    : 'text-slate-300 hover:text-white bg-[#0b0f17] border-[#1e2638]'
+                                }`}
+                                title="Локальная история версий (снапшоты файла перед каждым сохранением, откат в 1 клик без Git)"
+                              >
+                                <History className="w-3 h-3" />
+                                <span>Версии</span>
+                              </button>
+
                               {activeFilePath && (
                                 <>
                                   <button
@@ -4087,6 +4545,74 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                                   {snip.label}
                                 </button>
                               ))}
+                            </div>
+                          )}
+
+                          {/* Выдвижная панель локальной истории версий (снапшотов) файла без Git */}
+                          {showSnapshotsBar && activeFilePath && (
+                            <div className="px-3.5 py-2.5 bg-[#0b0f17] border-b border-amber-800/40 space-y-2 shrink-0">
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-1.5 text-xs font-mono text-amber-200">
+                                  <History className="w-3.5 h-3.5 text-amber-400" />
+                                  <span>История версий «{activeFilePath}» ({fileSnapshots.length}/12)</span>
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => loadFileSnapshots(activeProj.id, activeFilePath)}
+                                    disabled={snapshotsLoading}
+                                    className="px-2 py-0.5 text-[11px] font-mono text-slate-300 hover:text-white bg-[#111622] border border-[#1e2638] rounded cursor-pointer"
+                                  >
+                                    {snapshotsLoading ? '...' : 'Обновить'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    aria-label="Закрыть историю версий"
+                                    onClick={() => setShowSnapshotsBar(false)}
+                                    className="p-1 text-slate-400 hover:text-white cursor-pointer"
+                                  >
+                                    <X className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              </div>
+                              {snapshotsLoading ? (
+                                <div className="text-[11px] font-mono text-slate-400 py-1">
+                                  Загрузка снимков файла...
+                                </div>
+                              ) : fileSnapshots.length === 0 ? (
+                                <div className="text-[11px] font-mono text-slate-400 py-1">
+                                  Снимков пока нет. Beacon автоматически сохраняет резервную копию файла перед каждым изменением через редактор.
+                                </div>
+                              ) : (
+                                <div className="max-h-40 overflow-y-auto space-y-1 pr-1">
+                                  {fileSnapshots.map((snap) => (
+                                    <div
+                                      key={snap.id}
+                                      className="flex flex-wrap items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-[#111622] border border-[#1e2638] text-[11px] font-mono"
+                                    >
+                                      <div className="flex items-center gap-2 min-w-0 flex-1">
+                                        <span className="text-amber-300 shrink-0">
+                                          {formatShortTime(snap.timestamp)}
+                                        </span>
+                                        <span className="text-slate-400 shrink-0">
+                                          {snap.lines} стр. · {formatBytes(snap.size)}
+                                        </span>
+                                        <span className="text-slate-500 truncate" title={snap.preview}>
+                                          {snap.preview || '—'}
+                                        </span>
+                                      </div>
+                                      <button
+                                        type="button"
+                                        disabled={restoringSnapshotId === snap.id}
+                                        onClick={() => handleRestoreSnapshot(snap.id)}
+                                        className="px-2 py-0.5 rounded bg-amber-600/20 hover:bg-amber-600/40 text-amber-200 border border-amber-600/50 cursor-pointer disabled:opacity-50 shrink-0"
+                                      >
+                                        {restoringSnapshotId === snap.id ? 'Откат...' : 'Восстановить'}
+                                      </button>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
                             </div>
                           )}
 
@@ -4366,6 +4892,40 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                             </button>
                           ))}
                         </div>
+
+                        {/* Stage 7: Группа / Тег проекта для фильтрации и пакетных действий на Дашборде */}
+                        <div className="pt-2 border-t border-[#1e2638] grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+                          <div className="md:col-span-5">
+                            <label className="block text-xs text-slate-400 mb-1 flex items-center gap-1.5">
+                              <Tag className="w-3.5 h-3.5 text-indigo-400" />
+                              Группа / Тег проекта (для фильтра на Дашборде)
+                            </label>
+                            <input
+                              type="text"
+                              value={cfgGroupTag}
+                              onChange={(e) => setCfgGroupTag(e.target.value)}
+                              placeholder="Продакшн, Веб/API, Боты 24/7..."
+                              className="w-full bg-[#0b0f17] border border-[#1e2638] rounded-lg px-3 py-2 text-xs text-white"
+                            />
+                          </div>
+                          <div className="md:col-span-7 flex flex-wrap items-center gap-1.5 pb-1">
+                            <span className="text-[11px] text-slate-400 mr-1">Быстрые группы:</span>
+                            {['Продакшн', 'Веб/API', 'Боты 24/7', 'Парсеры', 'Стейджинг'].map((tagLabel) => (
+                              <button
+                                key={tagLabel}
+                                type="button"
+                                onClick={() => setCfgGroupTag(tagLabel)}
+                                className={`px-2 py-1 rounded text-[11px] border cursor-pointer ${
+                                  cfgGroupTag.trim() === tagLabel
+                                    ? 'bg-indigo-950/70 text-indigo-200 border-indigo-500'
+                                    : 'bg-[#0b0f17] text-slate-300 border-[#1e2638] hover:text-white'
+                                }`}
+                              >
+                                #{tagLabel}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
                       </div>
 
                       {/* Быстрые переключатели Автостарта, Прокси и Telegram-уведомлений */}
@@ -4483,6 +5043,85 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                               {healthcheckTesting ? 'Тест...' : 'Проверить'}
                             </button>
                           </div>
+
+                          {/* Stage 7: Генератор конфигов Reverse Proxy (Nginx / Caddy / Cloudflared) */}
+                          <div className="md:col-span-12 pt-3 mt-1 border-t border-cyan-900/40 space-y-2.5">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="flex items-center gap-2 text-xs font-semibold text-cyan-200">
+                                <Globe className="w-3.5 h-3.5 text-cyan-400" />
+                                Публикация наружу: генератор Reverse Proxy
+                              </div>
+                              <div className="flex items-center gap-1">
+                                {(
+                                  [
+                                    { id: 'nginx', label: 'Nginx' },
+                                    { id: 'caddy', label: 'Caddy (Auto-TLS)' },
+                                    { id: 'cloudflared', label: 'Cloudflared' },
+                                  ] as Array<{ id: ReverseProxyProvider; label: string }>
+                                ).map((prov) => (
+                                  <button
+                                    key={prov.id}
+                                    type="button"
+                                    onClick={() => setProxyProvider(prov.id)}
+                                    className={`px-2.5 py-1 rounded text-[11px] font-medium border cursor-pointer ${
+                                      proxyProvider === prov.id
+                                        ? 'bg-cyan-500/20 text-cyan-200 border-cyan-500/50'
+                                        : 'bg-[#111622] text-slate-400 border-[#1e2638] hover:text-white'
+                                    }`}
+                                  >
+                                    {prov.label}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+
+                            <div className="flex flex-wrap items-center gap-2">
+                              <input
+                                type="text"
+                                aria-label="Домен для Reverse Proxy"
+                                value={proxyDomain}
+                                onChange={(e) => setProxyDomain(e.target.value)}
+                                placeholder="api.example.com"
+                                className="flex-1 min-w-[200px] bg-[#111622] border border-[#1e2638] rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const cfgText = buildReverseProxyConfig(
+                                    proxyProvider,
+                                    proxyDomain,
+                                    Number(cfgPort) || activeProj.port || 18080,
+                                    cfgName || activeProj.name
+                                  );
+                                  navigator.clipboard?.writeText(cfgText).catch(() => {});
+                                  setProxyCopied(true);
+                                  setTimeout(() => setProxyCopied(false), 1800);
+                                }}
+                                className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer"
+                              >
+                                {proxyCopied ? (
+                                  <>
+                                    <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                    Скопировано
+                                  </>
+                                ) : (
+                                  <>
+                                    <Copy className="w-3.5 h-3.5" />
+                                    Копировать конфиг
+                                  </>
+                                )}
+                              </button>
+                            </div>
+
+                            <pre className="bg-[#060910] border border-[#1e2638] rounded-lg p-3 text-[11px] font-mono text-cyan-100/90 overflow-x-auto leading-relaxed">
+                              {buildReverseProxyConfig(
+                                proxyProvider,
+                                proxyDomain,
+                                Number(cfgPort) || activeProj.port || 18080,
+                                cfgName || activeProj.name
+                              )}
+                            </pre>
+                          </div>
                         </div>
                       )}
 
@@ -4498,6 +5137,43 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                               Активно: {cfgScheduleType} ({cfgScheduleExpr || '*/15 * * * *'})
                             </span>
                           </div>
+
+                          {(() => {
+                            const preview = computeNextScheduleRunPreview(cfgScheduleType, cfgScheduleExpr);
+                            return (
+                              <div className="flex flex-wrap items-center justify-between gap-2 bg-[#111622] border border-[#1e2638] rounded-lg px-3 py-2 text-xs">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-slate-400">Прогноз следующего запуска:</span>
+                                  <span className={`font-mono font-semibold ${preview.valid ? 'text-emerald-300' : 'text-rose-300'}`}>
+                                    {preview.nextRunText}
+                                  </span>
+                                  {preview.relativeText && (
+                                    <span className="text-slate-400 font-mono">({preview.relativeText})</span>
+                                  )}
+                                </div>
+                                <div className="flex flex-wrap items-center gap-1">
+                                  <span className="text-[11px] text-slate-400 mr-1">Пресеты в 1 клик:</span>
+                                  {SCHEDULE_PRESETS.map((preset) => (
+                                    <button
+                                      key={preset.label}
+                                      type="button"
+                                      onClick={() => {
+                                        setCfgScheduleType(preset.type);
+                                        setCfgScheduleExpr(preset.expr);
+                                      }}
+                                      className={`px-2 py-0.5 rounded text-[11px] font-mono border cursor-pointer ${
+                                        cfgScheduleType === preset.type && cfgScheduleExpr === preset.expr
+                                          ? 'bg-indigo-600 text-white border-indigo-500 font-semibold'
+                                          : 'bg-[#0b0f17] text-slate-300 border-[#1e2638] hover:text-white'
+                                      }`}
+                                    >
+                                      {preset.label}
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            );
+                          })()}
 
                           <div className="flex flex-wrap gap-1.5">
                             {[
@@ -4992,6 +5668,68 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                           </div>
                         </div>
 
+                        {/* Зависимость старта сервисов (DEPENDS_ON) и Auto Git Pull по вебхуку */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 border-t border-[#1e2638]">
+                          <div className="space-y-1.5">
+                            <label className="block text-xs text-slate-300 flex items-center gap-1.5">
+                              <Link2 className="w-3.5 h-3.5 text-cyan-400" />
+                              <span>
+                                Запускать после сервиса (<code className="font-mono text-cyan-300">DEPENDS_ON</code>)
+                              </span>
+                            </label>
+                            <select
+                              aria-label="Зависимость запуска DEPENDS_ON"
+                              value={parsedEnvObject.DEPENDS_ON || ''}
+                              onChange={(e) => {
+                                const val = e.target.value.trim();
+                                if (val) {
+                                  handleUpsertEnvVar('DEPENDS_ON', val);
+                                } else {
+                                  handleDeleteEnvVar('DEPENDS_ON');
+                                }
+                              }}
+                              className="w-full bg-[#111622] border border-[#1e2638] rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                            >
+                              <option value="">— Независимый запуск —</option>
+                              {projects
+                                .filter((p) => p.id !== activeProj.id)
+                                .map((p) => (
+                                  <option key={p.id} value={p.name}>
+                                    {p.name} ({p.type})
+                                  </option>
+                                ))}
+                            </select>
+                            <span className="block text-[10px] text-slate-400">
+                              При старте этого проекта Beacon сначала автоматически поднимет указанный сервис, если он остановлен
+                            </span>
+                          </div>
+
+                          <div className="flex items-start gap-2.5 p-2.5 bg-[#111622] border border-[#1e2638] rounded-lg">
+                            <input
+                              id="cfg-auto-git-pull"
+                              type="checkbox"
+                              checked={parsedEnvObject.AUTO_GIT_PULL === '1'}
+                              onChange={(e) => {
+                                if (e.target.checked) {
+                                  handleUpsertEnvVar('AUTO_GIT_PULL', '1');
+                                } else {
+                                  handleDeleteEnvVar('AUTO_GIT_PULL');
+                                }
+                              }}
+                              className="mt-0.5 rounded border-slate-700"
+                            />
+                            <label htmlFor="cfg-auto-git-pull" className="text-xs text-slate-200 cursor-pointer space-y-0.5">
+                              <div className="font-semibold flex items-center gap-1.5">
+                                <GitBranch className="w-3.5 h-3.5 text-emerald-400" />
+                                <span>Auto Git Pull + Рестарт при вызове Webhook</span>
+                              </div>
+                              <div className="text-[10px] text-slate-400">
+                                Записывает <code className="font-mono text-emerald-300">AUTO_GIT_PULL=1</code>: POST на Webhook URL выполнит <code className="font-mono">git pull --ff-only</code> и перезапустит сервис (CI/CD деплой).
+                              </div>
+                            </label>
+                          </div>
+                        </div>
+
                         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-[#1e2638]">
                           <div>
                             <label className="block text-[11px] text-slate-400 mb-1">
@@ -5098,6 +5836,127 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                             </button>
                           </div>
                         </div>
+                      </div>
+
+                      {/* Тестовый вызов и Журнал входящих Webhook-запросов (BEACON_WEBHOOK_PAYLOAD) */}
+                      <div className="bg-[#0b0f17] border border-[#1e2638] rounded-lg p-3.5 space-y-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div>
+                            <div className="text-xs font-semibold text-slate-200">
+                              Инспектор и Тест входящих Webhook-вызовов (<code className="font-mono text-indigo-300">BEACON_WEBHOOK_PAYLOAD</code>)
+                            </div>
+                            <div className="text-[11px] text-slate-400">
+                              Тело POST-запроса (до 16 КБ) и заголовок события автоматически передаются процессу в переменные окружения{' '}
+                              <code className="font-mono text-slate-300">BEACON_WEBHOOK_PAYLOAD</code> и{' '}
+                              <code className="font-mono text-slate-300">BEACON_WEBHOOK_EVENT</code>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const res = await apiFetch(`/api/projects/${activeProj.id}/webhooks`);
+                              if (res.ok) {
+                                const data = await res.json();
+                                setWebhookDeliveries(Array.isArray(data.deliveries) ? data.deliveries : []);
+                              }
+                            }}
+                            className="px-2.5 py-1 text-xs font-mono text-slate-300 hover:text-white bg-[#111622] border border-[#1e2638] rounded-lg cursor-pointer"
+                          >
+                            Обновить журнал ({webhookDeliveries.length})
+                          </button>
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-12 gap-2 items-center">
+                          <input
+                            type="text"
+                            value={webhookTestEvent}
+                            onChange={(e) => setWebhookTestEvent(e.target.value)}
+                            placeholder="Событие (push, deploy)"
+                            className="md:col-span-3 bg-[#111622] border border-[#1e2638] rounded-lg px-2.5 py-1.5 text-xs font-mono text-white"
+                          />
+                          <input
+                            type="text"
+                            value={webhookTestPayload}
+                            onChange={(e) => setWebhookTestPayload(e.target.value)}
+                            placeholder='JSON Payload: {"event": "deploy"}'
+                            className="md:col-span-6 bg-[#111622] border border-[#1e2638] rounded-lg px-2.5 py-1.5 text-xs font-mono text-white"
+                          />
+                          <button
+                            type="button"
+                            disabled={webhookTestBusy}
+                            onClick={async () => {
+                              setWebhookTestBusy(true);
+                              setWebhookTestMsg('');
+                              try {
+                                let parsedPayload: any = webhookTestPayload;
+                                try {
+                                  parsedPayload = JSON.parse(webhookTestPayload);
+                                } catch {
+                                  // keep as raw string if not JSON
+                                }
+                                const res = await apiFetch(`/api/projects/${activeProj.id}/webhook_test`, {
+                                  method: 'POST',
+                                  body: JSON.stringify({
+                                    event: webhookTestEvent,
+                                    payload: parsedPayload,
+                                  }),
+                                });
+                                const data = await res.json().catch(() => ({}));
+                                if (res.ok) {
+                                  setWebhookTestMsg(`Запущен Run #${data.run?.id || '—'} с BEACON_WEBHOOK_PAYLOAD`);
+                                  if (data.delivery) {
+                                    setWebhookDeliveries((prev) => [data.delivery, ...prev].slice(0, 25));
+                                  }
+                                  await loadProjectRuns(activeProj.id);
+                                  onRefreshAll();
+                                } else {
+                                  setWebhookTestMsg(`Ошибка: ${data.detail || 'Не удалось вызвать вебхук'}`);
+                                }
+                              } finally {
+                                setWebhookTestBusy(false);
+                              }
+                            }}
+                            className="md:col-span-3 py-1.5 px-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold cursor-pointer"
+                          >
+                            {webhookTestBusy ? 'Запуск...' : 'Тест Webhook'}
+                          </button>
+                        </div>
+
+                        {webhookTestMsg && <StatusNoticeBanner text={webhookTestMsg} compact />}
+
+                        {webhookDeliveries.length > 0 && (
+                          <div className="max-h-40 overflow-y-auto border border-[#1e2638] rounded-lg">
+                            <table className="w-full text-left border-collapse text-[11px] font-mono">
+                              <thead>
+                                <tr className="bg-[#111622] text-slate-400 border-b border-[#1e2638]">
+                                  <th className="py-1.5 px-2.5">Время</th>
+                                  <th className="py-1.5 px-2.5">Событие / IP</th>
+                                  <th className="py-1.5 px-2.5">HTTP / Run</th>
+                                  <th className="py-1.5 px-2.5">Payload</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-[#1e2638]">
+                                {webhookDeliveries.map((d, i) => (
+                                  <tr key={`${d.timestamp}-${i}`} className="hover:bg-[#111622]/60">
+                                    <td className="py-1 px-2.5 text-slate-400">{formatShortTime(d.timestamp)}</td>
+                                    <td className="py-1 px-2.5 text-indigo-300">
+                                      {d.event} <span className="text-slate-500">({d.client_ip})</span>
+                                    </td>
+                                    <td className="py-1 px-2.5">
+                                      <span className={d.status_code === 200 ? 'text-emerald-300' : 'text-rose-300'}>
+                                        HTTP {d.status_code}
+                                      </span>
+                                      {d.run_id ? <span className="text-slate-300 ml-1">· #{d.run_id}</span> : null}
+                                    </td>
+                                    <td className="py-1 px-2.5 text-slate-300 truncate max-w-[260px]" title={d.payload_preview}>
+                                      {d.payload_preview || '—'}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
                       </div>
 
                       {/* Редактор разрешённых параметров запуска (params_schema) */}
@@ -5422,6 +6281,158 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
               {/* ==================== ВКЛАДКА 4: ТЕРМИНАЛ, GIT И ИСТОРИЯ ЗАПУСКОВ (#17) ==================== */}
               {subTab === 'terminal_git' && (
                 <div className="bg-[#111622] border border-[#1e2638] rounded-xl p-4 space-y-4">
+                  {/* Git Auto-Deploy, Статус репозитория и 1-Click Rollback */}
+                  <div className="bg-[#0b0f17] border border-[#1e2638] rounded-xl p-3.5 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <GitBranch className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <h3 className="text-xs font-bold uppercase tracking-wider text-white">
+                          Git Auto-Deploy и Откат (Rollback)
+                        </h3>
+                        {gitInfo?.is_git && (
+                          <span className="px-2 py-0.5 rounded bg-emerald-950/60 border border-emerald-700/60 text-emerald-300 text-[11px] font-mono">
+                            {gitInfo.branch || 'HEAD'}
+                          </span>
+                        )}
+                        {gitInfo?.is_git && (
+                          <span
+                            className={`px-2 py-0.5 rounded text-[11px] font-mono border ${
+                              (gitInfo.dirty_files?.length || 0) > 0
+                                ? 'bg-amber-950/60 border-amber-700/60 text-amber-300'
+                                : 'bg-slate-800/80 border-slate-700 text-slate-300'
+                            }`}
+                          >
+                            {(gitInfo.dirty_files?.length || 0) > 0
+                              ? `Изменено файлов: ${gitInfo.dirty_files.length}`
+                              : 'Рабочее дерево чистое'}
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => loadProjectGitInfo(activeProj.id)}
+                          disabled={gitLoading}
+                          className="px-2.5 py-1 text-[11px] font-mono text-slate-200 bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded-lg inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                        >
+                          <RefreshCw className={`w-3 h-3 ${gitLoading ? 'animate-spin' : ''}`} />
+                          <span>Обновить</span>
+                        </button>
+
+                        {gitInfo?.is_git && (
+                          <button
+                            type="button"
+                            onClick={() => handleGitPull(true)}
+                            disabled={gitPullBusy}
+                            className="px-3 py-1 text-[11px] font-semibold text-white bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            <span>{gitPullBusy ? 'Pull...' : 'Git Pull & Рестарт'}</span>
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {gitStatusMsg && <StatusNoticeBanner text={gitStatusMsg} compact />}
+
+                    {gitInfo?.is_git ? (
+                      <div className="space-y-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2 px-2.5 py-2 rounded-lg bg-[#070b14] border border-[#1e2638] text-[11px] font-mono">
+                          <div className="min-w-0 truncate text-slate-300">
+                            <span className="text-slate-500 mr-1.5">Webhook Auto-Deploy (POST):</span>
+                            <span className="text-indigo-300">{webhookUrl}?git_pull=1</span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard?.writeText(`${webhookUrl}?git_pull=1`);
+                              setGitStatusMsg('URL авто-деплоя (?git_pull=1) скопирован в буфер обмена');
+                            }}
+                            className="px-2 py-0.5 text-[11px] text-slate-200 bg-[#111622] hover:bg-slate-800 border border-[#1e2638] rounded inline-flex items-center gap-1 cursor-pointer shrink-0"
+                          >
+                            <Copy className="w-3 h-3" />
+                            Копировать
+                          </button>
+                        </div>
+
+                        {gitInfo.remote_url && (
+                          <div className="text-[11px] font-mono text-slate-400 truncate">
+                            Remote origin: <span className="text-slate-200">{gitInfo.remote_url}</span>
+                          </div>
+                        )}
+
+                        {gitInfo.commits && gitInfo.commits.length > 0 && (
+                          <div className="overflow-x-auto border border-[#1e2638] rounded-lg">
+                            <table className="w-full text-left border-collapse text-[11px] font-mono tabular-nums">
+                              <thead>
+                                <tr className="bg-[#111622] text-slate-400 border-b border-[#1e2638]">
+                                  <th className="py-1.5 px-2.5">Хеш</th>
+                                  <th className="py-1.5 px-2.5">Коммит</th>
+                                  <th className="py-1.5 px-2.5">Автор</th>
+                                  <th className="py-1.5 px-2.5">Дата</th>
+                                  <th className="py-1.5 px-2.5 text-right">Откат</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-[#1e2638]">
+                                {gitInfo.commits.slice(0, 8).map((c, idx) => (
+                                  <tr key={c.hash} className="hover:bg-[#111622]/70">
+                                    <td className="py-1.5 px-2.5 text-emerald-300 font-semibold">
+                                      {c.hash}
+                                      {idx === 0 && (
+                                        <span className="ml-1.5 px-1 py-0.5 text-[9px] rounded bg-indigo-950 text-indigo-300 border border-indigo-700/60">
+                                          HEAD
+                                        </span>
+                                      )}
+                                    </td>
+                                    <td className="py-1.5 px-2.5 text-slate-200 max-w-md truncate" title={c.subject}>
+                                      {c.subject}
+                                    </td>
+                                    <td className="py-1.5 px-2.5 text-slate-400">{c.author}</td>
+                                    <td className="py-1.5 px-2.5 text-slate-400">
+                                      {c.timestamp ? formatShortTime(c.timestamp) : '—'}
+                                    </td>
+                                    <td className="py-1.5 px-2.5 text-right">
+                                      {idx === 0 ? (
+                                        <span className="text-slate-500">Текущий</span>
+                                      ) : (
+                                        <button
+                                          type="button"
+                                          disabled={gitRollbackHash === c.hash}
+                                          onClick={() => handleGitRollback(c.hash)}
+                                          className="px-2 py-0.5 rounded bg-amber-950/60 hover:bg-amber-900/70 text-amber-200 border border-amber-700/60 cursor-pointer disabled:opacity-50"
+                                          title={`Выполнить git reset --hard ${c.hash} и перезапустить сервис`}
+                                        >
+                                          {gitRollbackHash === c.hash ? 'Откат...' : 'Откатить'}
+                                        </button>
+                                      )}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+                        <span>
+                          В этой папке нет <code className="font-mono text-slate-200">.git</code>. Вы можете подключить репозиторий через терминал ниже (например, <code className="font-mono text-indigo-300">git init</code>) или использовать локальную историю версий файлов в редакторе.
+                        </span>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            await runProjectCommand('git init && git add . && git commit -m "Initial commit" 2>&1 || git status');
+                            loadProjectGitInfo(activeProj.id);
+                          }}
+                          className="px-2.5 py-1 text-[11px] font-mono text-emerald-200 bg-emerald-950/50 hover:bg-emerald-900/60 border border-emerald-700/60 rounded-lg cursor-pointer shrink-0"
+                        >
+                          git init здесь
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
                       <h3 className="text-sm font-bold text-white">

@@ -2,6 +2,25 @@
 
 All notable changes to **Beacon** are documented in this file.
 
+## [2.3.0] - 2026-11-19
+
+### Operations, Deployment & Code Versioning
+- **Git Auto-Deploy & 1-Click Rollback:** Added `GET /api/projects/{id}/git_info`, `POST /api/projects/{id}/git_pull` (`git pull --ff-only` with optional restart and `AUTO_GIT_PULL` flag), and `POST /api/projects/{id}/git_rollback` to safely roll back to recent commits.
+- **Local File Version History (No Git Required):** Automatic snapshots (up to 12 per file) before editor saves via `GET /api/projects/{id}/files/snapshots` and `POST /api/projects/{id}/files/restore_snapshot`.
+- **Cascading Service Dependencies (`DEPENDS_ON`) & Peak RSS Telemetry:** Automatic dependency startup with cycle protection, plus `peak_rss_mb` tracking per active run.
+- **Batch Fleet Actions, Project Group Tags & Production Mode:** Added `POST /api/projects/batch_action`, editable `PROJECT_GROUP` tags with presets for dashboard filtering, and a clean Production mode toggle.
+- **Multi-Channel Alerts, Maintenance Mute & Webhooks Inspector:** Added Discord and Slack webhook delivery, `POST /api/settings/maintenance` alert muting, webhook payload forwarding (`BEACON_WEBHOOK_PAYLOAD`), recent webhook call history (`GET /api/projects/{id}/webhooks`), and 1-click webhook test trigger.
+- **Logs & Scheduling UX:** Added log level filter (`All / WARN+ERROR / ERROR`) preserving stack traces, `.env` bulk paste with automatic secret vault migration hints, AI token permission presets, schedule presets, and live next-run preview.
+
+### Observability, Analytics & Infrastructure
+- **Cross-Project Log Search (`GET /api/logs/search`):** Tail-bounded (256 KB/file) search across all projects with secret redaction, level filter, and 1-click jump to matching project.
+- **Project SLA & Reliability Analytics (`GET /api/analytics/summary`):** 24h / 7d / 30d fleet SLA %, failure/OOM counters, average duration, peak RSS, and 10-bar visual run strip.
+- **Prometheus / OpenMetrics Export (`GET /api/metrics`):** Authenticated via session (`viewer+`) or read-only AI Bearer token, plus live metrics preview and copyable `prometheus.yml` snippet in Settings.
+- **Audit Log Export (`GET /api/system/audit/export`):** Admin-only CSV (with CSV Formula Injection protection) and JSON export.
+- **Host Port Map (`GET /api/system/ports`):** Scans listening TCP sockets (`psutil` + `/proc/net/tcp{,6}` fallback), identifies Beacon/project/external owners, flags port conflicts, and suggests the next free port.
+- **Live PGID Process Tree Inspector (`GET /api/projects/{id}/processes`):** Inspects all child processes/workers inside an active project's PGID with root badge, PPID, RSS, and redacted command line.
+- **Reverse Proxy Config Generator:** Built-in Nginx (HTTP/WS/SSE), Caddy (Auto-TLS), and Cloudflare Tunnel (`cloudflared`) config generator inside Web/API project settings.
+
 ## [2.2.0] - 2026-11-04
 
 ### Security & Core Supervisor
