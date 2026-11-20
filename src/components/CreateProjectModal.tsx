@@ -231,9 +231,6 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
       if (description.trim()) {
         envObj.PROJECT_DESCRIPTION = description.trim();
       }
-      if (projBotToken.trim()) {
-        envObj.BOT_TOKEN = projBotToken.trim();
-      }
       if (projChatId.trim()) {
         envObj.TG_CHAT_ID = projChatId.trim();
       }
@@ -258,6 +255,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
         restart_policy: type === 'service' || type === 'web' ? restartPolicy : 'no',
         env: envObj,
         initial_cookies_json: initialCookieJson.trim() || undefined,
+        initial_bot_token: projBotToken.trim() || undefined,
       });
       setName('');
       setDescription('');
@@ -278,6 +276,9 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
       role="dialog"
       aria-modal="true"
       aria-label="Создание нового проекта"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
       className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
     >
       <div className="bg-[#111622] border border-slate-700/80 rounded-xl max-w-2xl w-full p-6 shadow-2xl my-8 max-h-[92vh] overflow-y-auto">
@@ -526,7 +527,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
                 className="w-full bg-[#0b0f17] border border-slate-700 rounded-lg px-3 py-2.5 text-xs text-white focus:border-indigo-500 focus:outline-none"
               >
                 <option value="python">Python 3 — Универсальный воркер / демон 24/7 (main.py + beacon.state)</option>
-                <option value="fastapi">Python FastAPI + Uvicorn — Production REST API ($PORT + /health)</option>
+                <option value="fastapi">Python HTTP REST API — Лёгкий REST API ($PORT + /health, совместим с FastAPI)</option>
                 <option value="web">Python BaseHTTP — Лёгкий HTTP-микросервис без внешних зависимостей</option>
                 <option value="node_api">Node.js HTTP API — Микросервис на JavaScript ($PORT + /health + SDK)</option>
                 <option value="node">Node.js Worker — Фоновый сервис / скрипт (index.js + SDK beacon.js)</option>

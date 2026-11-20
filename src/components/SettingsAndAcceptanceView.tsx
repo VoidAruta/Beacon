@@ -83,6 +83,7 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
   >('security_net');
   const [showTgHelp, setShowTgHelp] = useState<boolean>(false);
   const [systemdInfo, setSystemdInfo] = useState<{ path: string; content: string } | null>(null);
+  const [systemdCopied, setSystemdCopied] = useState<boolean>(false);
   const [downloadingBackup, setDownloadingBackup] = useState<boolean>(false);
   const [backupsList, setBackupsList] = useState<Array<{ filename: string; size_bytes: number; updated_at: number }>>([]);
   const [restoreFile, setRestoreFile] = useState<File | null>(null);
@@ -99,6 +100,7 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
   const [editingUserId, setEditingUserId] = useState<number | null>(null);
   const [editUserRole, setEditUserRole] = useState<'viewer' | 'operator' | 'admin'>('viewer');
   const [editUserPassword, setEditUserPassword] = useState<string>('');
+  const [confirmDeleteUserId, setConfirmDeleteUserId] = useState<number | null>(null);
 
   // Самодиагностика среды (beacon doctor)
   const [doctorReport, setDoctorReport] = useState<any | null>(null);
@@ -504,7 +506,7 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
                 Адаптивная самодиагностика среды (<code className="font-mono text-indigo-300">python3 -m beacon doctor</code>)
               </h2>
               <p className="text-xs text-slate-400 mt-1">
-                Автоматически определяет профиль ОС (Android Chroot vs Standard Linux) и проверяет точки монтирования, права <code className="font-mono">0700/0600</code> на секреты, чекпоинт SQLite WAL, наличие <code className="font-mono">uv</code>, прокси и датчики.
+                Автоматически определяет профиль ОС (Android Chroot vs Standard Linux) и проверяет точки монтирования, права доступа к хранилищу секретов, чекпоинт SQLite WAL, наличие <code className="font-mono">uv</code>, прокси и датчики.
               </p>
             </div>
             <button
@@ -943,7 +945,7 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
                       type="password"
                       value={newPassword}
                       onChange={(e) => setNewPassword(e.target.value)}
-                      placeholder="Минимум 8 символов (PBKDF2-SHA256)"
+                      placeholder="Минимум 8 символов (scrypt)"
                       className="w-full bg-[#0b0f17] border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
                     />
                   </div>
@@ -1537,13 +1539,16 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
           {/* Резервное копирование (.zip) и генератор systemd */}
           <section className="bg-[#1e293b] border border-slate-800 rounded-xl p-5 space-y-4">
             <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 pb-3 border-b border-slate-800">
-              <div>
+              <div className="min-w-0">
                 <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                  <Download className="w-4 h-4 text-indigo-400" />
-                  Резервное копирование сервера (.zip) и служба автозапуска Linux (<code className="font-mono text-indigo-300">systemd</code>)
+                  <Download className="w-4 h-4 text-indigo-400 shrink-0" />
+                  <span>
+                    Резервное копирование сервера (.zip) и служба автозапуска Linux (
+                    <code className="font-mono text-indigo-300">systemd</code>)
+                  </span>
                 </h3>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  Архив включает консистентный слепок БД (<code className="font-mono">hub.db</code>), все файлы из <code className="font-mono">data/secrets/</code> и исходный код проектов (без тяжёлых папок <code className="font-mono">.venv / node_modules</code>).
+                  Архив включает консистентный слепок БД (<code className="font-mono">beacon.db / hub.db</code>), все файлы из <code className="font-mono">data/secrets/</code> и исходный код проектов (без тяжёлых папок <code className="font-mono">.venv / node_modules</code>).
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2 shrink-0">
@@ -1594,6 +1599,16 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
                   className="w-full bg-[#0b0f17] border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
                 />
               </div>
+            </div>
+            <div className="flex items-center justify-end">
+              <button
+                type="button"
+                onClick={() => submitSettingsRequest(false)}
+                className="px-3.5 py-1.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
+              >
+                <Save className="w-3.5 h-3.5" />
+                Сохранить параметры автобэкапа
+              </button>
             </div>
 
             {/* Переезд в 2 клика: Загрузка и восстановление бэкапа (.zip) */}
@@ -1685,7 +1700,7 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
                     Подтвердите восстановление сервера из архива: <code className="font-mono text-white">{confirmRestoreModal.targetName}</code>
                   </div>
                   <p className="text-[11px] text-amber-100/90 leading-relaxed">
-                    Все запущенные проекты будут аккуратно остановлены, текущее состояние сохранится в страховочный архив <code className="font-mono">beacon_pre_restore_*.zip</code>, после чего база данных <code className="font-mono">hub.db</code>, секреты <code className="font-mono">0600</code> и папки <code className="font-mono">projects/*</code> будут заменены данными из выбранного бэкапа.
+                    Все запущенные проекты будут аккуратно остановлены, текущее состояние сохранится в страховочный архив <code className="font-mono">beacon_pre_restore_*.zip</code>, после чего база данных <code className="font-mono">beacon.db / hub.db</code>, защищённые секреты и папки <code className="font-mono">projects/*</code> будут заменены данными из выбранного бэкапа.
                   </p>
                   <div className="flex items-center gap-2">
                     <button
@@ -1711,17 +1726,32 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
 
             {systemdInfo && (
               <div className="space-y-2 pt-2 border-t border-slate-800">
-                <div className="flex items-center justify-between text-xs text-slate-300">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-300">
                   <span>
                     Готовый юнит <code className="font-mono text-indigo-300">{systemdInfo.path}</code> (<code className="font-mono text-emerald-300">KillMode=process</code> сохраняет запущенные сервисы при рестарте панели):
                   </span>
-                  <button
-                    type="button"
-                    onClick={() => setSystemdInfo(null)}
-                    className="text-slate-400 hover:text-white text-xs cursor-pointer"
-                  >
-                    Скрыть
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      data-testid="copy-systemd-unit-btn"
+                      onClick={() => {
+                        navigator.clipboard?.writeText(systemdInfo.content).catch(() => {});
+                        setSystemdCopied(true);
+                        setTimeout(() => setSystemdCopied(false), 2000);
+                      }}
+                      className="px-2.5 py-1 text-xs font-mono text-indigo-200 bg-indigo-950/60 hover:bg-indigo-900/70 border border-indigo-700/50 rounded-lg inline-flex items-center gap-1 cursor-pointer"
+                    >
+                      <Copy className="w-3.5 h-3.5" />
+                      {systemdCopied ? 'Юнит скопирован!' : 'Копировать юнит'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSystemdInfo(null)}
+                      className="text-slate-400 hover:text-white text-xs cursor-pointer"
+                    >
+                      Скрыть
+                    </button>
+                  </div>
                 </div>
                 <pre className="p-3 bg-[#0b0f17] border border-slate-800 rounded-lg text-[11px] font-mono text-slate-200 overflow-x-auto">
                   {systemdInfo.content}
@@ -1885,15 +1915,37 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
                                 >
                                   Изменить
                                 </button>
-                                <button
-                                  type="button"
-                                  disabled={isSelf}
-                                  onClick={() => handleDeleteUser(u.id)}
-                                  className="px-2.5 py-1 bg-rose-950/60 hover:bg-rose-900 disabled:opacity-40 text-rose-200 border border-rose-700/50 rounded cursor-pointer"
-                                  title={isSelf ? 'Нельзя удалить собственную учётную запись' : 'Удалить пользователя'}
-                                >
-                                  Удалить
-                                </button>
+                                {confirmDeleteUserId === u.id ? (
+                                  <span className="inline-flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={async () => {
+                                        setConfirmDeleteUserId(null);
+                                        await handleDeleteUser(u.id);
+                                      }}
+                                      className="px-2 py-1 bg-rose-600 hover:bg-rose-500 text-white rounded cursor-pointer"
+                                    >
+                                      Удалить?
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setConfirmDeleteUserId(null)}
+                                      className="px-2 py-1 bg-slate-700 hover:bg-slate-600 text-slate-200 rounded cursor-pointer"
+                                    >
+                                      Отмена
+                                    </button>
+                                  </span>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    disabled={isSelf}
+                                    onClick={() => setConfirmDeleteUserId(u.id)}
+                                    className="px-2.5 py-1 bg-rose-950/60 hover:bg-rose-900 disabled:opacity-40 text-rose-200 border border-rose-700/50 rounded cursor-pointer"
+                                    title={isSelf ? 'Нельзя удалить собственную учётную запись' : 'Удалить пользователя'}
+                                  >
+                                    Удалить
+                                  </button>
+                                )}
                               </>
                             )}
                           </td>
@@ -1956,6 +2008,7 @@ export const SettingsAndAcceptanceView: React.FC<SettingsAndAcceptanceViewProps>
                 type="button"
                 onClick={loadSettingsAndAudit}
                 title="Обновить журнал"
+                aria-label="Обновить журнал аудита"
                 className="p-2 text-slate-400 hover:text-white bg-slate-800 rounded-lg cursor-pointer"
               >
                 <RefreshCw className="w-3.5 h-3.5" />

@@ -436,6 +436,7 @@ export function getRunStatusBadge(status: string): {
         colorClass: 'bg-rose-500/20 text-rose-200 border-rose-500/50',
         dotClass: 'bg-rose-400',
       };
+    case 'timeout':
     case 'killed_timeout':
       return {
         label: 'Таймаут',
@@ -744,6 +745,7 @@ export function getSlaStatusBarColor(status: string): string {
     case 'stopped':
       return 'bg-slate-500';
     case 'waiting_input':
+    case 'timeout':
     case 'killed_timeout':
       return 'bg-amber-400';
     case 'failed':
@@ -877,4 +879,37 @@ export function classifyPortOwnerBadge(ownerKind: string): {
 
 export function normalizeProjectGroupTag(raw: string): string {
   return (raw || '').replace(/\s+/g, ' ').trim().slice(0, 32);
+}
+
+/**
+ * Вычисляет ID запуска для отображения в консоли проекта.
+ * Когда включено автопереключение (`autoSwitchToNewRun = true`) и появился новый запуск
+ * (latestId > prevLatestRunId) или был выполнен явный перезапуск (`forceLatest = true`),
+ * консоль автоматически переключается на свежий запуск вместо того, чтобы оставаться на старом.
+ */
+export function resolveNextSelectedRunId(
+  runIds: number[],
+  prevSelectedRunId: number | null,
+  prevLatestRunId: number | null,
+  autoSwitchToNewRun: boolean,
+  forceLatest: boolean = false
+): number | null {
+  if (!runIds || runIds.length === 0) {
+    return null;
+  }
+  const latestId = runIds[0];
+  if (forceLatest && autoSwitchToNewRun) {
+    return latestId;
+  }
+  if (
+    autoSwitchToNewRun &&
+    prevLatestRunId !== null &&
+    latestId > prevLatestRunId
+  ) {
+    return latestId;
+  }
+  if (prevSelectedRunId !== null && runIds.includes(prevSelectedRunId)) {
+    return prevSelectedRunId;
+  }
+  return latestId;
 }

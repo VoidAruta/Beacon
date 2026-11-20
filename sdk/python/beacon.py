@@ -12,6 +12,7 @@ Beacon Python SDK (/opt/beacon/sdk/python/beacon.py)
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -19,8 +20,39 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
-_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        return None
+
+
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
 _RETRY_DELAYS = (0.5, 1.5)
+_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+_MAX_ERROR_BODY_BYTES = 4096
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_PING_URL_RE = re.compile(r"(/api/ping/)([^/?#\s]+)")
+_USERINFO_URL_RE = re.compile(r"(https?://)([^/@\s]+)@")
+
+
+def _redact_url(url: str) -> str:
+    cleaned = _USERINFO_URL_RE.sub(r"\1***@", str(url or ""))
+    cleaned = _PING_URL_RE.sub(r"\1***", cleaned)
+    if "?" in cleaned:
+        cleaned = cleaned.split("?", 1)[0] + "?***"
+    return cleaned
+
+
+def _validate_api_url(url: str) -> None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise BeaconApiError(f"Invalid Beacon API URL: {_redact_url(url)}", status_code=0)
+    allow_remote = str(os.environ.get("BEACON_ALLOW_REMOTE_API", "")).strip().lower() in ("1", "true", "yes")
+    if not allow_remote and parsed.hostname.lower() not in _LOOPBACK_HOSTS:
+        raise BeaconApiError(
+            f"Refusing to send Beacon API request to non-loopback host '{parsed.hostname}' "
+            "(set BEACON_ALLOW_REMOTE_API=1 to override)",
+            status_code=0,
+        )
 
 
 class BeaconApiError(RuntimeError):
@@ -54,6 +86,7 @@ def _request_raw_url(
     timeout: float = 15.0,
     max_attempts: int = 3,
 ) -> dict[str, Any]:
+    _validate_api_url(url)
     req_headers = dict(headers or {"Accept": "application/json"})
     data_bytes = None
     if payload is not None:
@@ -66,17 +99,25 @@ def _request_raw_url(
         req = urllib.request.Request(url, data=data_bytes, headers=req_headers, method=method.upper())
         try:
             with _NO_PROXY_OPENER.open(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8")
+                raw_bytes = resp.read(_MAX_RESPONSE_BYTES + 1)
+                if len(raw_bytes) > _MAX_RESPONSE_BYTES:
+                    raise BeaconApiError(
+                        f"Beacon API response exceeded {_MAX_RESPONSE_BYTES} bytes on {_redact_url(url)}",
+                        status_code=0,
+                    )
+                raw = raw_bytes.decode("utf-8")
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", errors="replace")
-            exc = BeaconApiError(f"Beacon API HTTP {e.code} on {url}: {err_body}", status_code=int(e.code))
-            # 4xx не ретраим — это клиентская ошибка/ACL/авторизация
-            if 400 <= int(e.code) < 500:
+            err_body = e.read(_MAX_ERROR_BODY_BYTES).decode("utf-8", errors="replace")
+            exc = BeaconApiError(f"Beacon API HTTP {e.code} on {_redact_url(url)}: {err_body}", status_code=int(e.code))
+            # 3xx (редиректы запрещены) и 4xx не ретраим — это клиентская ошибка/ACL/авторизация
+            if 300 <= int(e.code) < 500:
                 raise exc from e
             last_exc = exc
+        except BeaconApiError:
+            raise
         except (urllib.error.URLError, TimeoutError, OSError) as e:
-            last_exc = BeaconApiError(f"Beacon API connection error on {url}: {e}", status_code=0)
+            last_exc = BeaconApiError(f"Beacon API connection error on {_redact_url(url)}: {e}", status_code=0)
 
         if attempt + 1 < attempts:
             delay = _RETRY_DELAYS[attempt] if attempt < len(_RETRY_DELAYS) else _RETRY_DELAYS[-1]
@@ -104,7 +145,7 @@ def _request_json(
 
 def notify(text: str, level: str = "info", strict: bool = False) -> bool:
     """
-    Отправляет уведомление от имени текущего проекта (Telegram, ntfy, Webhook).
+    Отправляет уведомление от имени текущего проекта (Telegram, Discord, Slack, ntfy, Webhook).
     По умолчанию best-effort (не роняет скрипт при временной недоступности панели, если strict=False).
     """
     try:
@@ -124,8 +165,11 @@ def secret(name: str, as_path: bool = False) -> Any:
     - Если тип секрета 'text', возвращает строку (не меняя тип для числовых строк вроде '12345').
     - Если тип секрета 'file' или передан as_path=True, возвращает путь к файлу секрета.
     """
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        raise ValueError("Имя секрета не может быть пустым")
     try:
-        res = _request_json("GET", f"/secret/{urllib.parse.quote(name)}")
+        res = _request_json("GET", f"/secret/{urllib.parse.quote(clean_name, safe='')}")
         sec_type = res.get("type", "text")
         file_path = res.get("file_path", "")
         val = res.get("value")
@@ -148,8 +192,8 @@ def secret(name: str, as_path: bool = False) -> Any:
 
         return val if val is None or isinstance(val, str) else str(val)
     except Exception:
-        env_file = os.environ.get(f"BEACON_SECRET_FILE_{name}")
-        sec_type = (os.environ.get(f"BEACON_SECRET_TYPE_{name}") or "text").strip().lower()
+        env_file = os.environ.get(f"BEACON_SECRET_FILE_{clean_name}")
+        sec_type = (os.environ.get(f"BEACON_SECRET_TYPE_{clean_name}") or "text").strip().lower()
         if as_path and env_file:
             return env_file
         if env_file and os.path.exists(env_file):
@@ -185,21 +229,26 @@ def cookies_expired(secret_name: str, note: str = "Куки устарели, т
 def ask(prompt: str, timeout: int = 300) -> str:
     """
     Блокирующий интерактивный запрос ввода от пользователя (через веб-панель или Reply в Telegram).
-    Переводит текущий запуск в статус 'waiting_input' и ждёт ответа до timeout секунд.
+    Переводит текущий запуск в статус 'waiting_input' и ждёт ответа до timeout секунд (1..3600).
     """
+    try:
+        safe_timeout = max(1, min(3600, int(timeout)))
+    except (TypeError, ValueError):
+        safe_timeout = 300
+
     create_res = _request_json(
         "POST",
         "/ask/create",
-        {"prompt": str(prompt), "timeout": int(timeout)},
+        {"prompt": str(prompt), "timeout": safe_timeout},
     )
     ask_id = create_res.get("ask_id")
     if not ask_id:
         raise RuntimeError(f"Не удалось создать запрос beacon.ask: {create_res}")
 
-    deadline = time.time() + int(timeout) + 5
+    deadline = time.time() + safe_timeout + 5
     while time.time() < deadline:
         try:
-            poll_res = _request_json("GET", f"/ask/poll/{ask_id}", timeout=15.0, max_attempts=1)
+            poll_res = _request_json("GET", f"/ask/poll/{urllib.parse.quote(str(ask_id), safe='')}", timeout=15.0, max_attempts=1)
         except BeaconApiError as exc:
             if exc.status_code in (401, 403, 404):
                 raise
@@ -252,7 +301,7 @@ class _StateStore:
 
     def get(self, key: str, default: Any = None, strict: bool = False) -> Any:
         try:
-            res = _request_json("GET", f"/kv/{urllib.parse.quote(str(key))}")
+            res = _request_json("GET", f"/kv/{urllib.parse.quote(str(key), safe='')}")
             if not res.get("found"):
                 return default
             return res.get("value")
@@ -264,7 +313,7 @@ class _StateStore:
 
     def set(self, key: str, value: Any, strict: bool = False) -> bool:
         try:
-            res = _request_json("PUT", f"/kv/{urllib.parse.quote(str(key))}", {"value": value})
+            res = _request_json("PUT", f"/kv/{urllib.parse.quote(str(key), safe='')}", {"value": value})
             return bool(res.get("ok", True))
         except Exception as exc:
             if strict:
@@ -274,7 +323,7 @@ class _StateStore:
 
     def delete(self, key: str, strict: bool = False) -> bool:
         try:
-            res = _request_json("DELETE", f"/kv/{urllib.parse.quote(str(key))}")
+            res = _request_json("DELETE", f"/kv/{urllib.parse.quote(str(key), safe='')}")
             return bool(res.get("ok", True))
         except Exception as exc:
             if strict:

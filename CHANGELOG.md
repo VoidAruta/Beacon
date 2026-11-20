@@ -2,6 +2,31 @@
 
 All notable changes to **Beacon** are documented in this file.
 
+## [2.4.0] - 2026-11-20
+
+### Security Audit & Hardening (5-Phase Review)
+- **IPv4-Mapped IPv6 SSRF & Webhook Protection:** Blocked `::ffff:127.0.0.1`, `::ffff:169.254.169.254`, and loopback/link-local IPv6 destinations across outbound webhooks, Telegram/Discord/Slack/ntfy notifications, and heartbeat checks.
+- **Credential & Token Redaction Across All Surfaces:**
+  - Always mask proxy credentials (`user:pass@`) in `/api/dashboard`, `beacon doctor`, `RECENT_NOTIFICATIONS`, and Dashboard UI badges.
+  - Redact Discord/Slack webhook tokens in notification history and Healthchecks.io UUIDs / Uptime Kuma push tokens / query params in outbound heartbeat logs.
+- **Filesystem, Symlink & ZIP-Bomb Safeguards:**
+  - Atomic `0600` private file writes (`write_private_file_atomic`) rejecting symlinks for secrets and cookies.
+  - Symlink-safe log rotation in `disk_guard` (never truncates symlink targets outside `data/logs/`).
+  - Backup restore enforces total uncompressed size limits (ZIP-bomb defense) and supports both canonical `data/beacon.db` and legacy `data/hub.db` archives.
+- **Internal SDK & Rate-Limit Hardening (`sdk/python/beacon.py`, `sdk/node/beacon.js`):**
+  - Restrict SDK `X-Beacon-Token` requests to loopback hosts by default (`BEACON_ALLOW_REMOTE_API=1` opt-in), disable HTTP `3xx` redirects in Python SDK, bound response/error payload sizes (16 MB / 4 KB), validate `ask()` timeouts (`1..3600s`), and export `ping` & `BeaconApiError` from top-level `beacon`/`hub` packages.
+  - Added per-run rate limits on internal SDK notify/ask endpoints.
+- **Install / Update / Docker Hardening:**
+  - Validated numeric `BEACON_PORT` (`1..65535`) across `install.sh`, `update.sh`, and `zstart_line.sh`; added `--` separator to `git clone`, `chmod 0644` for systemd unit, `/proc/<pid>/cmdline` verification before `SIGTERM`/`SIGKILL`, strict symlink & `600`/`400` permission checks on `data/start.cmd`, root-safe `systemctl` handling, and stop-before-start on rollback.
+  - Updated `Dockerfile` healthcheck to use `${BEACON_PORT:-8050}` and enabled `no-new-privileges:true` in `docker-compose.yml`.
+
+### Reliability, UX & Documentation
+- **Auto-Switch Console Logs on Restart:** Added a persisted toggle in the project console so restarting a project automatically opens the new run's live log without manually picking it from the dropdown.
+- **2-Step Batch Confirmation on Dashboard:** Batch **Stop** and **Restart** for groups of 2+ projects now require inline confirmation (`Confirm / Cancel`) to prevent accidental fleet stops.
+- **Clearer Secrets & Cookies UI:** Removed raw Unix octal `(0600)` jargon from navigation labels and status badges in favor of clear human-readable protection descriptions, and fixed legacy `:8765` fallback port display and row action `aria-label` accessibility.
+- **Scheduler Memory Hygiene:** Pruned deleted project IDs from in-memory backoff, retry, cron-restart, and heartbeat-alert caches on every tick to preserve the `< 80 MB` idle RAM budget.
+- **Unified Version (`2.4.0`) & Documentation Overhaul:** Synchronized version strings across backend, MCP/OpenAPI, CLI, and Web UI; fixed webhook URL/header and AI scope docs in the in-app Documentation tab, `README.md`, `README.ru.md`, `SECURITY.md`, `AGENTS.md`, `docs/AI-ACCESS.md`, and `docs/AI-CODER-GUIDE.md`.
+
 ## [2.3.0] - 2026-11-19
 
 ### Operations, Deployment & Code Versioning

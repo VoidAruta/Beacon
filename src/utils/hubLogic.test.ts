@@ -338,3 +338,38 @@ test('buildReverseProxyConfig, classifyPortOwnerBadge, and normalizeProjectGroup
   assert.ok(classifyPortOwnerBadge('beacon_project').colorCls.includes('emerald'));
   assert.equal(normalizeProjectGroupTag('  Продакшн   API  '), 'Продакшн API');
 });
+
+import {
+  resolveNextSelectedRunId,
+  getRunStatusBadge,
+} from './hubLogic';
+
+test('resolveNextSelectedRunId switches to new run when autoSwitch is enabled and preserves manual selection otherwise', () => {
+  // Empty runs -> null
+  assert.equal(resolveNextSelectedRunId([], 10, 10, true, false), null);
+
+  // Initial load (no selection yet) -> selects latest
+  assert.equal(resolveNextSelectedRunId([25, 24, 23], null, null, true, false), 25);
+
+  // New run #26 arrives while autoSwitch is ON -> switches automatically to #26
+  assert.equal(resolveNextSelectedRunId([26, 25, 24], 25, 25, true, false), 26);
+
+  // User manually selected older run #24 and NO new run appeared -> stays on #24
+  assert.equal(resolveNextSelectedRunId([26, 25, 24], 24, 26, true, false), 24);
+
+  // Explicit restart (forceLatest=true) while viewing older run #24 -> switches to #27
+  assert.equal(resolveNextSelectedRunId([27, 26, 25, 24], 24, 26, true, true), 27);
+
+  // Auto-switch OFF -> stays on #25 even when new run #27 arrives
+  assert.equal(resolveNextSelectedRunId([27, 26, 25], 25, 26, false, false), 25);
+
+  // Auto-switch OFF but previously selected run #10 was pruned -> falls back to latest #27
+  assert.equal(resolveNextSelectedRunId([27, 26, 25], 10, 26, false, false), 27);
+});
+
+test('getRunStatusBadge and getSlaStatusBarColor treat timeout and killed_timeout consistently', () => {
+  assert.equal(getRunStatusBadge('timeout').label, getRunStatusBadge('killed_timeout').label);
+  assert.equal(getSlaStatusBarColor('timeout'), 'bg-amber-400');
+  assert.equal(getSlaStatusBarColor('killed_timeout'), 'bg-amber-400');
+});
+

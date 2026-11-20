@@ -151,12 +151,15 @@ def _get_session_secret() -> bytes:
     legacy = get_setting("session_secret", "").strip()
     secret_val = legacy if len(legacy) >= 32 else secrets.token_hex(32)
     try:
-        fd = os.open(str(SESSION_SECRET_PATH), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        tmp_secret = SESSION_SECRET_PATH.with_name(f".session.secret.{secrets.token_hex(4)}.tmp")
+        fd = os.open(str(tmp_secret), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             os.write(fd, secret_val.encode("utf-8"))
+            os.fsync(fd)
         finally:
             os.close(fd)
-        os.chmod(SESSION_SECRET_PATH, 0o600)
+        os.chmod(tmp_secret, 0o600)
+        os.replace(str(tmp_secret), str(SESSION_SECRET_PATH))
     except OSError:
         pass
     if legacy:
@@ -557,6 +560,14 @@ def create_session_tokens(
     return f"{payload_b64}.{sig}", csrf_token
 
 
+def _prune_revoked_sessions_cache(now: Optional[int] = None) -> None:
+    ts = now if now is not None else int(time.time())
+    if len(_REVOKED_SESSIONS) > 128:
+        expired = [sid for sid, exp in list(_REVOKED_SESSIONS.items()) if exp < ts]
+        for sid in expired:
+            _REVOKED_SESSIONS.pop(sid, None)
+
+
 def revoke_session_token(token: str) -> None:
     """Серверная инвалидация токена сессии при выходе (POST /api/auth/logout)."""
     if not token or "." not in token:
@@ -564,14 +575,16 @@ def revoke_session_token(token: str) -> None:
     try:
         payload_b64, _ = token.rsplit(".", 1)
         payload = json.loads(urllib.parse.unquote(payload_b64))
+        now_ts = int(time.time())
         sid = str(payload.get("sid") or token)
-        exp = int(payload.get("exp") or (int(time.time()) + 86400 * 7))
+        exp = int(payload.get("exp") or (now_ts + 86400 * 7))
         _REVOKED_SESSIONS[sid] = exp
+        _prune_revoked_sessions_cache(now_ts)
         execute_sql(
             "INSERT INTO revoked_sessions (sid, exp) VALUES (?, ?) ON CONFLICT(sid) DO UPDATE SET exp = excluded.exp",
             (sid, exp),
         )
-        execute_sql("DELETE FROM revoked_sessions WHERE exp < ?", (int(time.time()),))
+        execute_sql("DELETE FROM revoked_sessions WHERE exp < ?", (now_ts,))
     except Exception:
         pass
 
@@ -594,6 +607,7 @@ def verify_session_token(token: str) -> Optional[dict[str, Any]]:
         if int(payload.get("ep", 0)) != get_session_epoch():
             return None
         sid = str(payload.get("sid") or token)
+        _prune_revoked_sessions_cache(now)
         if sid in _REVOKED_SESSIONS:
             return None
         try:
@@ -811,30 +825,39 @@ def consume_ai_token_rate_limit(token_row: dict[str, Any], count: int = 1) -> tu
     return True, ""
 
 
+_RATE_LIMIT_GLOBAL_IP_MAX_FAILS = RATE_LIMIT_MAX_FAILS * 3
+
+
 def _login_rate_key(client_ip: str, username: str = "") -> str:
     clean_user = (username or "").strip().lower()
     return f"{client_ip}|{clean_user}" if clean_user else client_ip
 
 
 def check_rate_limit(client_ip: str, username: str = "") -> tuple[bool, int]:
-    key = _login_rate_key(client_ip, username)
     now = time.time()
-    unblock_at = _BLOCKED_IPS.get(key, 0.0)
-    if unblock_at > now:
-        return False, max(1, int(unblock_at - now))
-    elif key in _BLOCKED_IPS:
-        del _BLOCKED_IPS[key]
+    for check_key in (_login_rate_key(client_ip, username), f"__ip__|{client_ip}"):
+        unblock_at = _BLOCKED_IPS.get(check_key, 0.0)
+        if unblock_at > now:
+            return False, max(1, int(unblock_at - now))
+        elif check_key in _BLOCKED_IPS:
+            del _BLOCKED_IPS[check_key]
     return True, 0
 
 
 def record_login_failure(client_ip: str, username: str = "") -> tuple[bool, int]:
     key = _login_rate_key(client_ip, username)
+    ip_global_key = f"__ip__|{client_ip}"
     now = time.time()
     _prune_attempts_bucket(_FAILED_LOGINS, RATE_LIMIT_WINDOW_SEC, now)
     _prune_blocked_bucket(_BLOCKED_IPS, now)
+
     attempts = [t for t in _FAILED_LOGINS.get(key, []) if now - t <= RATE_LIMIT_WINDOW_SEC]
     attempts.append(now)
     _FAILED_LOGINS[key] = attempts
+
+    ip_attempts = [t for t in _FAILED_LOGINS.get(ip_global_key, []) if now - t <= RATE_LIMIT_WINDOW_SEC]
+    ip_attempts.append(now)
+    _FAILED_LOGINS[ip_global_key] = ip_attempts
 
     if len(attempts) >= RATE_LIMIT_MAX_FAILS:
         _BLOCKED_IPS[key] = now + RATE_LIMIT_BLOCK_SEC
@@ -843,6 +866,16 @@ def record_login_failure(client_ip: str, username: str = "") -> tuple[bool, int]
             client_ip,
             "RATE_LIMIT_BLOCK",
             f"Попытки входа для '{username or '*'}' с IP {client_ip} заблокированы на 15 минут ({len(attempts)} неудач)",
+        )
+        return True, RATE_LIMIT_BLOCK_SEC
+
+    if len(ip_attempts) >= _RATE_LIMIT_GLOBAL_IP_MAX_FAILS:
+        _BLOCKED_IPS[ip_global_key] = now + RATE_LIMIT_BLOCK_SEC
+        _FAILED_LOGINS[ip_global_key] = []
+        log_audit(
+            client_ip,
+            "RATE_LIMIT_BLOCK",
+            f"IP {client_ip} заблокирован на 15 минут за перебор разных логинов ({len(ip_attempts)} неудач)",
         )
         return True, RATE_LIMIT_BLOCK_SEC
 
@@ -857,9 +890,10 @@ def clear_login_failures(client_ip: str, username: str = "") -> None:
         _BLOCKED_IPS.pop(key, None)
     else:
         prefix = f"{client_ip}|"
-        for k in [k for k in list(_FAILED_LOGINS.keys()) if k == client_ip or k.startswith(prefix)]:
+        ip_global_key = f"__ip__|{client_ip}"
+        for k in [k for k in list(_FAILED_LOGINS.keys()) if k == client_ip or k == ip_global_key or k.startswith(prefix)]:
             _FAILED_LOGINS.pop(k, None)
-        for k in [k for k in list(_BLOCKED_IPS.keys()) if k == client_ip or k.startswith(prefix)]:
+        for k in [k for k in list(_BLOCKED_IPS.keys()) if k == client_ip or k == ip_global_key or k.startswith(prefix)]:
             _BLOCKED_IPS.pop(k, None)
 
 

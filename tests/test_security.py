@@ -1399,6 +1399,358 @@ class TestSecurityAndRbac(unittest.TestCase):
             finally:
                 asyncio.run(stop_project(int(proc_proj["id"])))
 
+    def test_audit_fixes_security_and_reliability(self) -> None:
+        import io
+        import zipfile
+        from pathlib import Path
+
+        from hub.api.routes_ai import api_ai_create_token
+        from hub.api.routes_ui import (
+            _validate_self_update_git_params,
+            api_auth_me,
+            api_import_project_archive,
+        )
+        from hub.disk_guard import cleanup_system_caches
+
+        with create_temp_hub() as tmpdir:
+            # 1. Prometheus /api/metrics accepts valid AI Bearer token without ImportError
+            set_setting("password_hash", hash_password("StrongAdmin#2026"))
+            set_setting("ai_access_enabled", "1")
+            tok_info = asyncio.run(
+                api_ai_create_token(
+                    DummyRequest(
+                        body={
+                            "name": "prom-scraper",
+                            "scopes": ["read"],
+                            "allowed_ips": "127.0.0.1/32",
+                            "ttl_days": 10,
+                        }
+                    )  # type: ignore[arg-type]
+                )
+            )
+
+            async def _next_metrics(req: object) -> JSONResponse:
+                return JSONResponse({"ok": True})
+
+            metrics_req = DummyRequest(
+                method="GET",
+                path="/api/metrics",
+                client_host="127.0.0.1",
+                headers={"authorization": f"Bearer {tok_info['token']}"},
+            )
+            metrics_resp = asyncio.run(security_and_auth_middleware(metrics_req, _next_metrics))  # type: ignore[arg-type]
+            self.assertEqual(metrics_resp.status_code, 200)
+
+            # 2. _validate_self_update_git_params blocks option injection and bad schemes
+            ok_repo, ok_branch = _validate_self_update_git_params(
+                "https://github.com/example/beacon.git", "main"
+            )
+            self.assertEqual(ok_repo, "https://github.com/example/beacon.git")
+            self.assertEqual(ok_branch, "main")
+
+            for bad_repo, bad_branch in (
+                ("--upload-pack=id", "main"),
+                ("https://github.com/example/beacon.git", "--delete"),
+                ("file:///etc/passwd", "main"),
+                ("https://github.com/example/beacon.git", "bad..branch"),
+            ):
+                with self.assertRaises(HTTPException) as ctx:
+                    _validate_self_update_git_params(bad_repo, bad_branch)
+                self.assertEqual(ctx.exception.status_code, 400)
+
+            # 3. _build_process_env blocks dangerous/internal overrides from project env_json
+            env_proj = make_project(
+                "env-hardening",
+                env_json=json.dumps({
+                    "SAFE_KEY": "ok123",
+                    "_BEACON_PROJECT_ID": "99999",
+                    "_BEACON_RUN_ID": "88888",
+                    "LD_PRELOAD": "/tmp/evil.so",
+                    "PYTHONSTARTUP": "/tmp/evil.py",
+                    "NODE_OPTIONS": "--require /tmp/evil.js",
+                }),
+            )
+            env_map = _build_process_env(env_proj, run_token="rtok_hard", settings=get_all_settings(), run_id=77)
+            self.assertEqual(env_map["SAFE_KEY"], "ok123")
+            self.assertEqual(env_map["_BEACON_PROJECT_ID"], str(env_proj["id"]))
+            self.assertEqual(env_map["_BEACON_RUN_ID"], "77")
+            self.assertNotIn("LD_PRELOAD", env_map)
+            self.assertNotIn("PYTHONSTARTUP", env_map)
+            self.assertNotIn("NODE_OPTIONS", env_map)
+
+            # 4. disk_guard preserves .tmp of running projects and cleans .tmp of stopped projects
+            running_proj = make_project("active-tmp-proj")
+            stopped_proj = make_project("stopped-tmp-proj")
+            running_tmp = Path(running_proj["workdir"]) / ".tmp"
+            stopped_tmp = Path(stopped_proj["workdir"]) / ".tmp"
+            running_tmp.mkdir(parents=True, exist_ok=True)
+            stopped_tmp.mkdir(parents=True, exist_ok=True)
+            (running_tmp / "live.dat").write_text("keep-me", encoding="utf-8")
+            (stopped_tmp / "stale.dat").write_text("delete-me", encoding="utf-8")
+            execute_sql(
+                """INSERT INTO runs (project_id, status, trigger, pid, pgid, proc_create_time, started_at, log_path, run_token)
+                   VALUES (?, 'running', 'manual', 99998, 99998, 0.0, 1, '/tmp/a.log', 'rtok_a')""",
+                (running_proj["id"],),
+            )
+            cleanup_system_caches()
+            self.assertTrue((running_tmp / "live.dat").exists())
+            self.assertFalse((stopped_tmp / "stale.dat").exists())
+
+            # 5. api_import_project_archive forces autostart=0 and does not auto-bind secrets
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(
+                    "project.yaml",
+                    'name: imported-app\ntype: service\nruntime: python\ncmd: python3 main.py\nautostart: true\nsecrets: ["prod_secret_key"]\n',
+                )
+                zf.writestr("main.py", "print('hello')\n")
+
+            import base64
+
+            imp_req = DummyRequest(
+                body={
+                    "name": "imported-app",
+                    "content_base64": base64.b64encode(buf.getvalue()).decode("ascii"),
+                }
+            )
+            imp_req.state.session = {"role": "admin", "user": "admin"}
+            imp_res = asyncio.run(api_import_project_archive(imp_req))  # type: ignore[arg-type]
+            self.assertTrue(imp_res["ok"])
+            self.assertEqual(imp_res["requested_secrets"], ["prod_secret_key"])
+            imp_row = query_one("SELECT autostart, secrets_json FROM projects WHERE id = ?", (imp_res["project"]["id"],))
+            self.assertEqual(int(imp_row["autostart"]), 0)
+            self.assertEqual(imp_row["secrets_json"], "[]")
+
+            # 6. Unauthenticated /api/auth/me does not expose is_default_password
+            unauth_resp = asyncio.run(api_auth_me(DummyRequest()))  # type: ignore[arg-type]
+            self.assertEqual(unauth_resp.status_code, 401)
+            unauth_body = json.loads(unauth_resp.body.decode("utf-8"))
+            self.assertNotIn("is_default_password", unauth_body)
+
+    def test_audit_phase2_sdk_limits_and_atomic_private_files(self) -> None:
+        from pathlib import Path
+        from unittest.mock import AsyncMock, patch
+
+        from hub.api.routes_internal import (
+            internal_ask_create,
+            internal_notify,
+            reset_internal_rate_limits,
+        )
+        from hub.web_auth_mgr import _redact_proxy_creds, write_private_file_atomic
+
+        with create_temp_hub() as tmpdir:
+            reset_internal_rate_limits()
+            proj = make_project("sdk-limit-proj")
+            execute_sql(
+                """INSERT INTO runs (project_id, status, trigger, pid, pgid, proc_create_time, started_at, log_path, run_token)
+                   VALUES (?, 'running', 'manual', 99997, 99997, 0.0, 1, '/tmp/sdk.log', 'rtok_sdk_lim')""",
+                (proj["id"],),
+            )
+
+            # 1. /internal/notify caps length at 4000 chars and rate-limits at 20/min per project -> 429
+            with patch("hub.api.routes_internal.send_notification", new=AsyncMock()) as mock_send:
+                long_msg = "A" * 5000
+                res_first = asyncio.run(
+                    internal_notify(
+                        DummyRequest(
+                            headers={"x-beacon-token": "rtok_sdk_lim"},
+                            body={"text": long_msg, "level": "info"},
+                        )  # type: ignore[arg-type]
+                    )
+                )
+                self.assertTrue(res_first["ok"])
+                sent_text = mock_send.call_args.kwargs["text"]
+                self.assertLessEqual(len(sent_text), 4020)
+                self.assertIn("[truncated]", sent_text)
+
+                for i in range(19):
+                    asyncio.run(
+                        internal_notify(
+                            DummyRequest(
+                                headers={"x-beacon-token": "rtok_sdk_lim"},
+                                body={"text": f"msg-{i}", "level": "info"},
+                            )  # type: ignore[arg-type]
+                        )
+                    )
+
+                with self.assertRaises(HTTPException) as ctx_429:
+                    asyncio.run(
+                        internal_notify(
+                            DummyRequest(
+                                headers={"x-beacon-token": "rtok_sdk_lim"},
+                                body={"text": "overflow", "level": "info"},
+                            )  # type: ignore[arg-type]
+                        )
+                    )
+                self.assertEqual(ctx_429.exception.status_code, 429)
+
+            # 2. /internal/ask/create caps active pending asks per project at 10 -> 429
+            for i in range(10):
+                ask_res = asyncio.run(
+                    internal_ask_create(
+                        DummyRequest(
+                            headers={"x-beacon-token": "rtok_sdk_lim"},
+                            body={"prompt": f"Code #{i}", "timeout": 60},
+                        )  # type: ignore[arg-type]
+                    )
+                )
+                self.assertTrue(ask_res["ok"])
+
+            with self.assertRaises(HTTPException) as ctx_ask_429:
+                asyncio.run(
+                    internal_ask_create(
+                        DummyRequest(
+                            headers={"x-beacon-token": "rtok_sdk_lim"},
+                            body={"prompt": "Too many asks", "timeout": 60},
+                        )  # type: ignore[arg-type]
+                    )
+                )
+            self.assertEqual(ctx_ask_429.exception.status_code, 429)
+
+            # 3. write_private_file_atomic writes 0600 and rejects symlinks
+            priv_file = tmpdir / "cookies_test.json"
+            write_private_file_atomic(priv_file, '[{"name":"s","value":"v","domain":".ex.com"}]')
+            self.assertEqual(stat.S_IMODE(priv_file.stat().st_mode), 0o600)
+
+            victim = tmpdir / "victim.txt"
+            victim.write_text("original", encoding="utf-8")
+            sym = tmpdir / "cookies_symlink.json"
+            sym.symlink_to(victim)
+            with self.assertRaises(ValueError):
+                write_private_file_atomic(sym, "overwritten")
+            self.assertEqual(victim.read_text(encoding="utf-8"), "original")
+
+            # 4. _redact_proxy_creds scrubs credentials from proxy URLs and error strings
+            red = _redact_proxy_creds("ProxyError on socks5://alice:SuperSecret99@10.0.0.5:10808 failed")
+            self.assertNotIn("alice", red)
+            self.assertNotIn("SuperSecret99", red)
+            self.assertIn("socks5://***:***@10.0.0.5:10808", red)
+
+    def test_audit_phase3_backup_zipbomb_ssrf_ipv6_log_symlink_and_redaction(self) -> None:
+        import sqlite3
+        from pathlib import Path
+        from hub.backup_mgr import create_backup_archive, restore_backup_archive
+        from hub.disk_guard import rotate_and_prune_logs
+        from hub.doctor import run_hub_doctor
+        from hub.notifier import (
+            RECENT_NOTIFICATIONS,
+            _is_safe_outbound_webhook_url,
+            _record_notification_event,
+        )
+
+        with create_temp_hub() as tmpdir:
+            # 1. SSRF blocks IPv4-mapped IPv6 loopback and cloud metadata addresses
+            self.assertFalse(_is_safe_outbound_webhook_url("http://[::ffff:127.0.0.1]:8050/api")[0])
+            self.assertFalse(_is_safe_outbound_webhook_url("http://[::ffff:169.254.169.254]/latest/meta-data/")[0])
+            self.assertFalse(_is_safe_outbound_webhook_url("http://[::1]:8050/")[0])
+
+            # 2. RECENT_NOTIFICATIONS redacts Discord/Slack webhook tokens and proxy credentials
+            ev = _record_notification_event(
+                "webhook",
+                "https://discord.com/api/webhooks/123456789/SuperSecretDiscordTok",
+                "hello",
+                "warn",
+                "http://proxyuser:ProxyPass99@10.0.0.2:8080",
+                False,
+                "Failed POST https://hooks.slack.com/services/T111/B222/SecretSlackXYZ",
+            )
+            self.assertNotIn("SuperSecretDiscordTok", ev["title"])
+            self.assertIn("/api/webhooks/123456789/***", ev["title"])
+            self.assertNotIn("ProxyPass99", ev["proxy_used"])
+            self.assertNotIn("SecretSlackXYZ", ev["detail"])
+            self.assertIn("/services/***/***/***", ev["detail"])
+            self.assertEqual(RECENT_NOTIFICATIONS[0], ev)
+
+            # 3. rotate_and_prune_logs never truncates symlink targets in data/logs/
+            set_setting("log_max_size_mb", "1")
+            outside_big = tmpdir / "outside_important.log"
+            outside_big.write_bytes(b"X" * (1200 * 1024))
+            logs_sub = tmpdir / "data" / "logs" / "symlink-proj"
+            logs_sub.mkdir(parents=True, exist_ok=True)
+            sym_log = logs_sub / "attack.log"
+            sym_log.symlink_to(outside_big)
+            rotate_and_prune_logs()
+            self.assertEqual(outside_big.stat().st_size, 1200 * 1024)
+
+            # 4. backup_mgr accepts data/beacon.db and rejects ZIP-bombs exceeding max_bytes
+            snap_zip = tmpdir / "normal.zip"
+            create_backup_archive(snap_zip)
+
+            # Repack DB under data/beacon.db and restore cleanly
+            beacon_db_zip = tmpdir / "beacon_db_backup.zip"
+            with zipfile.ZipFile(snap_zip, "r") as zin, zipfile.ZipFile(beacon_db_zip, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    arc = "data/beacon.db" if item.filename == "data/hub.db" else item.filename
+                    zout.writestr(arc, zin.read(item.filename))
+            rst = restore_backup_archive(beacon_db_zip, stop_running=False)
+            self.assertTrue(rst["ok"])
+            self.assertEqual(rst["db_source"], "data/beacon.db")
+
+            # ZIP-bomb test: compressed tiny zip with 2.5 MB of zeros rejected when max_bytes=1 MB
+            bomb_zip = tmpdir / "bomb.zip"
+            with zipfile.ZipFile(snap_zip, "r") as zin, zipfile.ZipFile(bomb_zip, "w", zipfile.ZIP_DEFLATED) as zout:
+                zout.writestr("data/hub.db", zin.read("data/hub.db"))
+                zout.writestr("projects/demo/huge.txt", b"0" * (2 * 1024 * 1024))
+            with self.assertRaises(ValueError):
+                restore_backup_archive(bomb_zip, stop_running=False, max_bytes=1024 * 1024)
+
+            # 5. beacon doctor redacts proxy credentials in output
+            set_setting("proxy_url", "socks5://docuser:DocSecret77@127.0.0.1:10808")
+            doc = run_hub_doctor(auto_fix_perms=False)
+            proxy_chk = next(c for c in doc["checks"] if c["id"] == "proxy_bridge")
+            self.assertNotIn("DocSecret77", proxy_chk["title"])
+            self.assertNotIn("DocSecret77", json.dumps(proxy_chk))
+
+    def test_audit_phase4_scheduler_redaction_pruning_and_dashboard_proxy_masking(self) -> None:
+        from hub.api.routes_ui import api_dashboard
+        from hub.scheduler import (
+            _HEARTBEAT_ALERTED,
+            _JOB_RETRIES,
+            _SERVICE_BACKOFF,
+            _SERVICE_CRON_RESTARTS,
+            _redact_heartbeat_url,
+            scheduler_tick,
+        )
+
+        # 1. _redact_heartbeat_url scrubs Healthchecks.io UUIDs, Uptime Kuma push tokens, query strings & credentials
+        hc_red = _redact_heartbeat_url("https://hc-ping.com/11112222-3333-4444-5555-666677778888?status=up")
+        self.assertEqual(hc_red, "https://hc-ping.com/***")
+        self.assertNotIn("11112222", hc_red)
+        self.assertNotIn("status=up", hc_red)
+
+        kuma_red = _redact_heartbeat_url("https://user:TopSecret@kuma.example.org:8443/api/push/AbCdEfGhIj?msg=OK")
+        self.assertEqual(kuma_red, "https://kuma.example.org:8443/api/push/***")
+        self.assertNotIn("TopSecret", kuma_red)
+        self.assertNotIn("AbCdEfGhIj", kuma_red)
+        self.assertNotIn("msg=OK", kuma_red)
+
+        with create_temp_hub():
+            # 2. scheduler_tick prunes stale entries for deleted projects from all in-memory dicts
+            stale_id = 999888
+            _SERVICE_BACKOFF[stale_id] = {"consecutive_failures": 2, "next_restart_at": 0.0, "trigger": "crash"}
+            _JOB_RETRIES[stale_id] = {"retry_count": 1, "next_retry_at": 0.0}
+            _SERVICE_CRON_RESTARTS[stale_id] = {"expr": "0 * * * *", "next_restart_at": 0.0}
+            _HEARTBEAT_ALERTED[stale_id] = 12345
+
+            asyncio.run(scheduler_tick())
+            self.assertNotIn(stale_id, _SERVICE_BACKOFF)
+            self.assertNotIn(stale_id, _JOB_RETRIES)
+            self.assertNotIn(stale_id, _SERVICE_CRON_RESTARTS)
+            self.assertNotIn(stale_id, _HEARTBEAT_ALERTED)
+
+            # 3. /api/dashboard always masks proxy_url credentials even for admin role
+            set_setting("proxy_url", "socks5://adminproxy:UltraSecretProxyPass@10.20.30.40:10808")
+            admin_req = DummyRequest()
+            admin_req.state.session = {"role": "admin", "user": "admin"}
+            dash = asyncio.run(api_dashboard(admin_req))  # type: ignore[arg-type]
+            shown_proxy = dash["system"]["proxy_url"]
+            self.assertNotIn("UltraSecretProxyPass", shown_proxy)
+            self.assertNotIn("adminproxy", shown_proxy)
+            self.assertIn("10.20.30.40:10808", shown_proxy)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+

@@ -77,27 +77,50 @@ def rotate_and_prune_logs() -> dict[str, int]:
     deleted_runs = 0
 
     # 1. Безопасная ротация по размеру файла (copytruncate: ftruncate(0) + запись хвоста без смены inode)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
     if LOGS_DIR.exists():
         for log_file in LOGS_DIR.rglob("*.log"):
             try:
+                if log_file.is_symlink() or not log_file.is_file():
+                    continue
                 sz = log_file.stat().st_size
                 if sz > max_bytes:
                     keep_bytes = max_bytes // 2
-                    fd = os.open(str(log_file), os.O_RDWR)
+                    fd = os.open(str(log_file), os.O_RDWR | no_follow)
                     try:
                         os.lseek(fd, max(0, sz - keep_bytes), os.SEEK_SET)
                         tail = os.read(fd, keep_bytes)
                         header = (
-                            f"\n--- [HUB LOG ROTATED AT {int(time.time())}: EXCEEDED {max_size_mb} MB (copytruncate)] ---\n"
+                            f"\n--- [BEACON LOG ROTATED AT {int(time.time())}: EXCEEDED {max_size_mb} MB (copytruncate)] ---\n"
                         ).encode("utf-8")
                         os.ftruncate(fd, 0)
                         os.lseek(fd, 0, os.SEEK_SET)
-                        os.write(fd, header + tail)
+                        view = memoryview(header + tail)
+                        while view:
+                            written = os.write(fd, view)
+                            if written <= 0:
+                                break
+                            view = view[written:]
                     finally:
                         os.close(fd)
                     rotated_files += 1
             except OSError:
                 continue
+
+    logs_root = LOGS_DIR.resolve()
+
+    def _safe_unlink_log(raw_log_path: Any) -> None:
+        if not raw_log_path:
+            return
+        try:
+            raw_p = Path(str(raw_log_path))
+            if raw_p.is_symlink():
+                return
+            lp = raw_p.resolve()
+            if lp.is_relative_to(logs_root) and lp.is_file():
+                lp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # 2. Удаление старых завершённых запусков по времени (log_keep_days)
     cutoff_ts = int(time.time()) - (keep_days * 86400)
@@ -106,12 +129,7 @@ def rotate_and_prune_logs() -> dict[str, int]:
         (cutoff_ts,),
     )
     for r in old_runs:
-        lp = Path(r["log_path"])
-        if lp.exists():
-            try:
-                lp.unlink()
-            except OSError:
-                pass
+        _safe_unlink_log(r.get("log_path"))
         execute_sql("DELETE FROM runs WHERE id = ?", (r["id"],))
         deleted_runs += 1
 
@@ -126,12 +144,7 @@ def rotate_and_prune_logs() -> dict[str, int]:
         )
         if len(completed) > keep_runs:
             for extra in completed[keep_runs:]:
-                lp = Path(extra["log_path"])
-                if lp.exists():
-                    try:
-                        lp.unlink()
-                    except OSError:
-                        pass
+                _safe_unlink_log(extra.get("log_path"))
                 execute_sql("DELETE FROM runs WHERE id = ?", (extra["id"],))
                 deleted_runs += 1
 
@@ -195,11 +208,17 @@ def cleanup_system_caches() -> dict[str, Any]:
         f"SQLite WAL checkpoint ({wal_stats['mode']}): {wal_stats['wal_size_before_kb']} КБ -> {wal_stats['wal_size_after_kb']} КБ"
     ]
 
-    # Очищаем <workdir>/.tmp для остановленных проектов
+    # Очищаем <workdir>/.tmp ТОЛЬКО для остановленных проектов (без активных running/waiting_input)
     cleaned_tmp_dirs = 0
+    active_proj_rows = query_all(
+        "SELECT DISTINCT project_id FROM runs WHERE status IN ('running', 'waiting_input')"
+    )
+    active_proj_ids = {int(r["project_id"]) for r in active_proj_rows if r.get("project_id") is not None}
     for proj in query_all("SELECT id, workdir FROM projects"):
+        if int(proj["id"]) in active_proj_ids:
+            continue
         tmp_dir = Path(proj["workdir"]) / ".tmp"
-        if tmp_dir.exists():
+        if tmp_dir.exists() and not tmp_dir.is_symlink():
             try:
                 for item in tmp_dir.iterdir():
                     if item.is_dir() and not item.is_symlink():

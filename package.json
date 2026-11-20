@@ -1,7 +1,7 @@
 {
   "name": "beacon-server",
   "private": false,
-  "version": "2.2.0",
+  "version": "2.4.0",
   "description": "Beacon — Lightweight Containerless PaaS, Process Supervisor (<80MB RAM) & Streamable HTTP MCP Server for Linux VPS, Raspberry Pi, and Android chroot/Termux",
   "license": "MIT",
   "repository": {

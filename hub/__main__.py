@@ -65,7 +65,9 @@ from hub.secrets_mgr import reload_redaction_cache
 
 logger = get_logger("main")
 
-app = FastAPI(title="Beacon Control Panel", version="2.2.0")
+from hub import __version__ as BEACON_VERSION
+
+app = FastAPI(title="Beacon Control Panel", version=BEACON_VERSION)
 
 # Фоновые задачи жизненного цикла
 _BG_TASKS: list[asyncio.Task[Any]] = []
@@ -214,12 +216,19 @@ async def security_and_auth_middleware(request: Request, call_next: Callable[[Re
             pass
 
     path = request.url.path
-    is_https = (
-        getattr(getattr(request, "url", None), "scheme", "http") == "https"
-        or request.headers.get("x-forwarded-proto", "").lower() == "https"
-    )
     direct_ip = request.client.host if request.client else "127.0.0.1"
     client_ip, proxy_rejected, proxy_err = resolve_request_client_ip(direct_ip, request.headers)
+    trusted_csv = (get_setting("trusted_proxies", "") or "").strip()
+    from hub.auth import _ip_in_cidr_csv
+
+    trust_xfp = (
+        os.environ.get("BEACON_PREVIEW_MODE") == "1"
+        or (bool(trusted_csv) and _ip_in_cidr_csv(direct_ip, trusted_csv))
+    )
+    is_https = (
+        getattr(getattr(request, "url", None), "scheme", "http") == "https"
+        or (trust_xfp and request.headers.get("x-forwarded-proto", "").lower() == "https")
+    )
     try:
         request.state.client_ip = client_ip
     except Exception as exc:
@@ -325,9 +334,10 @@ async def security_and_auth_middleware(request: Request, call_next: Callable[[Re
         if not session and path == "/api/metrics" and request.method == "GET":
             auth_hdr = request.headers.get("authorization", "")
             if auth_hdr.lower().startswith("bearer "):
-                from hub.api.routes_ai import authenticate_ai_token
+                from hub.auth import verify_ai_token
 
-                tok_row, _tok_err = authenticate_ai_token(request)
+                raw_tok = auth_hdr[7:].strip()
+                tok_row, _tok_err = verify_ai_token(raw_tok, client_ip=client_ip)
                 if tok_row and "read" in (tok_row.get("scopes") or []):
                     session = {
                         "sub": f"metrics_token:{tok_row.get('name', 'prometheus')}",
@@ -488,7 +498,7 @@ def _run_cli_migrate() -> int:
     ensure_directories()
     init_db()
     mig_res = migrate_legacy_installation(BASE_DIR)
-    print("[Beacon Migrate] Схема базы данных SQLite успешно обновлена до версии 2.2.0.")
+    print(f"[Beacon Migrate] Схема базы данных SQLite успешно обновлена до версии {BEACON_VERSION}.")
     if mig_res.get("migrated_files"):
         print(f"[Beacon Migrate] Автоматически перенесено файлов старых версий: {mig_res['migrated_files']}")
     print(f"[Beacon Migrate] Рабочая директория: {BASE_DIR}")

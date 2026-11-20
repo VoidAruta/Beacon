@@ -118,6 +118,8 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
   const [createdPlainToken, setCreatedPlainToken] = useState<string>('');
   const [copiedConfig, setCopiedConfig] = useState<boolean>(false);
   const [copiedMcpJson, setCopiedMcpJson] = useState<boolean>(false);
+  const [confirmRevokeTokenId, setConfirmRevokeTokenId] = useState<number | null>(null);
+  const [confirmDeleteTokenId, setConfirmDeleteTokenId] = useState<number | null>(null);
 
   const loadAiConfig = async (silent: boolean = false) => {
     if (userRole !== 'admin') {
@@ -924,20 +926,68 @@ export const AiAccessView: React.FC<AiAccessViewProps> = ({
                           <span className="text-emerald-400 font-mono text-[11px]">АКТИВЕН</span>
                         )}
                       </td>
-                      <td className="py-2.5 text-right">
+                      <td className="py-2.5 text-right whitespace-nowrap">
                         {!isRevoked ? (
-                          <button
-                            type="button"
-                            onClick={() => handleRevokeToken(t.id)}
-                            className="px-2.5 py-1 text-[11px] bg-rose-950/70 hover:bg-rose-900 text-rose-200 rounded border border-rose-700/50 inline-flex items-center gap-1 cursor-pointer"
-                          >
-                            <Trash2 className="w-3 h-3" />
-                            Отозвать
-                          </button>
+                          confirmRevokeTokenId === t.id ? (
+                            <span className="inline-flex items-center gap-1">
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  setConfirmRevokeTokenId(null);
+                                  await handleRevokeToken(t.id);
+                                }}
+                                className="px-2 py-1 text-[11px] bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded cursor-pointer"
+                              >
+                                Отозвать?
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmRevokeTokenId(null)}
+                                className="px-2 py-1 text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 rounded cursor-pointer"
+                              >
+                                Отмена
+                              </button>
+                            </span>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setConfirmDeleteTokenId(null);
+                                setConfirmRevokeTokenId(t.id);
+                              }}
+                              className="px-2.5 py-1 text-[11px] bg-rose-950/70 hover:bg-rose-900 text-rose-200 rounded border border-rose-700/50 inline-flex items-center gap-1 cursor-pointer"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                              Отозвать
+                            </button>
+                          )
+                        ) : confirmDeleteTokenId === t.id ? (
+                          <span className="inline-flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                setConfirmDeleteTokenId(null);
+                                await handleDeleteToken(t.id);
+                              }}
+                              className="px-2 py-1 text-[11px] bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded cursor-pointer"
+                            >
+                              Удалить?
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteTokenId(null)}
+                              className="px-2 py-1 text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 rounded cursor-pointer"
+                            >
+                              Отмена
+                            </button>
+                          </span>
                         ) : (
                           <button
                             type="button"
-                            onClick={() => handleDeleteToken(t.id)}
+                            onClick={() => {
+                              setConfirmRevokeTokenId(null);
+                              setConfirmDeleteTokenId(t.id);
+                            }}
                             className="px-2.5 py-1 text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 inline-flex items-center gap-1 cursor-pointer"
                           >
                             <Trash2 className="w-3 h-3" />

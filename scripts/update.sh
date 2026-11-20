@@ -17,6 +17,16 @@ done
 
 BEACON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BEACON_PORT="${BEACON_PORT:-8050}"
+if ! [[ "$BEACON_PORT" =~ ^[0-9]+$ ]] || [ "$BEACON_PORT" -lt 1 ] || [ "$BEACON_PORT" -gt 65535 ]; then
+    echo "[!] Некорректный BEACON_PORT='${BEACON_PORT}' (ожидается 1..65535)." >&2
+    exit 1
+fi
+
+SUDO=""
+if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+fi
+
 cd "$BEACON_DIR"
 
 echo "================================================================"
@@ -45,8 +55,61 @@ if [ -x "${BEACON_DIR}/.venv/bin/python" ]; then
     PY_BIN="${BEACON_DIR}/.venv/bin/python"
 fi
 
+is_beacon_pid() {
+    local pid="$1"
+    if ! [[ "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
+    if [ -r "/proc/${pid}/cmdline" ]; then
+        tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -Eq '(beacon|hub)' || return 1
+    fi
+    return 0
+}
+
+stop_beacon_daemon() {
+    local pid_file="${BEACON_DIR}/data/beacon.pid"
+    if [ -f "$pid_file" ] && [ ! -L "$pid_file" ]; then
+        local old_pid
+        old_pid="$(tr -cd '0-9' < "$pid_file" 2>/dev/null || true)"
+        if [ -n "$old_pid" ] && is_beacon_pid "$old_pid"; then
+            kill -TERM "$old_pid" 2>/dev/null || true
+            for _ in 1 2 3 4 5; do
+                kill -0 "$old_pid" 2>/dev/null || break
+                sleep 1
+            done
+            if is_beacon_pid "$old_pid"; then
+                kill -KILL "$old_pid" 2>/dev/null || true
+            fi
+        fi
+    else
+        pkill -TERM -f "python.*-m (beacon|hub)" 2>/dev/null || true
+        sleep 2
+    fi
+}
+
+start_beacon_daemon() {
+    mkdir -p "${BEACON_DIR}/data/logs"
+    local log_out="${BEACON_DIR}/data/logs/beacon-daemon.log"
+    local start_cmd_file="${BEACON_DIR}/data/start.cmd"
+    if [ -f "$start_cmd_file" ] && [ ! -L "$start_cmd_file" ] && [ -s "$start_cmd_file" ]; then
+        local perms
+        perms="$(stat -c '%a' "$start_cmd_file" 2>/dev/null || echo '777')"
+        if [ "$perms" = "600" ] || [ "$perms" = "400" ]; then
+            local start_cmd
+            start_cmd="$(cat "$start_cmd_file")"
+            echo "[*] Запуск панели командой из data/start.cmd..."
+            nohup bash -c "$start_cmd" >> "$log_out" 2>&1 < /dev/null &
+            return 0
+        else
+            echo "[!] Пропущен data/start.cmd с небезопасными правами (${perms} != 600), используется стандартный запуск." >&2
+        fi
+    fi
+    echo "[*] Запуск панели: ${PY_BIN} -m beacon --port ${BEACON_PORT}..."
+    nohup "$PY_BIN" -m beacon --port "$BEACON_PORT" >> "$log_out" 2>&1 < /dev/null &
+}
+
 # 2. Резервная копия перед обновлением (если БД уже инициализирована)
-if [ -f "${BEACON_DIR}/data/hub.db" ]; then
+if [ -f "${BEACON_DIR}/data/beacon.db" ] || [ -f "${BEACON_DIR}/data/hub.db" ]; then
     echo "[*] Создание резервной копии перед обновлением..."
     "$PY_BIN" -m beacon backup || true
 fi
@@ -62,11 +125,17 @@ fi
 
 rollback_and_exit() {
     echo "[!] Проверка работоспособности не пройдена — выполняется откат на ${PREV_SHA}..." >&2
-    git checkout "$PREV_SHA" || git reset --hard "$PREV_SHA" || true
+    git reset --hard "$PREV_SHA" || git checkout "$PREV_SHA" || true
     if [ -x "${BEACON_DIR}/.venv/bin/pip" ]; then
         "${BEACON_DIR}/.venv/bin/pip" install -r requirements.txt --quiet || true
     fi
     "$PY_BIN" -m beacon migrate || true
+    if [ -d "/run/systemd/system" ] && command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q "^beacon\.service"; then
+        ${SUDO} systemctl restart beacon.service || true
+    else
+        stop_beacon_daemon
+        start_beacon_daemon
+    fi
     exit 1
 }
 
@@ -90,9 +159,9 @@ fi
 
 if [ "$USE_SYSTEMD" -eq 1 ]; then
     echo "[*] Перезапуск службы через systemd..."
-    sudo systemctl daemon-reload || true
+    ${SUDO} systemctl daemon-reload || true
     if systemctl list-unit-files | grep -q "^beacon\.service"; then
-        sudo systemctl restart beacon.service
+        ${SUDO} systemctl restart beacon.service
     else
         echo "[*] Systemd-юнит не установлен, пробуем локальный перезапуск..."
         USE_SYSTEMD=0
@@ -101,33 +170,8 @@ fi
 
 if [ "$USE_SYSTEMD" -eq 0 ]; then
     echo "[*] Остановка текущего процесса панели..."
-    PID_FILE="${BEACON_DIR}/data/beacon.pid"
-    if [ -f "$PID_FILE" ]; then
-        OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
-        if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-            kill -TERM "$OLD_PID" 2>/dev/null || true
-            for _ in 1 2 3 4 5; do
-                kill -0 "$OLD_PID" 2>/dev/null || break
-                sleep 1
-            done
-            kill -0 "$OLD_PID" 2>/dev/null && kill -KILL "$OLD_PID" 2>/dev/null || true
-        fi
-    else
-        pkill -TERM -f "python.*-m beacon" 2>/dev/null || true
-        sleep 2
-    fi
-
-    mkdir -p "${BEACON_DIR}/data/logs"
-    LOG_OUT="${BEACON_DIR}/data/logs/beacon-daemon.log"
-    START_CMD_FILE="${BEACON_DIR}/data/start.cmd"
-    if [ -f "$START_CMD_FILE" ] && [ -s "$START_CMD_FILE" ]; then
-        START_CMD="$(cat "$START_CMD_FILE")"
-        echo "[*] Запуск панели командой из data/start.cmd..."
-        nohup bash -c "$START_CMD" >> "$LOG_OUT" 2>&1 < /dev/null &
-    else
-        echo "[*] Запуск панели: ${PY_BIN} -m beacon --port ${BEACON_PORT}..."
-        nohup "$PY_BIN" -m beacon --port "$BEACON_PORT" >> "$LOG_OUT" 2>&1 < /dev/null &
-    fi
+    stop_beacon_daemon
+    start_beacon_daemon
 fi
 
 # 7. Проверка здоровья HTTP (/api/auth/me) в течение 20 секунд

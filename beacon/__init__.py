@@ -3,7 +3,7 @@ Beacon (ранее Hub Control Panel) — Легковесная автоном�
 Поддерживает как вызов `python3 -m beacon`, так и импорт встроенного SDK (`import beacon`) из дочерних проектов.
 """
 
-from sdk.python.beacon import ask, cookies_expired, notify, secret, state
+from sdk.python.beacon import BeaconApiError, ask, cookies_expired, notify, ping, secret, state
 
-__version__ = "2.2.0"
-__all__ = ["notify", "secret", "cookies_expired", "ask", "state", "__version__"]
+__version__ = "2.4.0"
+__all__ = ["BeaconApiError", "notify", "secret", "cookies_expired", "ask", "ping", "state", "__version__"]

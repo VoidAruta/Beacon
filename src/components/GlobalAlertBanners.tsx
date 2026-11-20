@@ -47,7 +47,7 @@ export const GlobalAlertBanners: React.FC<GlobalAlertBannersProps> = ({
   const [submittingAskId, setSubmittingAskId] = useState<string | null>(null);
 
   const [cookieModalTarget, setCookieModalTarget] = useState<string | null>(null);
-  const [cookieRawJson, setCookieRawJson] = useState<string>(SAMPLE_COOKIE_EDITOR_JSON);
+  const [cookieRawJson, setCookieRawJson] = useState<string>('');
   const [cookieError, setCookieError] = useState<string | null>(null);
   const [cookieSubmitting, setCookieSubmitting] = useState<boolean>(false);
 
@@ -70,7 +70,7 @@ export const GlobalAlertBanners: React.FC<GlobalAlertBannersProps> = ({
 
   const openCookieModal = (secretName: string) => {
     setCookieModalTarget(secretName);
-    setCookieRawJson(SAMPLE_COOKIE_EDITOR_JSON);
+    setCookieRawJson('');
     setCookieError(null);
   };
 
@@ -239,17 +239,17 @@ export const GlobalAlertBanners: React.FC<GlobalAlertBannersProps> = ({
             <form onSubmit={handleSaveCookieJson} className="mt-4 space-y-4">
               <p className="text-xs text-slate-300">
                 Скопируйте JSON-массив из браузерного расширения <strong>Cookie-Editor</strong> (Export → JSON) и
-                вставьте ниже. Файл будет сохранён в{' '}
-                <code className="font-mono text-indigo-300">data/secrets/{cookieModalTarget}</code> с правами{' '}
-                <code className="font-mono text-emerald-400">0600</code>, а флаг <code className="font-mono">is_expired</code> сбросится в 0.
+                вставьте ниже. Файл будет обновлён в защищённом хранилище{' '}
+                <code className="font-mono text-indigo-300">data/secrets/{cookieModalTarget}</code>, а статус «истекли» сбросится.
               </p>
 
               <textarea
                 rows={10}
                 aria-label="JSON массив из Cookie-Editor"
+                placeholder={SAMPLE_COOKIE_EDITOR_JSON}
                 value={cookieRawJson}
                 onChange={(e) => setCookieRawJson(e.target.value)}
-                className="w-full p-3 bg-[#0f172a] border border-slate-700 rounded-lg font-mono text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                className="w-full p-3 bg-[#0f172a] border border-slate-700 rounded-lg font-mono text-xs text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500"
               />
 
               {cookieError && (

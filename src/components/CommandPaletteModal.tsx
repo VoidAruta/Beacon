@@ -23,6 +23,7 @@ interface CommandPaletteModalProps {
   isOpen: boolean;
   onClose: () => void;
   projects: ProjectItem[];
+  userRole?: string;
   onNavigateTab: (tab: 'dashboard' | 'projects' | 'secrets' | 'ai_access' | 'settings' | 'acceptance' | 'docs') => void;
   onOpenProject: (project: ProjectItem, subTab?: WorkspaceSubTab) => void;
   onStartProject: (id: number) => Promise<any>;
@@ -47,6 +48,7 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
   isOpen,
   onClose,
   projects,
+  userRole = 'admin',
   onNavigateTab,
   onOpenProject,
   onStartProject,
@@ -69,43 +71,52 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
   }, [isOpen]);
 
   const commands = useMemo<PaletteCommandItem[]>(() => {
-    const items: PaletteCommandItem[] = [
-      {
-        id: 'act-create-project',
-        group: 'Быстрые действия',
-        title: 'Создать новый проект (Service / Web API / Job / GitHub)',
-        subtitle: 'Мастер создания сервиса, веб-бэкенда или задачи из шаблона или Git',
-        keywords: 'new create project github service web job создать проект',
-        icon: <Plus className="w-4 h-4 text-indigo-400" />,
-        action: () => {
-          onClose();
-          onOpenCreateModal();
+    const isAdmin = userRole === 'admin';
+    const canOperate = userRole === 'admin' || userRole === 'operator';
+    const items: PaletteCommandItem[] = [];
+
+    if (isAdmin) {
+      items.push(
+        {
+          id: 'act-create-project',
+          group: 'Быстрые действия',
+          title: 'Создать новый проект (Service / Web API / Job / GitHub)',
+          subtitle: 'Мастер создания сервиса, веб-бэкенда или задачи из шаблона или Git',
+          keywords: 'new create project github service web job создать проект',
+          icon: <Plus className="w-4 h-4 text-indigo-400" />,
+          action: () => {
+            onClose();
+            onOpenCreateModal();
+          },
         },
-      },
-      {
-        id: 'act-import-examples',
-        group: 'Быстрые действия',
-        title: 'Импортировать готовые примеры из projects/examples/',
-        subtitle: 'Добавляет heartbeat-daemon, web-status-api (:18081), sms-auth-bot и cookie-checker-job',
-        keywords: 'import examples demo шаблоны примеры импорт',
-        icon: <Download className="w-4 h-4 text-emerald-400" />,
-        action: async () => {
-          onClose();
-          await onImportExamples();
+        {
+          id: 'act-import-examples',
+          group: 'Быстрые действия',
+          title: 'Импортировать готовые примеры из projects/examples/',
+          subtitle: 'Добавляет heartbeat-daemon, web-status-api (:18081), sms-auth-bot и cookie-checker-job',
+          keywords: 'import examples demo шаблоны примеры импорт',
+          icon: <Download className="w-4 h-4 text-emerald-400" />,
+          action: async () => {
+            onClose();
+            await onImportExamples();
+          },
         },
-      },
-      {
-        id: 'act-test-sigpipe',
-        group: 'Быстрые действия',
-        title: 'Проверить выживание процессов при рестарте Beacon (Direct FD)',
-        subtitle: 'Перезагружает состояние супервизора без падения дочерних сервисов от SIGPIPE',
-        keywords: 'restart survival sigpipe direct fd рестарт проверка',
-        icon: <RotateCcw className="w-4 h-4 text-amber-400" />,
-        action: async () => {
-          onClose();
-          await onTestHubRestartSurvival();
-        },
-      },
+        {
+          id: 'act-test-sigpipe',
+          group: 'Быстрые действия',
+          title: 'Проверить выживание процессов при рестарте Beacon (Direct FD)',
+          subtitle: 'Перезагружает состояние супервизора без падения дочерних сервисов от SIGPIPE',
+          keywords: 'restart survival sigpipe direct fd рестарт проверка',
+          icon: <RotateCcw className="w-4 h-4 text-amber-400" />,
+          action: async () => {
+            onClose();
+            await onTestHubRestartSurvival();
+          },
+        }
+      );
+    }
+
+    items.push(
       {
         id: 'nav-dashboard',
         group: 'Навигация',
@@ -129,43 +140,51 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
           onNavigateTab('projects');
           onClose();
         },
-      },
-      {
-        id: 'nav-secrets',
-        group: 'Навигация',
-        title: 'Перейти: Куки и Секреты 0600 (Alt+3)',
-        subtitle: 'Импорт Cookie-Editor JSON, API-ключи и привязка секретов к проектам',
-        keywords: 'secrets cookies ask events alt+3 куки секреты токены',
-        icon: <KeyRound className="w-4 h-4 text-slate-300" />,
-        action: () => {
-          onNavigateTab('secrets');
-          onClose();
+      }
+    );
+
+    if (isAdmin) {
+      items.push(
+        {
+          id: 'nav-secrets',
+          group: 'Навигация',
+          title: 'Перейти: Куки и Секреты (Alt+3)',
+          subtitle: 'Импорт Cookie-Editor JSON, API-ключи и привязка секретов к проектам',
+          keywords: 'secrets cookies ask events alt+3 куки секреты токены',
+          icon: <KeyRound className="w-4 h-4 text-slate-300" />,
+          action: () => {
+            onNavigateTab('secrets');
+            onClose();
+          },
         },
-      },
-      {
-        id: 'nav-ai-access',
-        group: 'Навигация',
-        title: 'Перейти: Доступ ИИ — MCP и /api/v1/ (Alt+4)',
-        subtitle: 'Токены для Claude Code / Cursor, очередь подтверждений и аудит ИИ',
-        keywords: 'ai mcp claude cursor alt+4 токены ии агент',
-        icon: <Bot className="w-4 h-4 text-slate-300" />,
-        action: () => {
-          onNavigateTab('ai_access');
-          onClose();
+        {
+          id: 'nav-ai-access',
+          group: 'Навигация',
+          title: 'Перейти: Доступ ИИ — MCP и /api/v1/ (Alt+4)',
+          subtitle: 'Токены для Claude Code / Cursor, очередь подтверждений и аудит ИИ',
+          keywords: 'ai mcp claude cursor alt+4 токены ии агент',
+          icon: <Bot className="w-4 h-4 text-slate-300" />,
+          action: () => {
+            onNavigateTab('ai_access');
+            onClose();
+          },
         },
-      },
-      {
-        id: 'nav-settings',
-        group: 'Навигация',
-        title: 'Перейти: Настройки Панели, Пароль, RBAC и Бэкап (Alt+5)',
-        subtitle: 'Смена пароля администратора, фильтр подсетей, системный Telegram-бот и бэкап',
-        keywords: 'settings password backup rbac alt+5 настройки пароль прокси бэкап',
-        icon: <Settings className="w-4 h-4 text-slate-300" />,
-        action: () => {
-          onNavigateTab('settings');
-          onClose();
-        },
-      },
+        {
+          id: 'nav-settings',
+          group: 'Навигация',
+          title: 'Перейти: Настройки Панели, Пароль, RBAC и Бэкап (Alt+5)',
+          subtitle: 'Смена пароля администратора, фильтр подсетей, системный Telegram-бот и бэкап',
+          keywords: 'settings password backup rbac alt+5 настройки пароль прокси бэкап',
+          icon: <Settings className="w-4 h-4 text-slate-300" />,
+          action: () => {
+            onNavigateTab('settings');
+            onClose();
+          },
+        }
+      );
+    }
+
+    items.push(
       {
         id: 'nav-acceptance',
         group: 'Навигация',
@@ -189,8 +208,8 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
           onNavigateTab('docs');
           onClose();
         },
-      },
-    ];
+      }
+    );
 
     for (const p of projects) {
       const isRunning = p.current_status === 'running' || p.current_status === 'waiting_input';
@@ -208,50 +227,53 @@ export const CommandPaletteModal: React.FC<CommandPaletteModalProps> = ({
         },
       });
 
-      if (!isRunning) {
-        items.push({
-          id: `proj-start-${p.id}`,
-          group: 'Проекты',
-          title: `${p.name} — Запустить (Start)`,
-          subtitle: `Запуск ${typeLabel} (${p.cmd})`,
-          keywords: `start run ${p.name} старт запуск`,
-          icon: <Play className="w-4 h-4 text-emerald-400" />,
-          action: async () => {
-            onClose();
-            await onStartProject(p.id);
-          },
-        });
-      } else {
-        items.push({
-          id: `proj-stop-${p.id}`,
-          group: 'Проекты',
-          title: `${p.name} — Остановить группу PGID (Stop)`,
-          subtitle: `Остановка дерева процессов PID ${p.pid}`,
-          keywords: `stop kill ${p.name} стоп остановить`,
-          icon: <Square className="w-4 h-4 text-rose-400" />,
-          action: async () => {
-            onClose();
-            await onStopProject(p.id);
-          },
-        });
-        items.push({
-          id: `proj-restart-${p.id}`,
-          group: 'Проекты',
-          title: `${p.name} — Перезапустить (Restart)`,
-          subtitle: `Чистый перезапуск процесса PID ${p.pid}`,
-          keywords: `restart reload ${p.name} рестарт перезапуск`,
-          icon: <RotateCcw className="w-4 h-4 text-amber-400" />,
-          action: async () => {
-            onClose();
-            await onRestartProject(p.id);
-          },
-        });
+      if (canOperate) {
+        if (!isRunning) {
+          items.push({
+            id: `proj-start-${p.id}`,
+            group: 'Проекты',
+            title: `${p.name} — Запустить (Start)`,
+            subtitle: `Запуск ${typeLabel} (${p.cmd})`,
+            keywords: `start run ${p.name} старт запуск`,
+            icon: <Play className="w-4 h-4 text-emerald-400" />,
+            action: async () => {
+              onClose();
+              await onStartProject(p.id);
+            },
+          });
+        } else {
+          items.push({
+            id: `proj-stop-${p.id}`,
+            group: 'Проекты',
+            title: `${p.name} — Остановить группу PGID (Stop)`,
+            subtitle: `Остановка дерева процессов PID ${p.pid}`,
+            keywords: `stop kill ${p.name} стоп остановить`,
+            icon: <Square className="w-4 h-4 text-rose-400" />,
+            action: async () => {
+              onClose();
+              await onStopProject(p.id);
+            },
+          });
+          items.push({
+            id: `proj-restart-${p.id}`,
+            group: 'Проекты',
+            title: `${p.name} — Перезапустить (Restart)`,
+            subtitle: `Чистый перезапуск процесса PID ${p.pid}`,
+            keywords: `restart reload ${p.name} рестарт перезапуск`,
+            icon: <RotateCcw className="w-4 h-4 text-amber-400" />,
+            action: async () => {
+              onClose();
+              await onRestartProject(p.id);
+            },
+          });
+        }
       }
     }
 
     return items;
   }, [
     projects,
+    userRole,
     onClose,
     onOpenCreateModal,
     onImportExamples,

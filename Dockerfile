@@ -24,6 +24,6 @@ ENV BEACON_PORT=8050
 EXPOSE 8050
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8050/api/auth/me)" && [ "$code" = "200" -o "$code" = "401" ] || exit 1
+    CMD code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${BEACON_PORT:-8050}/api/auth/me")" && [ "$code" = "200" -o "$code" = "401" ] || exit 1
 
-CMD ["python3", "-m", "beacon", "--port", "8050"]
+CMD ["python3", "-m", "beacon"]

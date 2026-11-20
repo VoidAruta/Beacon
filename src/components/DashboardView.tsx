@@ -109,6 +109,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [groupFilter, setGroupFilter] = useState<string>('all');
   const [hideTests, setHideTests] = useState(false);
   const [batchBusy, setBatchBusy] = useState<string | null>(null);
+  const [confirmBatchAction, setConfirmBatchAction] = useState<'stop' | 'restart' | null>(null);
   const [cloningProjectId, setCloningProjectId] = useState<number | null>(null);
   const [cloneNameInput, setCloneNameInput] = useState('');
   const [activeLogTab, setActiveLogTab] = useState<'errors' | 'notifications' | 'schedule' | 'log_search' | 'sla' | 'ports'>('errors');
@@ -659,7 +660,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 ? 'Прокси: выкл (прямой канал)'
                 : system.proxy_status?.online
                 ? `Прокси ONLINE (${system.proxy_status.latency_ms} мс)`
-                : `Прокси OFFLINE (${system.proxy_url})`}
+                : `Прокси OFFLINE (${system.proxy_url.replace(/(:\/\/)([^/@\s]+)@/, '$1***@')})`}
             </span>
           </div>
         </div>
@@ -746,7 +747,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </div>
               </div>
               <div className="text-[10px] font-mono text-purple-300">
-                Панель: :{window.location.port || '8765'}
+                Панель: :{window.location.port || (window.location.protocol === 'https:' ? '443' : '80')}
               </div>
             </div>
           </div>
@@ -900,66 +901,119 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <span className="text-[10px] font-mono text-slate-400 px-1.5">
                   Группа ({filteredProjects.length}):
                 </span>
-                <button
-                  type="button"
-                  disabled={batchBusy !== null}
-                  onClick={async () => {
-                    setBatchBusy('start');
-                    try {
-                      await onBatchProjectAction(
-                        'start',
-                        filteredProjects.map((p) => p.id)
-                      );
-                    } finally {
-                      setBatchBusy(null);
-                    }
-                  }}
-                  title="Запустить все проекты в текущем фильтре/группе"
-                  className="px-2 py-1 text-[11px] font-semibold bg-emerald-600/20 hover:bg-emerald-600/35 text-emerald-300 border border-emerald-500/30 rounded inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
-                >
-                  <Play className="w-3 h-3" />
-                  <span>Старт</span>
-                </button>
-                <button
-                  type="button"
-                  disabled={batchBusy !== null}
-                  onClick={async () => {
-                    setBatchBusy('restart');
-                    try {
-                      await onBatchProjectAction(
-                        'restart',
-                        filteredProjects.map((p) => p.id)
-                      );
-                    } finally {
-                      setBatchBusy(null);
-                    }
-                  }}
-                  title="Перезапустить все проекты в текущем фильтре/группе"
-                  className="px-2 py-1 text-[11px] font-semibold bg-indigo-600/20 hover:bg-indigo-600/35 text-indigo-300 border border-indigo-500/30 rounded inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
-                >
-                  <RotateCw className="w-3 h-3" />
-                  <span>Рестарт</span>
-                </button>
-                <button
-                  type="button"
-                  disabled={batchBusy !== null}
-                  onClick={async () => {
-                    setBatchBusy('stop');
-                    try {
-                      await onBatchProjectAction(
-                        'stop',
-                        filteredProjects.map((p) => p.id)
-                      );
-                    } finally {
-                      setBatchBusy(null);
-                    }
-                  }}
-                  title="Остановить все проекты в текущем фильтре/группе"
-                  className="px-2 py-1 text-[11px] font-semibold bg-rose-600/20 hover:bg-rose-600/35 text-rose-300 border border-rose-500/30 rounded inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
-                >
-                  <Square className="w-3 h-3" />
-                  <span>Стоп</span>
-                </button>
+                {confirmBatchAction && filteredProjects.length > 1 ? (
+                  <>
+                    <span className="text-[11px] font-semibold text-amber-300 px-1.5">
+                      {confirmBatchAction === 'stop' ? 'Стоп всех?' : 'Рестарт всех?'}
+                    </span>
+                    <button
+                      type="button"
+                      data-testid="batch-confirm-btn"
+                      disabled={batchBusy !== null}
+                      onClick={async () => {
+                        const act = confirmBatchAction;
+                        setConfirmBatchAction(null);
+                        setBatchBusy(act);
+                        try {
+                          await onBatchProjectAction(
+                            act,
+                            filteredProjects.map((p) => p.id)
+                          );
+                        } finally {
+                          setBatchBusy(null);
+                        }
+                      }}
+                      className={`px-2 py-1 text-[11px] font-semibold rounded border cursor-pointer disabled:opacity-50 ${
+                        confirmBatchAction === 'stop'
+                          ? 'bg-rose-600 hover:bg-rose-500 text-white border-rose-500'
+                          : 'bg-indigo-600 hover:bg-indigo-500 text-white border-indigo-500'
+                      }`}
+                    >
+                      Подтвердить
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="batch-cancel-btn"
+                      disabled={batchBusy !== null}
+                      onClick={() => setConfirmBatchAction(null)}
+                      className="px-2 py-1 text-[11px] font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded cursor-pointer disabled:opacity-50"
+                    >
+                      Отмена
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      disabled={batchBusy !== null}
+                      onClick={async () => {
+                        setConfirmBatchAction(null);
+                        setBatchBusy('start');
+                        try {
+                          await onBatchProjectAction(
+                            'start',
+                            filteredProjects.map((p) => p.id)
+                          );
+                        } finally {
+                          setBatchBusy(null);
+                        }
+                      }}
+                      title="Запустить все проекты в текущем фильтре/группе"
+                      className="px-2 py-1 text-[11px] font-semibold bg-emerald-600/20 hover:bg-emerald-600/35 text-emerald-300 border border-emerald-500/30 rounded inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                    >
+                      <Play className="w-3 h-3" />
+                      <span>Старт</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={batchBusy !== null}
+                      onClick={async () => {
+                        if (filteredProjects.length > 1) {
+                          setConfirmBatchAction('restart');
+                          return;
+                        }
+                        setBatchBusy('restart');
+                        try {
+                          await onBatchProjectAction(
+                            'restart',
+                            filteredProjects.map((p) => p.id)
+                          );
+                        } finally {
+                          setBatchBusy(null);
+                        }
+                      }}
+                      title="Перезапустить все проекты в текущем фильтре/группе"
+                      className="px-2 py-1 text-[11px] font-semibold bg-indigo-600/20 hover:bg-indigo-600/35 text-indigo-300 border border-indigo-500/30 rounded inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                    >
+                      <RotateCw className="w-3 h-3" />
+                      <span>Рестарт</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={batchBusy !== null}
+                      onClick={async () => {
+                        if (filteredProjects.length > 1) {
+                          setConfirmBatchAction('stop');
+                          return;
+                        }
+                        setBatchBusy('stop');
+                        try {
+                          await onBatchProjectAction(
+                            'stop',
+                            filteredProjects.map((p) => p.id)
+                          );
+                        } finally {
+                          setBatchBusy(null);
+                        }
+                      }}
+                      title="Остановить все проекты в текущем фильтре/группе"
+                      className="px-2 py-1 text-[11px] font-semibold bg-rose-600/20 hover:bg-rose-600/35 text-rose-300 border border-rose-500/30 rounded inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                    >
+                      <Square className="w-3 h-3" />
+                      <span>Стоп</span>
+                    </button>
+                  </>
+                )}
               </div>
             )}
 
@@ -1169,6 +1223,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                                   type="button"
                                   onClick={() => onStartProject(proj.id)}
                                   title="Запустить"
+                                  aria-label={`Запустить ${proj.name}`}
                                   className="p-1.5 rounded-lg bg-emerald-600/20 text-emerald-300 hover:bg-emerald-600/30 border border-emerald-500/30 cursor-pointer"
                                 >
                                   <Play className="w-3.5 h-3.5" />
@@ -1178,6 +1233,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                                   type="button"
                                   onClick={() => onStopProject(proj.id)}
                                   title="Остановить группу процессов (PGID)"
+                                  aria-label={`Остановить ${proj.name}`}
                                   className="p-1.5 rounded-lg bg-red-600/20 text-red-300 hover:bg-red-600/30 border border-red-500/30 cursor-pointer"
                                 >
                                   <Square className="w-3.5 h-3.5" />
@@ -1188,6 +1244,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                                 type="button"
                                 onClick={() => onRestartProject(proj.id)}
                                 title="Перезапустить"
+                                aria-label={`Перезапустить ${proj.name}`}
                                 className="p-1.5 rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700 cursor-pointer"
                               >
                                 <RotateCw className="w-3.5 h-3.5" />
@@ -1201,6 +1258,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                                     setCloneNameInput(`${proj.name}-copy`);
                                   }}
                                   title="Клонировать проект"
+                                  aria-label={`Клонировать ${proj.name}`}
                                   className="p-1.5 rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700 cursor-pointer"
                                 >
                                   <Copy className="w-3.5 h-3.5" />

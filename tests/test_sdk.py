@@ -271,6 +271,12 @@ class TestBeaconSdk(unittest.TestCase):
         os.environ["BEACON_PING_TOKEN"] = "valid-ping-tok"
         self.assertTrue(beacon_sdk.ping())
 
+        # Failed ping must redact secret ping token in error message
+        with self.assertRaises(beacon_sdk.BeaconApiError) as ping_err:
+            beacon_sdk.ping(token="super-secret-ping-999", strict=True)
+        self.assertNotIn("super-secret-ping-999", str(ping_err.exception))
+        self.assertIn("/api/ping/***", str(ping_err.exception))
+
         # Verify only canonical beacon.py / beacon.js exist in sdk/
         self.assertTrue((SDK_PY_DIR / "beacon.py").exists())
         self.assertFalse((SDK_PY_DIR / "aruta.py").exists())
@@ -293,6 +299,15 @@ const beacon = require('beacon');
   const got = await beacon.state.get('node_k', null, { strict: true });
   assert.deepStrictEqual(got, { ok: 1 });
   assert.strictEqual(await beacon.ping(), true);
+  let leaked = false;
+  try {
+    await beacon.ping('node-secret-ping-888', { strict: true });
+    assert.fail('expected ping failure');
+  } catch (err) {
+    leaked = String(err.message || '').includes('node-secret-ping-888');
+    assert.ok(String(err.message || '').includes('/api/ping/***'));
+  }
+  assert.strictEqual(leaked, false);
   console.log('NODE_SDK_OK');
 })().catch((err) => { console.error(err); process.exit(1); });
 """
@@ -311,6 +326,76 @@ const beacon = require('beacon');
         )
         self.assertEqual(proc.returncode, 0, msg=f"stderr: {proc.stderr}\nstdout: {proc.stdout}")
         self.assertIn("NODE_SDK_OK", proc.stdout)
+
+    def test_07_sdk_security_hardening_loopback_redirects_and_exports(self) -> None:
+        import beacon as top_beacon_pkg
+        import hub as top_hub_pkg
+
+        # 1. Top-level packages export ping, BeaconApiError, and version 2.4.0
+        self.assertTrue(callable(getattr(top_beacon_pkg, "ping", None)))
+        self.assertTrue(callable(getattr(top_hub_pkg, "ping", None)))
+        self.assertEqual(top_hub_pkg.__version__, "2.4.0")
+
+        # 2. Python SDK refuses non-loopback BEACON_API_URL unless BEACON_ALLOW_REMOTE_API=1
+        os.environ["BEACON_API_URL"] = "https://evil.example.com/internal"
+        with self.assertRaises(beacon_sdk.BeaconApiError) as ctx_remote:
+            beacon_sdk.notify("should-not-leak", strict=True)
+        self.assertIn("non-loopback", str(ctx_remote.exception))
+
+        # 3. URL redaction scrubs userinfo, ping tokens, and query strings
+        red = beacon_sdk._redact_url("http://user:MyPass99@127.0.0.1:8050/api/ping/secret-tok-123?token=abc")
+        self.assertNotIn("MyPass99", red)
+        self.assertNotIn("secret-tok-123", red)
+        self.assertNotIn("token=abc", red)
+        self.assertEqual(red, "http://***@127.0.0.1:8050/api/ping/***?***")
+
+        # 4. Empty secret name rejected immediately
+        os.environ["BEACON_API_URL"] = f"{self.base_url}/internal"
+        with self.assertRaises(ValueError):
+            beacon_sdk.secret("   ")
+
+        # 5. Python SDK does not follow HTTP 302 redirects (protects X-Beacon-Token)
+        self.state.force_status["/internal/notify"] = 302
+        with self.assertRaises(beacon_sdk.BeaconApiError) as ctx_redir:
+            beacon_sdk.notify("redir-test", strict=True)
+        self.assertEqual(ctx_redir.exception.status_code, 302)
+
+        # 6. Node.js SDK rejects non-loopback BEACON_API_URL and redacts URL credentials
+        if shutil.which("node") is not None:
+            node_sec_script = r"""
+const assert = require('assert');
+const beacon = require('beacon');
+(async () => {
+  process.env.BEACON_API_URL = 'https://evil.example.com/internal';
+  let blocked = false;
+  try {
+    await beacon.notify('leak-check', 'info', { strict: true });
+  } catch (err) {
+    blocked = String(err.message || '').includes('non-loopback');
+  }
+  assert.strictEqual(blocked, true);
+  let emptyRejected = false;
+  try {
+    await beacon.secret('   ');
+  } catch (_) {
+    emptyRejected = true;
+  }
+  assert.strictEqual(emptyRejected, true);
+  console.log('NODE_SEC_OK');
+})().catch((err) => { console.error(err); process.exit(1); });
+"""
+            env = dict(os.environ)
+            env["NODE_PATH"] = str(SDK_NODE_PATH)
+            proc = subprocess.run(
+                ["node", "-e", node_sec_script],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=f"stderr: {proc.stderr}\nstdout: {proc.stdout}")
+            self.assertIn("NODE_SEC_OK", proc.stdout)
 
 
 if __name__ == "__main__":

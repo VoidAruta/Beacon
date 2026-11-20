@@ -37,6 +37,31 @@ _SKIP_PROJECT_DIRS = frozenset(
 _EXCLUDED_SECRET_FILES = frozenset({"session.secret", "internal.token"})
 _REQUIRED_TABLES = ("settings", "projects", "runs", "secrets", "users")
 _MAX_PROJECT_FILE_BYTES = 5 * 1024 * 1024
+_MAX_RESTORE_MEMBER_BYTES = 128 * 1024 * 1024
+_MAX_RESTORE_TOTAL_BYTES = 512 * 1024 * 1024
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_DB_ARCHIVE_NAMES = ("data/beacon.db", "data/hub.db")
+
+
+def _copy_limited(src_f: Any, dst_fd: int, remaining_total: int, max_member: int) -> int:
+    """Копирует поток из ZIP-записи с жёстким контролем реального распакованного объёма (защита от ZIP-бомб)."""
+    written = 0
+    while True:
+        chunk = src_f.read(65536)
+        if not chunk:
+            break
+        written += len(chunk)
+        if written > max_member:
+            raise ValueError(f"Файл в архиве превышает допустимый размер ({max_member // (1024 * 1024)} МБ)")
+        if written > remaining_total:
+            raise ValueError("Суммарный распакованный размер архива превышает допустимый лимит (защита от ZIP-бомбы)")
+        view = memoryview(chunk)
+        while view:
+            n = os.write(dst_fd, view)
+            if n <= 0:
+                raise OSError("Не удалось записать данные при восстановлении архива")
+            view = view[n:]
+    return written
 
 
 def create_backup_archive(output_path: Path, max_bytes: int = 250 * 1024 * 1024) -> Path:
@@ -121,7 +146,7 @@ def create_backup_archive(output_path: Path, max_bytes: int = 250 * 1024 * 1024)
 
 
 def _validate_zip_member(info: zipfile.ZipInfo) -> str:
-    """Проверяет имя и тип записи в ZIP-архиве (защита от traversal, симлинков и лишних путей)."""
+    """Проверяет имя, тип и размер записи в ZIP-архиве (защита от traversal, симлинков и ZIP-бомб)."""
     if ((info.external_attr >> 16) & 0o170000) == 0o120000:
         raise ValueError(f"Запрещённая символическая ссылка в архиве: {info.filename}")
 
@@ -138,7 +163,10 @@ def _validate_zip_member(info: zipfile.ZipInfo) -> str:
             raise ValueError(f"Неразрешённый каталог в архиве: {info.filename}")
         return norm
 
-    if norm == "data/hub.db":
+    if int(getattr(info, "file_size", 0) or 0) > _MAX_RESTORE_MEMBER_BYTES:
+        raise ValueError(f"Файл в архиве превышает лимит размера: {info.filename}")
+
+    if norm in _DB_ARCHIVE_NAMES:
         return norm
     if norm.startswith("data/secrets/") and len(parts) == 3:
         if parts[2] in _EXCLUDED_SECRET_FILES:
@@ -147,6 +175,9 @@ def _validate_zip_member(info: zipfile.ZipInfo) -> str:
     if norm.startswith("projects/") and len(parts) >= 2:
         if parts[-1] in _EXCLUDED_SECRET_FILES:
             raise ValueError(f"Запрещённый файл в архиве: {norm}")
+        lowered = [p.lower() for p in parts]
+        if ".venv" in lowered or ("hooks" in lowered and ".git" in lowered):
+            raise ValueError(f"Запрещённый путь в архиве бэкапа: {norm}")
         return norm
 
     raise ValueError(f"Неразрешённый файл в архиве бэкапа: {info.filename}")
@@ -195,13 +226,18 @@ def _stop_running_projects_sync() -> int:
         return asyncio.run(_stop_all())
 
 
-def restore_backup_archive(archive_path: Path, stop_running: bool = True) -> dict[str, Any]:
+def restore_backup_archive(
+    archive_path: Path,
+    stop_running: bool = True,
+    max_bytes: int = _MAX_RESTORE_TOTAL_BYTES,
+) -> dict[str, Any]:
     """
     Восстанавливает Beacon из ZIP-архива бэкапа:
-    - Валидирует все записи ZIP (без path traversal / симлинков)
-    - Проверяет data/hub.db через PRAGMA integrity_check и наличие таблиц
+    - Валидирует все записи ZIP (без path traversal, симлинков и ZIP-бомб)
+    - Поддерживает как data/beacon.db, так и legacy data/hub.db
+    - Проверяет БД через PRAGMA integrity_check и наличие обязательных таблиц
     - Останавливает запущенные проекты
-    - Атомарно заменяет data/hub.db, data/secrets/* (0600) и projects/*
+    - Атомарно заменяет БД, data/secrets/* (0600) и projects/*
     - Удаляет -wal/-shm и повторно запускает init_db() (миграции)
     """
     src_zip = Path(archive_path)
@@ -209,6 +245,7 @@ def restore_backup_archive(archive_path: Path, stop_running: bool = True) -> dic
         raise FileNotFoundError(f"Файл бэкапа не найден: {src_zip}")
 
     ensure_directories()
+    total_limit = max(1024 * 1024, int(max_bytes))
 
     with zipfile.ZipFile(src_zip, "r") as zf:
         infos = zf.infolist()
@@ -216,28 +253,44 @@ def restore_backup_archive(archive_path: Path, stop_running: bool = True) -> dic
             raise ValueError("Архив бэкапа пуст")
 
         db_info: Optional[zipfile.ZipInfo] = None
+        db_arc_name: str = ""
         secret_entries: list[tuple[zipfile.ZipInfo, str]] = []
         project_entries: list[tuple[zipfile.ZipInfo, str]] = []
+        declared_total = 0
 
         for info in infos:
             norm = _validate_zip_member(info)
             if info.is_dir():
                 continue
-            if norm == "data/hub.db":
-                db_info = info
+            declared_total += int(getattr(info, "file_size", 0) or 0)
+            if declared_total > total_limit:
+                raise ValueError(
+                    f"Суммарный размер архива превышает лимит {total_limit // (1024 * 1024)} МБ"
+                )
+            if norm in _DB_ARCHIVE_NAMES:
+                if db_info is None or norm == "data/beacon.db":
+                    db_info = info
+                    db_arc_name = norm
             elif norm.startswith("data/secrets/"):
                 secret_entries.append((info, norm.split("/", 2)[2]))
             elif norm.startswith("projects/"):
                 project_entries.append((info, norm[len("projects/") :]))
 
         if db_info is None:
-            raise ValueError("В архиве бэкапа отсутствует обязательный файл data/hub.db")
+            raise ValueError("В архиве бэкапа отсутствует обязательный файл data/beacon.db (или data/hub.db)")
+
+        remaining_bytes = total_limit
 
         with tempfile.TemporaryDirectory(prefix="beacon_restore_") as tmp_dir_str:
             tmp_dir = Path(tmp_dir_str)
-            tmp_db = tmp_dir / "hub.db"
-            with zf.open(db_info, "r") as src_f, open(tmp_db, "wb") as dst_f:
-                shutil.copyfileobj(src_f, dst_f)
+            tmp_db = tmp_dir / "restore.db"
+            db_fd = os.open(str(tmp_db), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW, 0o600)
+            try:
+                with zf.open(db_info, "r") as src_f:
+                    written = _copy_limited(src_f, db_fd, remaining_bytes, _MAX_RESTORE_MEMBER_BYTES)
+                    remaining_bytes -= written
+            finally:
+                os.close(db_fd)
 
             _verify_sqlite_snapshot(tmp_db)
 
@@ -254,26 +307,41 @@ def restore_backup_archive(archive_path: Path, stop_running: bool = True) -> dic
                     pass
 
             stage_db = DB_PATH.with_name(f".hub.db.restore.{secrets.token_hex(4)}")
-            shutil.copy2(tmp_db, stage_db)
+            stage_fd = os.open(str(stage_db), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW, 0o600)
+            try:
+                with open(tmp_db, "rb") as src_db_f:
+                    while True:
+                        chunk = src_db_f.read(65536)
+                        if not chunk:
+                            break
+                        os.write(stage_fd, chunk)
+                os.fsync(stage_fd)
+            finally:
+                os.close(stage_fd)
             os.chmod(stage_db, 0o600)
             os.replace(stage_db, DB_PATH)
 
             restored_secrets = 0
+            secrets_root = SECRETS_DIR.resolve()
             for info, sec_name in secret_entries:
-                target_sec = (SECRETS_DIR / sec_name).resolve()
-                if os.path.commonpath([str(SECRETS_DIR.resolve()), str(target_sec)]) != str(SECRETS_DIR.resolve()):
+                raw_sec = SECRETS_DIR / sec_name
+                if raw_sec.is_symlink():
+                    raise ValueError(f"Восстановление секрета поверх симлинка запрещено: {sec_name}")
+                target_sec = raw_sec.resolve()
+                if os.path.commonpath([str(secrets_root), str(target_sec)]) != str(secrets_root):
                     raise ValueError(f"Недопустимый путь секрета: {sec_name}")
                 tmp_sec = SECRETS_DIR / f".{sec_name}.{secrets.token_hex(4)}.tmp"
-                fd = os.open(str(tmp_sec), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                fd = os.open(str(tmp_sec), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW, 0o600)
                 try:
                     with zf.open(info, "r") as src_f:
-                        while True:
-                            chunk = src_f.read(65536)
-                            if not chunk:
-                                break
-                            os.write(fd, chunk)
-                finally:
+                        written = _copy_limited(src_f, fd, remaining_bytes, _MAX_RESTORE_MEMBER_BYTES)
+                        remaining_bytes -= written
+                    os.fsync(fd)
+                except Exception:
                     os.close(fd)
+                    tmp_sec.unlink(missing_ok=True)
+                    raise
+                os.close(fd)
                 os.chmod(tmp_sec, 0o600)
                 os.replace(tmp_sec, target_sec)
                 restored_secrets += 1
@@ -281,18 +349,30 @@ def restore_backup_archive(archive_path: Path, stop_running: bool = True) -> dic
             restored_files = 0
             proj_root = PROJECTS_DIR.resolve()
             for info, rel_proj in project_entries:
-                target_file = (proj_root / rel_proj).resolve()
+                raw_target = proj_root / rel_proj
+                cur_chk = proj_root
+                for seg in Path(rel_proj).parts:
+                    cur_chk = cur_chk / seg
+                    if cur_chk.is_symlink():
+                        raise ValueError(f"Восстановление через существующий симлинк запрещено: {rel_proj}")
+                target_file = raw_target.resolve()
                 if os.path.commonpath([str(proj_root), str(target_file)]) != str(proj_root):
                     raise ValueError(f"Недопустимый путь файла проекта: {rel_proj}")
                 target_file.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(info, "r") as src_f, open(target_file, "wb") as dst_f:
-                    shutil.copyfileobj(src_f, dst_f)
+                fd = os.open(str(target_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW, 0o644)
+                try:
+                    with zf.open(info, "r") as src_f:
+                        written = _copy_limited(src_f, fd, remaining_bytes, _MAX_RESTORE_MEMBER_BYTES)
+                        remaining_bytes -= written
+                finally:
+                    os.close(fd)
                 restored_files += 1
 
     init_db()
     return {
         "ok": True,
         "db_restored": True,
+        "db_source": db_arc_name,
         "restored_secrets": restored_secrets,
         "restored_project_files": restored_files,
     }
@@ -309,6 +389,13 @@ def run_auto_backup_if_due() -> Optional[Path]:
     except ValueError:
         interval_hours = 0
     if interval_hours <= 0:
+        return None
+
+    from hub.disk_guard import can_start_new_run
+
+    disk_ok, disk_reason = can_start_new_run()
+    if not disk_ok:
+        logger.warning("Автобэкап пропущен из-за нехватки места на диске: %s", disk_reason)
         return None
 
     try:

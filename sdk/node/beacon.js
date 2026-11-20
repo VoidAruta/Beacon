@@ -8,6 +8,20 @@ const https = require('https');
 const fs = require('fs');
 
 const RETRY_DELAYS_MS = [500, 1500];
+const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+const MAX_ERROR_BODY_CHARS = 4096;
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
+function redactUrl(url) {
+  let cleaned = String(url || '')
+    .replace(/(https?:\/\/)([^/@\s]+)@/g, '$1***@')
+    .replace(/(\/api\/ping\/)([^/?#\s]+)/g, '$1***');
+  const qIdx = cleaned.indexOf('?');
+  if (qIdx !== -1) {
+    cleaned = `${cleaned.slice(0, qIdx)}?***`;
+  }
+  return cleaned;
+}
 
 class BeaconApiError extends Error {
   constructor(message, statusCode = 0) {
@@ -15,6 +29,28 @@ class BeaconApiError extends Error {
     this.name = 'BeaconApiError';
     this.statusCode = Number(statusCode || 0);
   }
+}
+
+function validateApiUrl(targetUrl) {
+  let target;
+  try {
+    target = new URL(targetUrl);
+  } catch (_) {
+    throw new BeaconApiError(`Invalid Beacon API URL: ${redactUrl(targetUrl)}`, 0);
+  }
+  if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+    throw new BeaconApiError(`Unsupported Beacon API protocol: ${redactUrl(targetUrl)}`, 0);
+  }
+  const allowRemote = ['1', 'true', 'yes'].includes(
+    String(process.env.BEACON_ALLOW_REMOTE_API || '').trim().toLowerCase()
+  );
+  if (!allowRemote && !LOOPBACK_HOSTS.has(target.hostname.toLowerCase())) {
+    throw new BeaconApiError(
+      `Refusing to send Beacon API request to non-loopback host '${target.hostname}' (set BEACON_ALLOW_REMOTE_API=1 to override)`,
+      0
+    );
+  }
+  return target;
 }
 
 function getApiConfig() {
@@ -37,8 +73,20 @@ function sleep(ms) {
 }
 
 function singleHttpRequest(method, targetUrl, headers, bodyStr, timeoutMs) {
+  const target = validateApiUrl(targetUrl);
   return new Promise((resolve, reject) => {
-    const target = new URL(targetUrl);
+    let settled = false;
+    const finishResolve = (val) => {
+      if (settled) return;
+      settled = true;
+      resolve(val);
+    };
+    const finishReject = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+
     const transport = target.protocol === 'https:' ? https : http;
     const req = transport.request(
       {
@@ -51,24 +99,53 @@ function singleHttpRequest(method, targetUrl, headers, bodyStr, timeoutMs) {
       },
       (res) => {
         let raw = '';
+        let totalBytes = 0;
         res.setEncoding('utf8');
-        res.on('data', (chunk) => (raw += chunk));
+        res.on('data', (chunk) => {
+          if (settled) return;
+          totalBytes += Buffer.byteLength(chunk, 'utf8');
+          if (totalBytes > MAX_RESPONSE_BYTES) {
+            req.destroy();
+            finishReject(
+              new BeaconApiError(
+                `Beacon API response exceeded ${MAX_RESPONSE_BYTES} bytes on ${redactUrl(targetUrl)}`,
+                0
+              )
+            );
+            return;
+          }
+          raw += chunk;
+        });
+        res.on('error', (err) => {
+          finishReject(new BeaconApiError(`Beacon API stream error on ${redactUrl(targetUrl)}: ${err.message}`, 0));
+        });
         res.on('end', () => {
+          if (settled) return;
           if (res.statusCode >= 200 && res.statusCode < 300) {
             try {
-              resolve(raw ? JSON.parse(raw) : {});
+              finishResolve(raw ? JSON.parse(raw) : {});
             } catch (err) {
-              reject(err);
+              finishReject(err);
             }
           } else {
-            reject(new BeaconApiError(`Beacon API HTTP ${res.statusCode}: ${raw}`, res.statusCode));
+            const snippet = raw.length > MAX_ERROR_BODY_CHARS ? `${raw.slice(0, MAX_ERROR_BODY_CHARS)}...` : raw;
+            finishReject(
+              new BeaconApiError(
+                `Beacon API HTTP ${res.statusCode} on ${redactUrl(targetUrl)}: ${snippet}`,
+                res.statusCode
+              )
+            );
           }
         });
       }
     );
-    req.on('error', (err) => reject(new BeaconApiError(`Beacon API connection error: ${err.message}`, 0)));
+    req.on('error', (err) => {
+      finishReject(new BeaconApiError(`Beacon API connection error on ${redactUrl(targetUrl)}: ${err.message}`, 0));
+    });
     req.on('timeout', () => {
-      req.destroy(new BeaconApiError('Beacon API request timeout', 0));
+      const timeoutErr = new BeaconApiError(`Beacon API request timeout on ${redactUrl(targetUrl)}`, 0);
+      finishReject(timeoutErr);
+      req.destroy();
     });
     if (bodyStr !== null) {
       req.write(bodyStr);
@@ -78,6 +155,7 @@ function singleHttpRequest(method, targetUrl, headers, bodyStr, timeoutMs) {
 }
 
 async function requestRawUrl(method, targetUrl, headers = { Accept: 'application/json' }, payload = null, timeoutMs = 15000, maxAttempts = 3) {
+  validateApiUrl(targetUrl);
   const reqHeaders = { ...headers };
   const bodyStr = payload !== null ? JSON.stringify(payload) : null;
   if (bodyStr !== null) {
@@ -92,7 +170,7 @@ async function requestRawUrl(method, targetUrl, headers = { Accept: 'application
       return await singleHttpRequest(method, targetUrl, reqHeaders, bodyStr, timeoutMs);
     } catch (err) {
       lastErr = err;
-      if (err && err.statusCode >= 400 && err.statusCode < 500) {
+      if (err && err.statusCode >= 300 && err.statusCode < 500) {
         throw err;
       }
       if (attempt + 1 < attempts) {
@@ -127,8 +205,12 @@ async function notify(text, level = 'info', opts = {}) {
 }
 
 async function secret(name, { asPath = false } = {}) {
+  const cleanName = String(name || '').trim();
+  if (!cleanName) {
+    throw new Error('Secret name must not be empty');
+  }
   try {
-    const res = await requestJson('GET', `/secret/${encodeURIComponent(name)}`);
+    const res = await requestJson('GET', `/secret/${encodeURIComponent(cleanName)}`);
     if (asPath) return res.file_path;
     if (res.type === 'cookie_json') {
       if (Array.isArray(res.value) || (res.value && typeof res.value === 'object')) {
@@ -145,8 +227,8 @@ async function secret(name, { asPath = false } = {}) {
     if (res.type === 'file') return res.file_path;
     return res.value === undefined || res.value === null ? res.value : String(res.value);
   } catch (err) {
-    const envFile = process.env[`BEACON_SECRET_FILE_${name}`];
-    const secType = (process.env[`BEACON_SECRET_TYPE_${name}`] || 'text').trim().toLowerCase();
+    const envFile = process.env[`BEACON_SECRET_FILE_${cleanName}`];
+    const secType = (process.env[`BEACON_SECRET_TYPE_${cleanName}`] || 'text').trim().toLowerCase();
     if (asPath && envFile) return envFile;
     if (envFile && fs.existsSync(envFile)) {
       if (secType === 'file') return envFile;
@@ -176,20 +258,22 @@ async function cookies_expired(secretName, note = 'Куки устарели, т
 }
 
 async function ask(prompt, timeout = 300) {
+  const parsedTimeout = Number(timeout);
+  const safeTimeout = Number.isFinite(parsedTimeout) ? Math.max(1, Math.min(3600, Math.floor(parsedTimeout))) : 300;
   const createRes = await requestJson('POST', '/ask/create', {
     prompt: String(prompt),
-    timeout: Number(timeout),
+    timeout: safeTimeout,
   });
   const askId = createRes.ask_id;
   if (!askId) {
     throw new Error(`Failed to create ask: ${JSON.stringify(createRes)}`);
   }
 
-  const deadline = Date.now() + (Number(timeout) + 5) * 1000;
+  const deadline = Date.now() + (safeTimeout + 5) * 1000;
   while (Date.now() < deadline) {
     let pollRes;
     try {
-      pollRes = await requestJson('GET', `/ask/poll/${askId}`, null, 15000, 1);
+      pollRes = await requestJson('GET', `/ask/poll/${encodeURIComponent(String(askId))}`, null, 15000, 1);
     } catch (err) {
       if (err && (err.statusCode === 401 || err.statusCode === 403 || err.statusCode === 404)) {
         throw err;

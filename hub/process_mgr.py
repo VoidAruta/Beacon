@@ -351,7 +351,7 @@ def check_endpoint_health(
     if not host or (not allow_external and not _is_loopback_or_self_host(host)):
         return False, "blocked_external_healthcheck_host"
 
-    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "Beacon-Healthcheck/2.2"})
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "Beacon-Healthcheck/2.4"})
     try:
         with _NO_PROXY_OPENER.open(req, timeout=timeout) as resp:
             code = getattr(resp, "status", 200)
@@ -730,25 +730,41 @@ def _build_process_env(
     if venv_dir.exists():
         env["VIRTUAL_ENV"] = str(venv_dir)
 
-    # 3. Маркировка процессов для отлова сирот (_BEACON_PROJECT_ID / _BEACON_RUN_ID)
-    if project.get("id") is not None:
-        env["_BEACON_PROJECT_ID"] = str(project["id"])
-    if run_id is not None:
-        env["_BEACON_RUN_ID"] = str(run_id)
-
-    # 4. Проброс переменной PORT для веб-бэкендов и сервисов
+    # 3. Проброс переменной PORT для веб-бэкендов и сервисов
     proj_port = int(project.get("port") or 0)
     if proj_port > 0:
         env["PORT"] = str(proj_port)
 
-    # 5. Пользовательские переменные из project.env_json
+    # 4. Пользовательские переменные из project.env_json (с фильтрацией опасных/служебных ключей)
+    _blocked_env_keys = {
+        "_BEACON_PROJECT_ID",
+        "_BEACON_RUN_ID",
+        "BEACON_API_URL",
+        "BEACON_RUN_TOKEN",
+        "BEACON_INTERNAL_TOKEN",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "PYTHONSTARTUP",
+        "NODE_OPTIONS",
+    }
     try:
         proj_env = json.loads(project.get("env_json") or "{}")
         if isinstance(proj_env, dict):
             for k, v in proj_env.items():
-                env[str(k)] = str(v)
+                key_s = str(k).strip()
+                key_u = key_s.upper()
+                if not key_s or key_u in _blocked_env_keys or key_u.startswith(("_BEACON_", "BEACON_INTERNAL_")):
+                    continue
+                env[key_s] = str(v)
     except Exception:
         logger.exception("Некорректный env_json у проекта id=%s", project.get("id"))
+
+    # 5. Служебные переменные Beacon всегда устанавливаются ПОСЛЕ пользовательского env_json
+    if project.get("id") is not None:
+        env["_BEACON_PROJECT_ID"] = str(project["id"])
+    if run_id is not None:
+        env["_BEACON_RUN_ID"] = str(run_id)
 
     hub_port = str(get_runtime_port() or settings.get("port", "8050") or "8050")
     internal_url = f"http://127.0.0.1:{hub_port}/internal"

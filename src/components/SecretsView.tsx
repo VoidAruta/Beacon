@@ -77,6 +77,7 @@ export const SecretsView: React.FC<SecretsViewProps> = ({
   // Уведомления и ответы на 2FA
   const [askAnswers, setAskAnswers] = useState<Record<string, string>>({});
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [confirmDeleteSecretName, setConfirmDeleteSecretName] = useState<string | null>(null);
 
   const cookieFileInputRef = useRef<HTMLInputElement | null>(null);
   const secretFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -202,7 +203,7 @@ export const SecretsView: React.FC<SecretsViewProps> = ({
       setSelectedProjectsForNew([]);
       setFeedback({
         type: 'ok',
-        text: `Секрет «${cleanName}» сохранён с правами 0600 и включён в фильтр маскировки логов.`,
+        text: `Секрет «${cleanName}» сохранён в защищённом хранилище и включён в фильтр маскировки логов.`,
       });
     } catch (err: unknown) {
       setFeedback({
@@ -233,7 +234,7 @@ export const SecretsView: React.FC<SecretsViewProps> = ({
       setCookieJsonText('');
       setFeedback({
         type: 'ok',
-        text: `Профиль куки «${cleanName}» успешно импортирован (права 0600, статус «протухшие» сброшен).`,
+        text: `Профиль куки «${cleanName}» успешно импортирован в защищённое хранилище (статус «истекли» сброшен).`,
       });
     } catch (err: unknown) {
       setFeedback({
@@ -361,7 +362,7 @@ export const SecretsView: React.FC<SecretsViewProps> = ({
           </div>
           <div>
             <h2 className="text-base font-bold text-white flex flex-wrap items-center gap-2">
-              Хранилище секретов и профилей куки (0600)
+              Хранилище кук и секретов
               <span className="px-2 py-0.5 text-[10px] font-mono bg-emerald-950/80 text-emerald-300 border border-emerald-500/30 rounded">
                 Автомаскировка логов активна
               </span>
@@ -408,7 +409,7 @@ export const SecretsView: React.FC<SecretsViewProps> = ({
               1. Чтение в Python и Node.js
             </div>
             <p className="text-slate-300 leading-relaxed">
-              В коде проекта вызовите <code className="font-mono text-emerald-300">beacon.secret("имя")</code>. Для JSON-кук метод сразу вернёт готовый список словарей, а с параметром <code className="font-mono text-indigo-200">as_path=True</code> — путь к файлу <code className="font-mono">0600</code>.
+              В коде проекта вызовите <code className="font-mono text-emerald-300">beacon.secret("имя")</code>. Для JSON-кук метод сразу вернёт готовый список словарей, а с параметром <code className="font-mono text-indigo-200">as_path=True</code> — путь к защищённому файлу секрета.
             </p>
           </div>
           <div className="p-3 bg-[#0f172a]/90 border border-slate-800 rounded-lg space-y-1.5">
@@ -645,7 +646,7 @@ export const SecretsView: React.FC<SecretsViewProps> = ({
             disabled={importingCookies || !cookieSecretName.trim() || !cookiePreview?.valid}
             className="w-full py-2.5 text-xs font-semibold bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 rounded-lg transition-colors cursor-pointer"
           >
-            {importingCookies ? 'Сохранение 0600...' : 'Импортировать куки и сбросить флаг «Истекли»'}
+            {importingCookies ? 'Сохранение кук...' : 'Импортировать куки и сбросить флаг «Истекли»'}
           </button>
         </form>
 
@@ -791,7 +792,7 @@ export const SecretsView: React.FC<SecretsViewProps> = ({
             className="w-full py-2.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg inline-flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
           >
             <Plus className="w-4 h-4" />
-            {savingSecret ? 'Запись в data/secrets/...' : 'Сохранить секрет с правами 0600'}
+            {savingSecret ? 'Сохранение секрета...' : 'Сохранить секрет в хранилище'}
           </button>
         </form>
       </div>
@@ -1000,8 +1001,11 @@ export const SecretsView: React.FC<SecretsViewProps> = ({
                             )}
                           </div>
                         ) : (
-                          <span className="px-2 py-0.5 rounded bg-emerald-950/60 text-emerald-300 border border-emerald-500/30">
-                            Активен (0600)
+                          <span
+                            title="Защищённый файл: доступ на чтение и запись только у владельца (права Unix 0600)"
+                            className="px-2 py-0.5 rounded bg-emerald-950/60 text-emerald-300 border border-emerald-500/30"
+                          >
+                            Активен
                           </span>
                         )}
                       </td>
@@ -1039,14 +1043,36 @@ export const SecretsView: React.FC<SecretsViewProps> = ({
                           </button>
                         )}
 
-                        <button
-                          type="button"
-                          onClick={() => onDeleteSecret(s.name)}
-                          title="Удалить секрет"
-                          className="p-1.5 rounded bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30 inline-flex items-center cursor-pointer"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        {confirmDeleteSecretName === s.name ? (
+                          <span className="inline-flex items-center gap-1 font-sans">
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                setConfirmDeleteSecretName(null);
+                                await onDeleteSecret(s.name);
+                              }}
+                              className="px-2 py-1 rounded bg-red-600 hover:bg-red-500 text-white text-[11px] font-semibold cursor-pointer"
+                            >
+                              Удалить?
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteSecretName(null)}
+                              className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] cursor-pointer"
+                            >
+                              Отмена
+                            </button>
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteSecretName(s.name)}
+                            title="Удалить секрет"
+                            className="p-1.5 rounded bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30 inline-flex items-center cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                       </td>
                     </tr>
                   );

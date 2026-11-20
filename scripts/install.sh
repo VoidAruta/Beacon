@@ -13,6 +13,11 @@ set -euo pipefail
 BEACON_REPO_URL="${BEACON_REPO_URL:-https://github.com/VoidAruta/Beacon.git}"
 BEACON_PORT="${BEACON_PORT:-8050}"
 
+if ! [[ "$BEACON_PORT" =~ ^[0-9]+$ ]] || [ "$BEACON_PORT" -lt 1 ] || [ "$BEACON_PORT" -gt 65535 ]; then
+    echo "[!] Invalid BEACON_PORT='${BEACON_PORT}' (expected 1..65535)" >&2
+    exit 1
+fi
+
 # Detect if running from an existing checkout or piped via `curl ... | bash`
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 if [ -n "$SCRIPT_SOURCE" ] && [ -f "$SCRIPT_SOURCE" ]; then
@@ -56,7 +61,7 @@ fi
 if [ ! -f "${BEACON_DIR}/requirements.txt" ] || [ ! -d "${BEACON_DIR}/beacon" ]; then
     echo "[*] Cloning Beacon repository into ${BEACON_DIR}..."
     mkdir -p "$(dirname "${BEACON_DIR}")"
-    git clone --depth 1 "${BEACON_REPO_URL}" "${BEACON_DIR}"
+    git clone --depth 1 -- "${BEACON_REPO_URL}" "${BEACON_DIR}"
 fi
 
 # 3. Create unprivileged system user beacon-runner for child projects
@@ -109,6 +114,7 @@ if [ "$HAS_SYSTEMD" -eq 1 ]; then
     echo "[*] Generating and enabling systemd service (beacon.service)..."
     "${BEACON_DIR}/.venv/bin/python" -m beacon systemd >/dev/null
     cp "${BEACON_DIR}/data/generated/beacon.service" /etc/systemd/system/beacon.service
+    chmod 0644 /etc/systemd/system/beacon.service
     systemctl daemon-reload
     systemctl enable --now beacon.service
     echo "[+] Service beacon.service started via systemd!"

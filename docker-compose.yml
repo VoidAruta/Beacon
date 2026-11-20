@@ -10,6 +10,8 @@ services:
       - BEACON_PORT=8050
       - BEACON_TRUSTED_PROXIES=127.0.0.1/32
       - PYTHONUNBUFFERED=1
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - ./data:/opt/beacon/data
       - ./projects:/opt/beacon/projects

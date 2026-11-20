@@ -293,7 +293,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[{name}] " + (fmt % args), flush=True)
 
-server = HTTPServer(("0.0.0.0", PORT), ApiHandler)
+HOST = os.environ.get("HOST", "127.0.0.1")
+server = HTTPServer((HOST, PORT), ApiHandler)
 
 def _graceful_stop(signum, _frame):
     print(f"[{name}] Получен сигнал {{signum}}, корректная остановка HTTP-сервера...", flush=True)
@@ -356,8 +357,9 @@ process.on('SIGTERM', () => {{
   server.close(() => process.exit(0));
 }});
 
-server.listen(PORT, '0.0.0.0', () => {{
-  console.log('[{name}] Node.js HTTP API listening on http://127.0.0.1:' + PORT + ' (/health ready)');
+const HOST = process.env.HOST || '127.0.0.1';
+server.listen(PORT, HOST, () => {{
+  console.log('[{name}] Node.js HTTP API listening on http://' + HOST + ':' + PORT + ' (/health ready)');
 }});
 """,
             encoding="utf-8",
@@ -462,8 +464,9 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[{name}] " + (fmt % args), flush=True)
 
-print(f"[{name}] Запуск HTTP/API сервера на 127.0.0.1:{{PORT}} (/health готов)...", flush=True)
-HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+HOST = os.environ.get("HOST", "127.0.0.1")
+print(f"[{name}] Запуск HTTP/API сервера на {{HOST}}:{{PORT}} (/health готов)...", flush=True)
+HTTPServer((HOST, PORT), Handler).serve_forever()
 """
         elif proj_type == "service":
             code = f"""import os

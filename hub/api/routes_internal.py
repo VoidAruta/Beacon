@@ -22,9 +22,36 @@ from hub.db import execute_sql, log_audit, query_one
 from hub.notifier import send_notification
 from hub.secrets_mgr import get_secret_raw, mark_cookies_expired, validate_secret_name
 
+from collections import deque
+
 router = APIRouter(prefix="/internal")
 
 _KV_KEY_RE = re.compile(r"^[a-zA-Z0-9_.:-]{1,128}$")
+_NOTIFY_RATE_WINDOW_SEC = 60.0
+_NOTIFY_RATE_MAX_PER_PROJECT = 20
+_NOTIFY_MAX_TEXT_LEN = 4000
+_ASK_MAX_PROMPT_LEN = 1000
+_ASK_MAX_PENDING_PER_PROJECT = 10
+_NOTIFY_TIMESTAMPS: dict[int, deque[float]] = {}
+
+
+def reset_internal_rate_limits() -> None:
+    """Сбрасывает счётчики rate-limit внутреннего SDK (используется в тестах)."""
+    _NOTIFY_TIMESTAMPS.clear()
+
+
+def _check_notify_rate_limit(project_id: int) -> None:
+    now = time.monotonic()
+    bucket = _NOTIFY_TIMESTAMPS.setdefault(project_id, deque())
+    cutoff = now - _NOTIFY_RATE_WINDOW_SEC
+    while bucket and bucket[0] < cutoff:
+        bucket.popleft()
+    if len(bucket) >= _NOTIFY_RATE_MAX_PER_PROJECT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Превышен лимит уведомлений SDK ({_NOTIFY_RATE_MAX_PER_PROJECT}/мин на проект)",
+        )
+    bucket.append(now)
 
 
 def _authenticate_sdk_request(request: Request) -> dict[str, Any]:
@@ -87,6 +114,7 @@ def _validate_kv_key(key: str) -> str:
 @router.post("/notify")
 async def internal_notify(request: Request) -> dict[str, Any]:
     ctx = _authenticate_sdk_request(request)
+    _check_notify_rate_limit(int(ctx["project_id"]))
     body = await read_json(request)
     text = str(body.get("text", "")).strip()
     level = str(body.get("level", "info")).strip().lower()
@@ -94,6 +122,8 @@ async def internal_notify(request: Request) -> dict[str, Any]:
         level = "info"
     if not text:
         raise HTTPException(status_code=400, detail="Пустой текст уведомления")
+    if len(text) > _NOTIFY_MAX_TEXT_LEN:
+        text = text[:_NOTIFY_MAX_TEXT_LEN] + "… [truncated]"
 
     await send_notification(text=text, level=level, project_name=ctx["project_name"])
     return {"ok": True}
@@ -149,13 +179,25 @@ async def internal_cookies_expired(request: Request) -> dict[str, Any]:
 @router.post("/ask/create")
 async def internal_ask_create(request: Request) -> dict[str, Any]:
     ctx = _authenticate_sdk_request(request)
+    proj_id = int(ctx["project_id"])
+    pending_row = query_one(
+        "SELECT COUNT(*) AS cnt FROM pending_asks WHERE project_id = ? AND status = 'pending'",
+        (proj_id,),
+    )
+    if int((pending_row or {}).get("cnt") or 0) >= _ASK_MAX_PENDING_PER_PROJECT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Превышен лимит активных запросов beacon.ask() ({_ASK_MAX_PENDING_PER_PROJECT} на проект)",
+        )
     body = await read_json(request)
     prompt = str(body.get("prompt", "Введите код подтверждения:")).strip()
+    if len(prompt) > _ASK_MAX_PROMPT_LEN:
+        prompt = prompt[:_ASK_MAX_PROMPT_LEN] + "…"
     timeout = parse_int_param(body.get("timeout"), "timeout", default=300, min_val=5, max_val=3600)
 
     ask_id = await create_ask(
         run_id=int(ctx["run_id"]),
-        project_id=int(ctx["project_id"]),
+        project_id=proj_id,
         project_name=str(ctx["project_name"]),
         prompt=prompt,
         timeout=timeout,

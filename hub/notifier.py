@@ -2,7 +2,9 @@
 Отправка уведомлений (Telegram, ntfy, Webhook) с маршрутизацией через HTTP-прокси 127.0.0.1:10808.
 """
 
+import asyncio
 import ipaddress
+import re
 import socket
 import time
 import urllib.parse
@@ -11,14 +13,40 @@ from typing import Any, Optional
 from hub.compat import httpx
 from hub.db import get_all_settings, log_audit
 
+_TG_TOKEN_RE = re.compile(r"bot\d+:[A-Za-z0-9_-]{10,}")
+_URL_CREDS_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s@]+)@")
+_DISCORD_WEBHOOK_RE = re.compile(r"(/api/webhooks/\d+/)([^\s/?#]+)", re.IGNORECASE)
+_SLACK_WEBHOOK_RE = re.compile(r"(/services/)([A-Za-z0-9]+/[A-Za-z0-9]+/[A-Za-z0-9]+)", re.IGNORECASE)
+
+
+def _redact_tg_token(text: str) -> str:
+    return _TG_TOKEN_RE.sub("bot***REDACTED***", str(text or ""))
+
+
+def _redact_outbound_secrets(text: str) -> str:
+    """Скрывает токены Telegram/Discord/Slack и учётные данные прокси перед сохранением в журнал/UI."""
+    out = _redact_tg_token(text)
+    out = _URL_CREDS_RE.sub(r"\1***@", out)
+    out = _DISCORD_WEBHOOK_RE.sub(r"\1***", out)
+    out = _SLACK_WEBHOOK_RE.sub(r"\1***/***/***", out)
+    return out
+
+
 # Кольцевой буфер последних отправленных уведомлений для диагностики и проверки в UI
 RECENT_NOTIFICATIONS: list[dict[str, Any]] = []
 MAX_RECENT_NOTIFICATIONS = 50
 
 
+def _is_forbidden_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        ip_obj = ip_obj.ipv4_mapped
+    return bool(ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_unspecified or ip_obj.is_multicast)
+
+
 def _is_safe_outbound_webhook_url(raw_url: str) -> tuple[bool, str]:
     """
-    Проверяет URL исходящего вебхука/ntfy на защиту от SSRF (блокирует loopback, link-local metadata 169.254.169.254, 0.0.0.0).
+    Проверяет URL исходящего вебхука/ntfy на защиту от SSRF
+    (блокирует loopback, link-local metadata 169.254.169.254, 0.0.0.0 и IPv4-mapped IPv6 вроде ::ffff:127.0.0.1).
     """
     url = (raw_url or "").strip()
     if not url:
@@ -37,7 +65,7 @@ def _is_safe_outbound_webhook_url(raw_url: str) -> tuple[bool, str]:
 
     try:
         ip_obj = ipaddress.ip_address(host)
-        if ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_unspecified or ip_obj.is_multicast:
+        if _is_forbidden_ip(ip_obj):
             return False, f"IP-адрес {host} запрещён политикой SSRF"
     except ValueError:
         try:
@@ -45,7 +73,7 @@ def _is_safe_outbound_webhook_url(raw_url: str) -> tuple[bool, str]:
             for info in infos:
                 addr_str = str(info[4][0]).split("%")[0]
                 ip_obj = ipaddress.ip_address(addr_str)
-                if ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_unspecified or ip_obj.is_multicast:
+                if _is_forbidden_ip(ip_obj):
                     return False, f"DNS-резолв {host} -> {addr_str} запрещён политикой SSRF"
         except socket.gaierror:
             pass
@@ -64,12 +92,12 @@ def _record_notification_event(
     event = {
         "timestamp": int(time.time()),
         "channel": channel,
-        "title": title,
+        "title": _redact_outbound_secrets(title),
         "text": text,
         "level": level,
-        "proxy_used": proxy_used or "",
+        "proxy_used": _redact_outbound_secrets(proxy_used or ""),
         "delivered": delivered,
-        "detail": detail,
+        "detail": _redact_outbound_secrets(detail),
     }
     RECENT_NOTIFICATIONS.insert(0, event)
     if len(RECENT_NOTIFICATIONS) > MAX_RECENT_NOTIFICATIONS:
@@ -114,7 +142,7 @@ async def send_telegram_message(
         payload["reply_markup"] = reply_markup
 
     try:
-        async with httpx.AsyncClient(proxy=proxy_url, timeout=10.0) as client:
+        async with httpx.AsyncClient(proxy=proxy_url, timeout=10.0, follow_redirects=False) as client:
             resp = await client.post(url, json=payload)
             data = resp.json() if resp.status_code == 200 else {}
             ok = bool(resp.status_code == 200 and data.get("ok"))
@@ -137,7 +165,7 @@ async def send_telegram_message(
             "error",
             proxy_url,
             False,
-            f"Ошибка прокси/сети ({proxy_url or 'direct'}): {e}",
+            f"Ошибка прокси/сети ({_redact_outbound_secrets(proxy_url or 'direct')}): {_redact_outbound_secrets(str(e))}",
         )
         return None
 
@@ -194,7 +222,12 @@ async def send_notification(
     tg_proxy = proxy_default if (cfg.get("tg_use_proxy", "0") == "1" and proxy_default) else None
     msg_id = await send_telegram_message(full_text, settings=cfg)
     results["channels"].append(
-        {"channel": "telegram", "proxy": tg_proxy, "message_id": msg_id, "configured": bool(cfg.get("tg_bot_token"))}
+        {
+            "channel": "telegram",
+            "proxy": _redact_outbound_secrets(tg_proxy) if tg_proxy else None,
+            "message_id": msg_id,
+            "configured": bool(cfg.get("tg_bot_token")),
+        }
     )
 
     # 2. ntfy
@@ -203,30 +236,34 @@ async def send_notification(
     if ntfy_url and ntfy_topic:
         ntfy_proxy = proxy_default if cfg.get("ntfy_use_proxy", "0") == "1" else None
         target = f"{ntfy_url}/{ntfy_topic}"
-        safe_url, safe_reason = _is_safe_outbound_webhook_url(target)
+        safe_url, safe_reason = await asyncio.to_thread(_is_safe_outbound_webhook_url, target)
         if not safe_url:
             _record_notification_event("ntfy", target, full_text, level, ntfy_proxy, False, f"SSRF Guard: {safe_reason}")
             results["channels"].append({"channel": "ntfy", "ok": False, "error": safe_reason})
         else:
+            safe_title = re.sub(r"[\r\n]+", " ", f"Beacon {project_name or 'Alert'}").strip()[:120]
             try:
-                async with httpx.AsyncClient(proxy=ntfy_proxy, timeout=10.0) as client:
+                async with httpx.AsyncClient(proxy=ntfy_proxy, timeout=10.0, follow_redirects=False) as client:
                     resp = await client.post(
                         target,
                         content=full_text.encode("utf-8"),
-                        headers={"Title": f"Beacon {project_name or 'Alert'}", "Priority": "high" if level in ("error", "crash", "oom") else "default"},
+                        headers={"Title": safe_title, "Priority": "high" if level in ("error", "crash", "oom") else "default"},
                     )
                     ok = 200 <= resp.status_code < 300
                     _record_notification_event("ntfy", target, full_text, level, ntfy_proxy, ok, f"HTTP {resp.status_code}")
-                    results["channels"].append({"channel": "ntfy", "ok": ok, "proxy": ntfy_proxy})
+                    results["channels"].append(
+                        {"channel": "ntfy", "ok": ok, "proxy": _redact_outbound_secrets(ntfy_proxy) if ntfy_proxy else None}
+                    )
             except Exception as e:
-                _record_notification_event("ntfy", target, full_text, level, ntfy_proxy, False, str(e))
-                results["channels"].append({"channel": "ntfy", "ok": False, "error": str(e)})
+                err_safe = _redact_outbound_secrets(str(e))
+                _record_notification_event("ntfy", target, full_text, level, ntfy_proxy, False, err_safe)
+                results["channels"].append({"channel": "ntfy", "ok": False, "error": err_safe})
 
     # 3. Универсальный Webhook (Discord / Slack / Mattermost / n8n / Custom JSON)
     webhook_url = cfg.get("webhook_url", "").strip()
     if webhook_url:
         wh_proxy = proxy_default if cfg.get("webhook_use_proxy", "0") == "1" else None
-        safe_wh, wh_reason = _is_safe_outbound_webhook_url(webhook_url)
+        safe_wh, wh_reason = await asyncio.to_thread(_is_safe_outbound_webhook_url, webhook_url)
         if not safe_wh:
             _record_notification_event("webhook", webhook_url, full_text, level, wh_proxy, False, f"SSRF Guard: {wh_reason}")
             results["channels"].append({"channel": "webhook", "ok": False, "error": wh_reason})
@@ -253,14 +290,17 @@ async def send_notification(
                     "timestamp": int(time.time()),
                 }
             try:
-                async with httpx.AsyncClient(proxy=wh_proxy, timeout=10.0) as client:
+                async with httpx.AsyncClient(proxy=wh_proxy, timeout=10.0, follow_redirects=False) as client:
                     resp = await client.post(webhook_url, json=payload)
                     ok = 200 <= resp.status_code < 300
                     _record_notification_event("webhook", webhook_url, full_text, level, wh_proxy, ok, f"HTTP {resp.status_code}")
-                    results["channels"].append({"channel": "webhook", "ok": ok, "proxy": wh_proxy})
+                    results["channels"].append(
+                        {"channel": "webhook", "ok": ok, "proxy": _redact_outbound_secrets(wh_proxy) if wh_proxy else None}
+                    )
             except Exception as e:
-                _record_notification_event("webhook", webhook_url, full_text, level, wh_proxy, False, str(e))
-                results["channels"].append({"channel": "webhook", "ok": False, "error": str(e)})
+                err_safe = _redact_outbound_secrets(str(e))
+                _record_notification_event("webhook", webhook_url, full_text, level, wh_proxy, False, err_safe)
+                results["channels"].append({"channel": "webhook", "ok": False, "error": err_safe})
 
     log_audit("127.0.0.1", f"NOTIFY_{level.upper()}", f"{project_name or 'System'}: {text[:180]}")
     return results

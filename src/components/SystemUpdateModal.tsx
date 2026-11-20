@@ -185,7 +185,7 @@ export const SystemUpdateModal: React.FC<SystemUpdateModalProps> = ({
               {t('Текущая версия', 'Current Version')}
             </div>
             <div className="text-sm font-bold text-white font-mono mt-0.5 flex items-center gap-2">
-              <span>v{status?.version || '2.2.0'}</span>
+              <span>v{status?.version || '2.4.0'}</span>
               <span className="px-1.5 py-0.5 text-[10px] rounded bg-emerald-950/60 text-emerald-300 border border-emerald-800/60">
                 Stable
               </span>

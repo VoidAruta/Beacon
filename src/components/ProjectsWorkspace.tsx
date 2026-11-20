@@ -65,6 +65,7 @@ import {
   LogLevelFilter,
   normalizeProjectGroupTag,
   parseDotEnvText,
+  resolveNextSelectedRunId,
   ReverseProxyProvider,
   SCHEDULE_PRESETS,
 } from '../utils/hubLogic';
@@ -111,6 +112,7 @@ interface ProjectsWorkspaceProps {
   onRefreshAll: () => void;
   onOpenSecretsVault?: () => void;
   apiFetch: (path: string, options?: RequestInit) => Promise<Response>;
+  userRole?: string;
 }
 
 const DEFAULT_COOKIE_SAMPLE = JSON.stringify(
@@ -146,8 +148,10 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   onRefreshAll,
   onOpenSecretsVault,
   apiFetch,
+  userRole = 'admin',
 }) => {
   const { lang, t } = useI18n();
+  const canOperate = userRole === 'admin' || userRole === 'operator';
   const [subTab, setSubTab] = useState<WorkspaceSubTab>(initialSubTab);
 
   // Адаптивная компоновка рабочей области (экономия места на экране: консоль логов сбоку по умолчанию)
@@ -235,14 +239,35 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   const editorTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const editorGutterRef = useRef<HTMLPreElement | null>(null);
 
-  // История запусков и живой лог (с пагинацией Audit #17)
+  // История запусков и живой лог (с пагинацией Audit #17 + автопереключение на новый лог при перезапуске)
   const [runs, setRuns] = useState<RunItem[]>([]);
   const [visibleRunsCount, setVisibleRunsCount] = useState<number>(DEFAULTS.RUNS_PAGE_SIZE);
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null);
+  const [autoSwitchNewRun, setAutoSwitchNewRun] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('beacon_auto_switch_new_run');
+      return saved === null ? true : saved === 'true';
+    } catch {
+      return true;
+    }
+  });
+  const autoSwitchNewRunRef = useRef<boolean>(autoSwitchNewRun);
+  const latestRunIdRef = useRef<number | null>(null);
+  const pendingSwitchToNewRunRef = useRef<boolean>(false);
   const [logText, setLogText] = useState<string>('');
+  const [copiedLog, setCopiedLog] = useState<boolean>(false);
   const [stdinInput, setStdinInput] = useState<string>('');
   const [stdinStatus, setStdinStatus] = useState<string>('');
   const logBoxRef = useRef<HTMLPreElement | null>(null);
+
+  useEffect(() => {
+    autoSwitchNewRunRef.current = autoSwitchNewRun;
+    try {
+      localStorage.setItem('beacon_auto_switch_new_run', String(autoSwitchNewRun));
+    } catch {
+      // ignore storage quota errors
+    }
+  }, [autoSwitchNewRun]);
 
   // Вкладка 2: Куки, HTTP-проверка и Telegram
   const [cookieSecretName, setCookieSecretName] = useState<string>('');
@@ -570,6 +595,10 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     setGitInfo(null);
     setGitStatusMsg('');
 
+    latestRunIdRef.current = null;
+    pendingSwitchToNewRunRef.current = false;
+    setSelectedRunId(null);
+
     loadProjectFiles(activeProj.id);
     loadProjectRuns(activeProj.id);
     loadProjectKv(activeProj.id);
@@ -749,27 +778,38 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   // Защищённые обёртки действий над процессом (Audit #2, #3, #12)
   const triggerStartProjectSafe = useCallback(
     async (projId: number, params?: Record<string, string>) => {
-      if (procActionBusy) return;
+      if (procActionBusy || !canOperate) return;
       setProcActionBusy('start');
       try {
-        await onStartProject(projId, params);
+        const resData = await onStartProject(projId, params);
         setDirtyDeployMap((prev) => {
           const next = { ...prev };
           delete next[projId];
           return next;
         });
+        if (autoSwitchNewRunRef.current) {
+          const newRunId = Number(resData?.run?.id || 0);
+          if (newRunId > 0) {
+            setSelectedRunId(newRunId);
+            latestRunIdRef.current = newRunId;
+            setBottomConsoleTab('logs');
+          } else {
+            pendingSwitchToNewRunRef.current = true;
+          }
+        }
+        await loadProjectRuns(projId);
       } catch (err: any) {
         setFileStatus(`Ошибка запуска: ${err?.message || 'Сбой сети'}`);
       } finally {
         setProcActionBusy(null);
       }
     },
-    [onStartProject, procActionBusy]
+    [onStartProject, procActionBusy, canOperate]
   );
 
   const triggerStopProjectSafe = useCallback(
     async (projId: number) => {
-      if (procActionBusy) return;
+      if (procActionBusy || !canOperate) return;
       setProcActionBusy('stop');
       try {
         await onStopProject(projId);
@@ -778,33 +818,45 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
           delete next[projId];
           return next;
         });
+        await loadProjectRuns(projId);
       } catch (err: any) {
         setFileStatus(`Ошибка остановки: ${err?.message || 'Сбой сети'}`);
       } finally {
         setProcActionBusy(null);
       }
     },
-    [onStopProject, procActionBusy]
+    [onStopProject, procActionBusy, canOperate]
   );
 
   const triggerRestartProjectSafe = useCallback(
     async (projId: number) => {
-      if (procActionBusy) return;
+      if (procActionBusy || !canOperate) return;
       setProcActionBusy('restart');
       try {
-        await onRestartProject(projId);
+        const resData = await onRestartProject(projId);
         setDirtyDeployMap((prev) => {
           const next = { ...prev };
           delete next[projId];
           return next;
         });
+        if (autoSwitchNewRunRef.current) {
+          const newRunId = Number(resData?.run?.id || 0);
+          if (newRunId > 0) {
+            setSelectedRunId(newRunId);
+            latestRunIdRef.current = newRunId;
+            setBottomConsoleTab('logs');
+          } else {
+            pendingSwitchToNewRunRef.current = true;
+          }
+        }
+        await loadProjectRuns(projId);
       } catch (err: any) {
         setFileStatus(`Ошибка перезапуска: ${err?.message || 'Сбой сети'}`);
       } finally {
         setProcActionBusy(null);
       }
     },
-    [onRestartProject, procActionBusy]
+    [onRestartProject, procActionBusy, canOperate]
   );
 
   const loadProjectKv = async (projId: number) => {
@@ -1397,11 +1449,25 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
         const list: RunItem[] = await res.json();
         setRuns(list);
         if (list.length > 0) {
-          setSelectedRunId((prev) => {
-            if (prev && list.some((r) => r.id === prev)) return prev;
-            return list[0].id;
-          });
+          const runIds = list.map((r) => r.id);
+          const prevLatest = latestRunIdRef.current;
+          const forceLatest = pendingSwitchToNewRunRef.current && autoSwitchNewRunRef.current;
+          latestRunIdRef.current = runIds[0];
+          if (forceLatest && runIds[0] !== prevLatest) {
+            pendingSwitchToNewRunRef.current = false;
+          }
+          setSelectedRunId((prev) =>
+            resolveNextSelectedRunId(
+              runIds,
+              prev,
+              prevLatest,
+              autoSwitchNewRunRef.current,
+              forceLatest
+            )
+          );
         } else {
+          latestRunIdRef.current = null;
+          pendingSwitchToNewRunRef.current = false;
           setSelectedRunId(null);
           setLogText('Запусков ещё не было. Нажмите «Запустить сейчас» в шапке проекта.');
         }
@@ -1559,7 +1625,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     }
 
     setSavingCookiesBusy(true);
-    setCookieSaveStatus('Сохранение в сейф и запись cookies.json (0600)...');
+    setCookieSaveStatus('Сохранение в защищённое хранилище и запись cookies.json...');
     try {
       const res = await apiFetch(`/api/projects/${activeProj.id}/cookies`, {
         method: 'POST',
@@ -1579,7 +1645,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
       setCfgSelectedSecrets(updatedSecrets);
       onRefreshAll();
       loadProjectFiles(activeProj.id, activeFilePath);
-      setCookieSaveStatus(`Куки сохранены в «${cookieSecretName.trim()}» (права 0600) и подключены к проекту!`);
+      setCookieSaveStatus(`Куки сохранены в защищённом хранилище «${cookieSecretName.trim()}» и подключены к проекту!`);
     } catch (err: any) {
       setCookieSaveStatus(`Ошибка сети при сохранении кук: ${err?.message || 'Сбой сети'}`);
     } finally {
@@ -1974,7 +2040,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     setCfgStatus(
       `Импортировано переменных из .env: ${parsed.count}${
         parsed.secretCandidates.length > 0
-          ? ` (обнаружено чувствительных ключей: ${parsed.secretCandidates.join(', ')} — рекомендуем перенести в Сейф 0600)`
+          ? ` (обнаружено чувствительных ключей: ${parsed.secretCandidates.join(', ')} — рекомендуем перенести в Сейф секретов)`
           : ''
       }`
     );
@@ -2000,7 +2066,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
         handleDeleteEnvVar(envKey);
         onRefreshAll();
         setCfgStatus(
-          `Ключ «${envKey}» перенесён в защищённый Сейф (0600) как «${secretName}» и привязан к проекту!`
+          `Ключ «${envKey}» перенесён в защищённый Сейф секретов как «${secretName}» и привязан к проекту!`
         );
       } else {
         const err = await res.json().catch(() => ({}));
@@ -3326,6 +3392,47 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                             </option>
                           ))}
                         </select>
+                        <button
+                          type="button"
+                          data-testid="toggle-auto-switch-run"
+                          aria-pressed={autoSwitchNewRun}
+                          onClick={() => setAutoSwitchNewRun((v) => !v)}
+                          title={
+                            autoSwitchNewRun
+                              ? 'Автопереключение лога включено: при перезапуске проекта консоль автоматически откроет новый лог. Нажмите, чтобы отключить.'
+                              : 'Автопереключение лога выключено: при перезапуске консоль останется на выбранном старом логе. Нажмите, чтобы включить.'
+                          }
+                          className={`px-2 py-1 rounded-lg text-[11px] font-medium border inline-flex items-center gap-1 transition-colors cursor-pointer ${
+                            autoSwitchNewRun
+                              ? 'bg-indigo-600/25 border-indigo-500/60 text-indigo-200 hover:bg-indigo-600/35'
+                              : 'bg-[#111622] border-[#1e2638] text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          <Zap className="w-3 h-3" />
+                          <span>Авто-лог</span>
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="copy-console-log-btn"
+                          onClick={async () => {
+                            try {
+                              await navigator.clipboard.writeText(logText || '');
+                              setCopiedLog(true);
+                              setTimeout(() => setCopiedLog(false), 1600);
+                            } catch {
+                              // ignore clipboard errors in restricted contexts
+                            }
+                          }}
+                          className={`p-1 border rounded-lg cursor-pointer transition-colors ${
+                            copiedLog
+                              ? 'text-emerald-300 bg-emerald-950/60 border-emerald-500/50'
+                              : 'text-slate-300 hover:text-white bg-[#111622] border-[#1e2638]'
+                          }`}
+                          title={copiedLog ? 'Лог скопирован в буфер обмена' : 'Копировать текущий лог в буфер обмена'}
+                          aria-label="Копировать лог"
+                        >
+                          {copiedLog ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                        </button>
                         <button
                           type="button"
                           onClick={() => {
@@ -6048,7 +6155,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                         <span>Быстрая настройка сетевой авторизации проекта «{activeProj.name}»</span>
                       </div>
                       <p className="text-[11px] text-slate-400">
-                        Здесь настраиваются куки, прокси и Telegram-переменные конкретно для этого проекта. Все ключи шифруются и сохраняются в едином глобальном хранилище Beacon (<code className="font-mono text-slate-300">chmod 0600</code>).
+                        Здесь настраиваются куки, прокси и Telegram-переменные конкретно для этого проекта. Все ключи хранятся в защищённом хранилище Beacon (доступно только владельцу сервера).
                       </p>
                     </div>
                     {onOpenSecretsVault && (
@@ -6070,7 +6177,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                         <div>
                           <h3 className="text-sm font-bold text-white flex items-center gap-2">
                             <Cookie className="w-4 h-4 text-amber-400" />
-                            Куки авторизации (Cookie-Editor JSON · 0600)
+                            Куки авторизации (Cookie-Editor JSON)
                           </h3>
                           <p className="text-xs text-slate-400">
                             Хранятся в защищённом файле и читаются скриптом через <code className="text-indigo-300">beacon.secret(&quot;{cookieSecretName}&quot;)</code>

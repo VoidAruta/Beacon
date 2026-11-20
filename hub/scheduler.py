@@ -430,15 +430,47 @@ def get_upcoming_runs(limit: int = 5) -> list[dict[str, Any]]:
     return upcoming[:limit]
 
 
+def _redact_heartbeat_url(raw_url: str) -> str:
+    """Скрывает логин/пароль, секретные сегменты пути (UUID/push-токены) и query-параметры heartbeat URL перед логированием."""
+    try:
+        from urllib.parse import urlparse
+
+        p = urlparse(str(raw_url or ""))
+        if not p.scheme or not p.hostname:
+            return "***REDACTED***"
+        host_port = f"{p.hostname}:{p.port}" if p.port else p.hostname
+        parts = [seg for seg in (p.path or "").split("/") if seg]
+        if not parts:
+            return f"{p.scheme}://{host_port}/"
+        if len(parts) == 1:
+            return f"{p.scheme}://{host_port}/***"
+        return f"{p.scheme}://{host_port}/{'/'.join(parts[:-1])}/***"
+    except Exception:
+        return "***REDACTED***"
+
+
 def _ping_outbound_heartbeat_sync(url: str) -> None:
     if not url or not url.startswith(("http://", "https://")):
         return
+    from hub.notifier import _is_safe_outbound_webhook_url, _redact_outbound_secrets
+
+    safe_label = _redact_heartbeat_url(url)
+    safe, reason = _is_safe_outbound_webhook_url(url)
+    if not safe:
+        logger.warning("Исходящий heartbeat заблокирован политикой SSRF (%s): %s", safe_label, reason)
+        return
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+            return None
+
     try:
-        req = urllib.request.Request(url, method="GET", headers={"User-Agent": "Beacon-Heartbeat/2.2"})
-        with urllib.request.urlopen(req, timeout=5.0):
+        opener = urllib.request.build_opener(_NoRedirect())
+        req = urllib.request.Request(url, method="GET", headers={"User-Agent": "Beacon-Heartbeat/2.4"})
+        with opener.open(req, timeout=5.0):
             pass
     except Exception as exc:
-        logger.warning("Ошибка отправки исходящего heartbeat на %s: %s", url, exc)
+        logger.warning("Ошибка отправки исходящего heartbeat на %s: %s", safe_label, _redact_outbound_secrets(str(exc)))
 
 
 async def scheduler_tick(now: float | None = None) -> None:
@@ -587,6 +619,11 @@ async def scheduler_tick(now: float | None = None) -> None:
     hb_projects = query_all(
         "SELECT id, name, heartbeat_interval_sec, heartbeat_grace_sec, last_ping_at, created_at, updated_at, health_status FROM projects WHERE heartbeat_interval_sec > 0"
     )
+    active_hb_ids = {int(hp["id"]) for hp in hb_projects}
+    for old_hb_id in list(_HEARTBEAT_ALERTED.keys()):
+        if old_hb_id not in active_hb_ids:
+            del _HEARTBEAT_ALERTED[old_hb_id]
+
     now_int = int(now)
     for hp in hb_projects:
         pid = int(hp["id"])
@@ -608,6 +645,14 @@ async def scheduler_tick(now: float | None = None) -> None:
                     level="warn",
                     project_name=hp["name"],
                 )
+
+    # Очистка устаревших записей удалённых проектов из in-memory словарей (контроль бюджета ОЗУ < 80 МБ)
+    if _SERVICE_BACKOFF or _JOB_RETRIES or _SERVICE_CRON_RESTARTS:
+        existing_ids = {int(r["id"]) for r in query_all("SELECT id FROM projects")}
+        for cache_dict in (_SERVICE_BACKOFF, _JOB_RETRIES, _SERVICE_CRON_RESTARTS):
+            for stale_id in list(cache_dict.keys()):
+                if stale_id not in existing_ids:
+                    del cache_dict[stale_id]
 
 
 async def scheduler_loop() -> None:

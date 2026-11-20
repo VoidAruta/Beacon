@@ -353,10 +353,21 @@ except ImportError:
         def json(self) -> Any:
             return json.loads(self.text) if self.text else {}
 
+    class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+            return None
+
     class _FallbackAsyncClient:
-        def __init__(self, proxy: Optional[str] = None, timeout: float = 15.0, **kwargs: Any):
+        def __init__(
+            self,
+            proxy: Optional[str] = None,
+            timeout: float = 15.0,
+            follow_redirects: bool = True,
+            **kwargs: Any,
+        ):
             self.proxy = proxy
             self.timeout = float(timeout)
+            self.follow_redirects = bool(follow_redirects)
 
         async def __aenter__(self) -> "_FallbackAsyncClient":
             return self
@@ -384,12 +395,15 @@ except ImportError:
                 data_bytes = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
                 req_headers.setdefault("Content-Type", "application/json; charset=utf-8")
 
+            handlers: list[Any] = []
             if self.proxy:
-                handler = urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy})
+                handlers.append(urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy}))
             else:
-                handler = urllib.request.ProxyHandler({})
+                handlers.append(urllib.request.ProxyHandler({}))
+            if not self.follow_redirects:
+                handlers.append(_NoRedirectHandler())
 
-            opener = urllib.request.build_opener(handler)
+            opener = urllib.request.build_opener(*handlers)
             req = urllib.request.Request(url, data=data_bytes, headers=req_headers, method=method.upper())
             try:
                 with opener.open(req, timeout=self.timeout) as resp:

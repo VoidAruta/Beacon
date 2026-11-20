@@ -15,11 +15,11 @@ from typing import Any
 
 from hub.auth import get_internal_token, is_default_password, was_untrusted_proxy_header_seen
 from hub.compat import psutil
-from hub.config import BASE_DIR, DATA_DIR, INTERNAL_TOKEN_PATH, SECRETS_DIR, ensure_directories
+from hub.config import BASE_DIR, DATA_DIR, INTERNAL_TOKEN_PATH, SECRETS_DIR, SESSION_SECRET_PATH, ensure_directories
 from hub.db import checkpoint_wal, db_session, get_all_settings
 from hub.disk_guard import get_disk_status
 from hub.env_detect import get_environment_profile
-from hub.web_auth_mgr import check_proxy_reachable, get_poco_hardware_status
+from hub.web_auth_mgr import _redact_proxy_creds, check_proxy_reachable, get_poco_hardware_status
 
 
 def _check_cmd_version(cmd: list[str]) -> str:
@@ -143,9 +143,11 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
     secret_files = list(SECRETS_DIR.iterdir()) if SECRETS_DIR.exists() else []
     if INTERNAL_TOKEN_PATH.exists():
         secret_files.append(INTERNAL_TOKEN_PATH)
+    if SESSION_SECRET_PATH.exists():
+        secret_files.append(SESSION_SECRET_PATH)
 
     for f_path in secret_files:
-        if not f_path.is_file():
+        if f_path.is_symlink() or not f_path.is_file():
             continue
         try:
             mode = f_path.stat().st_mode & 0o777
@@ -216,11 +218,14 @@ def run_hub_doctor(auto_fix_perms: bool = True) -> dict[str, Any]:
 
     # 5. Доступность локального прокси 127.0.0.1:10808
     proxy_url = settings.get("proxy_url", "http://127.0.0.1:10808")
+    proxy_display = _redact_proxy_creds(proxy_url) if proxy_url else "не задан"
     proxy_st = check_proxy_reachable(proxy_url, timeout=0.4)
+    if isinstance(proxy_st, dict) and "proxy_url" in proxy_st:
+        proxy_st = {**proxy_st, "proxy_url": _redact_proxy_creds(str(proxy_st.get("proxy_url") or ""))}
     checks.append(
         {
             "id": "proxy_bridge",
-            "title": f"Локальный прокси-туннель ({proxy_url or 'не задан'})",
+            "title": f"Локальный прокси-туннель ({proxy_display})",
             "status": "ok" if proxy_st["online"] else "warn",
             "summary": (
                 f"Прокси {proxy_st['host']}:{proxy_st['port']} доступен (задержка {proxy_st['latency_ms']} мс)."

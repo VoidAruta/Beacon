@@ -18,8 +18,43 @@ from hub.db import execute_sql, get_all_settings, get_setting, log_audit, query_
 from hub.notifier import send_notification
 from hub.secrets_mgr import import_cookie_editor_json
 
+import re
+import secrets as _secrets
+
 # Активные сессии проверки HTTP-ответа и заголовков Set-Cookie (по project_id)
 ACTIVE_WEB_AUTH_SESSIONS: dict[int, dict[str, Any]] = {}
+_WEB_AUTH_SESSION_TTL_SEC = 1800
+_PROXY_CREDS_RE = re.compile(r"([a-zA-Z0-9+.-]+://)([^/\s:@]+):([^/\s@]+)@")
+
+
+def _redact_proxy_creds(text: str) -> str:
+    """Маскирует логин и пароль прокси (scheme://user:pass@host) в ответах и логах."""
+    return _PROXY_CREDS_RE.sub(r"\1***:***@", text or "")
+
+
+def write_private_file_atomic(target: Path, content: str) -> None:
+    """Атомарно записывает конфиденциальный файл с правами 0600, блокируя симлинки."""
+    if target.is_symlink():
+        raise ValueError(f"Отказ записи в символическую ссылку: {target.name}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.parent / f".{target.name}.{_secrets.token_hex(6)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(tmp_path), flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, target)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 # Кулдауны уведомлений аппаратной защиты (чтобы не спамить в Telegram)
 _LAST_HW_ALERT_TS: dict[str, float] = {
@@ -542,8 +577,17 @@ async def start_web_auth_session(
                 if e_idx > s_idx:
                     page_title = text_sample[s_idx:e_idx].strip()[:80] or page_title
     except Exception as e:
-        error_note = str(e)
+        error_note = _redact_proxy_creds(str(e))
 
+    now_ts = int(time.time())
+    stale_pids = [
+        pid for pid, sess in ACTIVE_WEB_AUTH_SESSIONS.items()
+        if now_ts - int(sess.get("started_at", 0) or 0) > _WEB_AUTH_SESSION_TTL_SEC
+    ]
+    for pid in stale_pids:
+        ACTIVE_WEB_AUTH_SESSIONS.pop(pid, None)
+
+    safe_proxy_label = _redact_proxy_creds(active_proxy) if active_proxy else "Без прокси"
     session_data: dict[str, Any] = {
         "project_id": project_id,
         "project_name": proj["name"],
@@ -552,11 +596,11 @@ async def start_web_auth_session(
         "page_title": page_title,
         "http_status": http_status,
         "proxy_mode": proxy_mode,
-        "proxy_used": active_proxy or "Без прокси",
+        "proxy_used": safe_proxy_label,
         "user_agent": ua,
         "cookies": fetched_cookies,
         "local_storage": {},
-        "started_at": int(time.time()),
+        "started_at": now_ts,
         "error": error_note,
         "last_action": (
             f"HTTP {http_status}: получено {len(fetched_cookies)} Set-Cookie с {domain}"
@@ -628,11 +672,7 @@ async def save_and_close_web_auth_session(project_id: int) -> dict[str, Any]:
     workdir = Path(proj["workdir"])
     workdir.mkdir(parents=True, exist_ok=True)
     cookies_file = workdir / "cookies.json"
-    cookies_file.write_text(cookies_raw, encoding="utf-8")
-    try:
-        os.chmod(cookies_file, 0o600)
-    except OSError:
-        pass
+    write_private_file_atomic(cookies_file, cookies_raw)
 
     return {
         "ok": True,

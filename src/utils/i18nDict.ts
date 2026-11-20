@@ -380,8 +380,8 @@ export const EXACT_RU_TO_EN: Record<string, string> = {
   'Здесь настраиваются куки, прокси и Telegram-переменные конкретно для этого проекта. Все ключи шифруются и сохраняются в едином глобальном хранилище Beacon (':
     'Configure cookies, proxy, and Telegram variables specifically for this project. All secrets are stored in the global Beacon Vault (',
   'Открыть глобальный Сейф секретов (Alt+3)': 'Open Global Secrets Vault (Alt+3)',
-  'Куки авторизации (Cookie-Editor JSON · 0600)': 'Auth Cookies (Cookie-Editor JSON · 0600)',
-  'Хранятся в защищённом файле и читаются скриптом через': 'Stored with 0600 permissions and read by your script via',
+  'Куки авторизации (Cookie-Editor JSON · 0600)': 'Auth Cookies (Cookie-Editor JSON)',
+  'Хранятся в защищённом файле и читаются скриптом через': 'Stored in a protected file and read by your script via',
   'Загрузить .json': 'Upload .json',
   'Имя секрета в Сейфе': 'Secret Name in Vault',
   'Вставить шаблон Cookie JSON': 'Insert Sample Cookie JSON',
@@ -798,7 +798,17 @@ export const EXACT_RU_TO_EN: Record<string, string> = {
   'Пометить куки устаревшими (тест алерта)': 'Mark cookies as expired (test alert)',
   'Удалить секрет': 'Delete secret',
   'Безопасное хранение API-ключей, JSON-кук из браузера и привязка доступа к проектам без проброса в открытый':
-    'Secure 0600 storage for API keys, browser Cookie-Editor JSON, and per-project ACL binding without exposing secrets in plain',
+    'Secure storage for API keys, browser Cookie-Editor JSON, and per-project ACL binding without exposing secrets in plain',
+  'Хранилище кук и секретов': 'Cookies & Secrets Vault',
+  'Сохранить секрет в хранилище': 'Save Secret to Vault',
+  'Сохранение секрета...': 'Saving secret...',
+  'Сохранение кук...': 'Saving cookies...',
+  'Авто-лог': 'Auto-log',
+  'Копировать лог': 'Copy Log',
+  'Сохранить параметры автобэкапа': 'Save Auto-Backup Settings',
+  'Копировать юнит': 'Copy Unit',
+  'Юнит скопирован!': 'Unit Copied!',
+  'Обновить журнал аудита': 'Refresh audit log',
   'Всего:': 'Total:',
   'Куки JSON:': 'Cookie JSON:',
   'Ключи/Файлы:': 'Keys/Files:',
@@ -807,6 +817,7 @@ export const EXACT_RU_TO_EN: Record<string, string> = {
   'beacon.secret("имя")': 'beacon.secret("name")',
   '. Для JSON-кук метод сразу вернёт готовый список словарей, а с параметром':
     '. For Cookie JSON it returns a ready list of dicts, or with',
+  '— путь к защищённому файлу секрета.': '— the path to the protected secret file.',
   '— путь к файлу': '— the path to the',
   'В целях безопасности проект видит только те секреты, которые ему разрешены. Привязать секрет к проекту можно прямо при создании ниже или в колонке «Доступ проектов (ACL)» в таблице.':
     'For security, a project can only read secrets explicitly granted to it. Bind secrets during creation below or in the "Project Access (ACL)" column.',
@@ -824,7 +835,10 @@ export const EXACT_RU_TO_EN: Record<string, string> = {
   'Сырые значения никогда не передаются обратно в браузер (':
     'Raw secret values are never sent back to the browser (',
   'ИСТЕКЛИ (требуют обновления)': 'EXPIRED (update required)',
-  'Активен (0600)': 'Active (0600)',
+  'Активен': 'Active',
+  'Активен (0600)': 'Active',
+  'Удалить?': 'Delete?',
+  'Отозвать?': 'Revoke?',
   'Заменить': 'Replace',
   'Истёк': 'Expired',
   'Распознано кук:': 'Cookies parsed:',
@@ -1314,7 +1328,8 @@ export const EXACT_RU_TO_EN: Record<string, string> = {
   'Перейти: Проекты и Консоль — IDE & Логи (Alt+2)': 'Go to: Projects & Console — IDE & Logs (Alt+2)',
   'Редактор кода с подсветкой, файловый менеджер, расписание и живые логи сбоку':
     'Syntax-highlighted code editor, file explorer, schedule builder, and side-by-side live logs',
-  'Перейти: Куки и Секреты 0600 (Alt+3)': 'Go to: Cookies & Secrets Vault 0600 (Alt+3)',
+  'Перейти: Куки и Секреты (Alt+3)': 'Go to: Cookies & Secrets (Alt+3)',
+  'Перейти: Куки и Секреты 0600 (Alt+3)': 'Go to: Cookies & Secrets (Alt+3)',
   'Импорт Cookie-Editor JSON, API-ключи и привязка секретов к проектам':
     'Cookie-Editor JSON import, API keys, and per-project secret ACL bindings',
   'Перейти: Доступ ИИ — MCP и /api/v1/ (Alt+4)': 'Go to: AI Access — MCP & /api/v1/ (Alt+4)',
@@ -1581,14 +1596,14 @@ export const EXACT_RU_TO_EN: Record<string, string> = {
   'Поддерживает стандарт JSON-RPC 2.0 (методы initialize, tools/list, tools/call). Агент может самостоятельно смотреть статус сервера, читать замаскированные логи, править файлы проектов, устанавливать зависимости и перезапускать сервисы.':
     'Implements JSON-RPC 2.0 Streamable HTTP MCP (initialize, tools/list, tools/call). Agents can inspect server health, read redacted logs, edit project files, install dependencies, and restart services.',
   'Гранулярные права (Scopes) и привязка к проектам': 'Granular Scopes & Project Whitelisting',
-  'Каждому токену можно выдать только нужные права: read (чтение статуса и логов), process (запуск/остановка), files (чтение/запись кода), secrets_acl (привязка секретов без чтения их значений) и опасный admin.':
-    'Grant each token only the scopes it needs: read (status & redacted logs), files:read, files:write, run (start/stop/install_deps), schedule, create_project, and ask_reply.',
+  'Каждому токену можно выдать только нужные права: read (статус, логи, Prometheus /api/metrics), files:read, files:write (с unified diff), run (старт/стоп/зависимости), schedule:write, templates:create и ask:answer, а также ограничить список проектов и IP/CIDR.':
+    'Grant each token only the scopes it needs: read (status, logs, Prometheus /api/metrics), files:read, files:write (with unified diff), run (start/stop/deps), schedule:write, templates:create, and ask:answer, plus project & IP/CIDR allowlists.',
   'Ручное подтверждение опасных операций (Human-in-the-Loop)': 'Human-in-the-Loop Approval Queue for Write/Run Actions',
-  'Если для токена включён флаг «Требовать подтверждение опасных действий», попытка удалить проект или остановить сервис создаст заявку в очереди во вкладке «Доступ ИИ (MCP)» и уведомление в Telegram.':
-    'Unless a project is on the token’s auto-approve list, file modifications (with unified diff) and process control requests are placed in the approval queue in "AI Access (MCP)" and sent to Telegram.',
+  'Запись файлов (с показом unified diff и проверкой конфликта версий base_sha256), изменение расписания и ответы на 2FA создают заявку в очереди во вкладке «Доступ ИИ (MCP)», если проект не добавлен явно в auto_approve_projects.':
+    'File writes (with unified diff and base_sha256 conflict detection), schedule edits, and 2FA answers create a pending request in "AI Access (MCP)" unless the project is listed in auto_approve_projects.',
   'Кнопка мгновенной блокировки (Kill-Switch)': 'Instant Emergency Kill-Switch',
-  'Во вкладке «Доступ ИИ (MCP)» доступна кнопка экстренной паузы, которая в один клик блокирует все запросы по всем токенам без их удаления.':
-    'The "AI Access (MCP)" tab and top header include a 1-click Kill-Switch that immediately blocks all requests across all AI tokens without revoking them.',
+  'Во вкладке «Доступ ИИ (MCP)» и в шапке панели доступна кнопка экстренной паузы (python3 -m beacon ai-pause), которая в один клик блокирует все запросы по всем токенам без их удаления.':
+    'The "AI Access (MCP)" tab, header bar, and CLI (python3 -m beacon ai-pause) include a 1-click Kill-Switch that immediately blocks all requests across all AI tokens without revoking them.',
   'Подключение в Claude Code (CLI)': 'Connecting Claude Code (CLI)',
   'Конфигурация для Cursor / Windsurf (mcp.json)': 'Configuration for Cursor / Windsurf (mcp.json)',
   'Защита панели в локальной сети и через VPN Tailscale, разделение прав пользователей (viewer / operator / admin) и установка службы Linux.':
@@ -1606,10 +1621,10 @@ export const EXACT_RU_TO_EN: Record<string, string> = {
   'Как обновлять Beacon из Git-репозитория в пару кликов с автоматическим бэкапом без остановки запущенных проектов, переключать язык RU/EN и проверять окружение по типу проекта.':
     'How to update Beacon from Git in 2 clicks with automatic backup and zero downtime for running projects, switch UI language (RU/EN), and use adaptive environment actions.',
   'Открыть Проекты и Консоль': 'Open Projects & Console',
-  'Обновление панели в 2 клика (кнопка «v2.2 / Обновить» в верхней шапке)':
-    '2-Click Panel Self-Update ("v2.2 / Update" button in the top header)',
-  'Нажмите на кнопку версии «v2.2 / Обновить» в правом верхнем углу панели: Шаг 1 проверяет наличие свежих коммитов в Git-репозитории (git fetch), а Шаг 2 создаёт резервный архив в data/backups/, выполняет git pull --ff-only, применяет миграции SQLite и переподхватывает работающие проекты без их остановки.':
-    'Click the "v2.2 / Update" button in the top-right header: Step 1 checks the remote Git repository for new commits (git fetch), and Step 2 creates a safety backup in data/backups/, runs git pull --ff-only, applies SQLite migrations, and re-attaches surviving project processes without stopping them.',
+  'Обновление панели в 2 клика (кнопка «v2.4 / Обновить» в верхней шапке)':
+    '2-Click Panel Self-Update ("v2.4 / Update" button in the sidebar)',
+  'Нажмите на кнопку версии «v2.4 / Обновить» в боковой/верхней панели: Шаг 1 проверяет наличие свежих коммитов в Git-репозитории (git fetch), а Шаг 2 создаёт резервный архив в data/backups/, выполняет git pull --ff-only, применяет миграции SQLite и переподхватывает работающие проекты без их остановки.':
+    'Click the "v2.4 / Update" button in the sidebar: Step 1 checks the remote Git repository for new commits (git fetch), and Step 2 creates a safety backup in data/backups/, runs git pull --ff-only, applies SQLite migrations, and re-attaches surviving project processes without stopping them.',
   'Кнопка RU | EN в верхней панели мгновенно переключает язык навигации, шапки, модального окна обновления и кнопок управления проектами между русским и английским (выбор сохраняется в браузере).':
     'The RU | EN toggle in the top header instantly switches the entire interface between Russian and English (persisted in localStorage).',
   'Умная кнопка окружения и быстрый переключатель стека (python / node / bash)':
@@ -1684,6 +1699,22 @@ export const EXACT_RU_TO_EN: Record<string, string> = {
     '6. Supervisor Memory Footprint python3 -m beacon (< 80 MB RSS)',
   'Cookie-Editor JSON импортирован (0600), тип в Python: list[dict] (1 шт.), триггер баннера is_expired=1 подтверждён.':
     'Cookie-Editor JSON imported (0600), Python type: list[dict] (1 item), banner trigger is_expired=1 verified.',
+  'Стоп всех?': 'Stop all?',
+  'Рестарт всех?': 'Restart all?',
+  'Подтвердить': 'Confirm',
+  'Отправляет сообщение в настроенные каналы панели (Telegram, Discord, Slack, ntfy, Webhook) с указанием имени проекта и уровня важности (info, warn, error).':
+    'Sends a message to configured alert channels (Telegram, Discord, Slack, ntfy, Webhook) tagged with the project name and severity level (info, warn, error).',
+  'Встроенная защита SDK (Loopback и без редиректов)': 'Built-in SDK Safeguards (Loopback & No Redirects)',
+  'SDK по умолчанию отправляет BEACON_RUN_TOKEN строго на локальный адрес (127.0.0.1/localhost/::1), не следует HTTP-редиректам (3xx), ограничивает размер ответа 16 МБ и маскирует токены в сообщениях об ошибках.':
+    'By default, the SDK sends BEACON_RUN_TOKEN strictly to loopback (127.0.0.1/localhost/::1), refuses HTTP 3xx redirects, caps response size at 16 MB, and redacts credentials/tokens in error messages.',
+  '4. Куки, Секреты и интерактивный 2FA': '4. Cookies, Secrets & Interactive 2FA',
+  'Как безопасно хранить токены (доступ на диске только владельцу), импортировать куки из браузера через Cookie-Editor и автоматически скрывать секреты в логах.':
+    'How to store tokens safely (owner-only disk access), import browser cookies via Cookie-Editor, and automatically redact secrets in logs.',
+  'У каждого проекта есть уникальный токен вебхука для запуска из GitHub Actions, GitLab или внешних сервисов. При включении HMAC-секрета панель проверяет подпись заголовка X-Beacon-Signature: sha256=<hex> и передаёт тело запроса в BEACON_WEBHOOK_PAYLOAD.':
+    'Each project gets a unique webhook token for triggering runs from GitHub Actions, GitLab, or external services. When an HMAC secret is set, Beacon verifies X-Beacon-Signature: sha256=<hex> and passes the payload via BEACON_WEBHOOK_PAYLOAD.',
+  'Автопереключение консоли на свежий запуск и защита массовых действий': 'Auto-Switch Console Logs & Batch Action Confirmation',
+  'В консоли проекта переключатель «Автопереключение лога» автоматически открывает новый лог при перезапуске проекта. На дашборде массовые «Стоп» и «Рестарт» для группы проектов защищены встроенным 2-шаговым подтверждением.':
+    'In the project console, the "Auto-switch log" toggle automatically opens the new log when you restart a project. On the dashboard, batch Stop and Restart for multiple projects require inline 2-step confirmation.',
 };
 
 // Ordered phrase & regex replacements for composite / dynamic strings (template literals, split JSX nodes, Doctor & Acceptance reports)

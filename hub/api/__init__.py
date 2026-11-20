@@ -270,7 +270,7 @@ except ImportError:
             return lambda f: self._add_route("DELETE", path, f)
 
     class FastAPI(APIRouter):
-        def __init__(self, title: str = "Beacon", version: str = "2.2.0", **kwargs: Any):
+        def __init__(self, title: str = "Beacon", version: str = "2.4.0", **kwargs: Any):
             super().__init__(prefix="")
             self.title = title
             self.version = version

@@ -24,6 +24,7 @@ import pwd
 import re
 import secrets
 import shutil
+import subprocess
 import tempfile
 import time
 import zipfile
@@ -76,7 +77,7 @@ from hub.config import (
     parse_reserved_ports,
     validate_project_name,
 )
-from hub.db import execute_sql, get_all_settings, get_setting, log_audit, query_all, query_one, set_setting
+from hub.db import execute_sql, get_all_settings, get_setting, init_db, log_audit, query_all, query_one, set_setting
 from hub.disk_guard import cleanup_system_caches, get_disk_status
 from hub.doctor import run_hub_doctor
 from hub.env_detect import get_environment_profile
@@ -106,6 +107,9 @@ from hub.scheduler import (
 
 logger = get_logger("routes_ui")
 _PANEL_STARTED_AT = time.time()
+_AUTH_SCRYPT_SEMAPHORE = asyncio.Semaphore(4)
+_MAX_EDITOR_FILE_BYTES = 2 * 1024 * 1024
+_SAFE_GIT_BRANCH_RE = re.compile(r"^[A-Za-z0-9._/\-]{1,120}$")
 from hub.secrets_mgr import (
     delete_secret,
     get_secret_raw,
@@ -201,9 +205,15 @@ def _mask_url_userinfo(url_str: str) -> str:
 
 
 def _cookie_security_flags(request: Request) -> tuple[bool, str]:
+    direct_ip = request.client.host if getattr(request, "client", None) else "127.0.0.1"
+    trusted_csv = (get_setting("trusted_proxies", "") or "").strip()
+    trust_xfp = (
+        os.environ.get("BEACON_PREVIEW_MODE") == "1"
+        or (bool(trusted_csv) and _ip_in_cidr_csv(direct_ip, trusted_csv))
+    )
     is_https = (
         getattr(getattr(request, "url", None), "scheme", "http") == "https"
-        or request.headers.get("x-forwarded-proto", "").lower() == "https"
+        or (trust_xfp and request.headers.get("x-forwarded-proto", "").lower() == "https")
         or get_setting("cookie_secure", "0") == "1"
     )
     samesite_mode = "None" if (is_https and os.environ.get("BEACON_PREVIEW_MODE") == "1") else "Lax"
@@ -750,29 +760,31 @@ async def api_login(request: Request) -> Response:
     authenticated_user = "admin"
     auth_ok = False
 
-    if username in ("", "admin"):
-        stored_hash = get_setting("password_hash", "")
-        if verify_password(password, stored_hash):
-            auth_ok = True
-            authenticated_role = "admin"
-            authenticated_user = "admin"
-            if needs_password_rehash(stored_hash):
-                set_setting("password_hash", hash_password(password))
-    else:
-        user_row = query_one("SELECT * FROM users WHERE username = ?", (username,))
-        if user_row:
-            if verify_password(password, user_row["password_hash"]):
+    async with _AUTH_SCRYPT_SEMAPHORE:
+        if username in ("", "admin"):
+            stored_hash = get_setting("password_hash", "")
+            if await asyncio.to_thread(verify_password, password, stored_hash):
                 auth_ok = True
-                authenticated_role = str(user_row.get("role") or "viewer")
-                authenticated_user = str(user_row["username"])
-                if needs_password_rehash(str(user_row["password_hash"])):
-                    execute_sql(
-                        "UPDATE users SET password_hash = ? WHERE id = ?",
-                        (hash_password(password), int(user_row["id"])),
-                    )
+                authenticated_role = "admin"
+                authenticated_user = "admin"
+                if needs_password_rehash(stored_hash):
+                    set_setting("password_hash", await asyncio.to_thread(hash_password, password))
         else:
-            # Выравнивание времени ответа при несуществующем пользователе (P1-2)
-            verify_dummy_password(password)
+            user_row = query_one("SELECT * FROM users WHERE username = ?", (username,))
+            if user_row:
+                if await asyncio.to_thread(verify_password, password, user_row["password_hash"]):
+                    auth_ok = True
+                    authenticated_role = str(user_row.get("role") or "viewer")
+                    authenticated_user = str(user_row["username"])
+                    if needs_password_rehash(str(user_row["password_hash"])):
+                        new_h = await asyncio.to_thread(hash_password, password)
+                        execute_sql(
+                            "UPDATE users SET password_hash = ? WHERE id = ?",
+                            (new_h, int(user_row["id"])),
+                        )
+            else:
+                # Выравнивание времени ответа при несуществующем пользователе (P1-2)
+                await asyncio.to_thread(verify_dummy_password, password)
 
     if not auth_ok:
         now_blocked, block_sec = record_login_failure(client_ip, username)
@@ -911,11 +923,10 @@ async def api_auth_me(request: Request) -> Response:
             }
         )
 
-    # Фаза A.1(б): поле initial_password_file полностью убрано из ответа /api/auth/me
+    # Фаза A.1(б): без авторизации не раскрываем ни initial_password_file, ни статус стандартного пароля
     return JSONResponse(
         {
             "authenticated": False,
-            "is_default_password": default_pw,
             "must_change_password": False,
         },
         status_code=401,
@@ -1201,7 +1212,7 @@ def _build_dashboard_payload_sync(mask_sensitive: bool) -> dict[str, Any]:
     pending_ai_approvals_count = int((pending_approvals_row or {}).get("cnt") or 0)
 
     proxy_url = get_setting("proxy_url", "")
-    shown_proxy_url = _mask_url_userinfo(proxy_url) if mask_sensitive else proxy_url
+    shown_proxy_url = _mask_url_userinfo(proxy_url) if proxy_url else ""
     default_pw = is_default_password()
     net_telemetry = _get_network_telemetry(projects)
     return {
@@ -1323,9 +1334,8 @@ async def api_create_project(request: Request) -> dict[str, Any]:
     use_proxy = 1 if body.get("use_proxy", tpl_info["use_proxy"]) else 0
     ram_limit_mb = parse_int_param(body.get("ram_limit_mb"), "ram_limit_mb", default=0, min_val=0)
     proj_port = parse_int_param(body.get("port"), "port", default=0, min_val=0, max_val=65535)
-    reserved = parse_reserved_ports(get_setting("reserved_ports", ""))
-    if proj_port > 0 and proj_port in reserved:
-        raise HTTPException(status_code=400, detail=f"Порт {proj_port} указан в списке зарезервированных портов (reserved_ports)")
+    if proj_port > 0:
+        _validate_project_port(proj_port)
 
     healthcheck_url = str(body.get("healthcheck_url", "")).strip()
     healthcheck_interval_sec = parse_int_param(body.get("healthcheck_interval_sec"), "healthcheck_interval_sec", default=30, min_val=5)
@@ -2051,7 +2061,12 @@ async def api_export_project_zip(request: Request, project_id: int) -> Response:
                         rel_dir = str(root_p.relative_to(target_root)).rstrip("/") + "/"
                         zf.writestr(rel_dir, b"")
                     for fn in files:
-                        if fn in skip_files:
+                        fn_low = fn.lower()
+                        if (
+                            fn_low in skip_files
+                            or fn_low.startswith(".env.")
+                            or fn_low.endswith((".pem", ".key", ".session", ".p12", ".pfx"))
+                        ):
                             continue
                         fp = root_p / fn
                         try:
@@ -2164,6 +2179,12 @@ async def api_import_project_archive(request: Request) -> dict[str, Any]:
         imp_sexpr = ""
     cmd = str(yaml_cfg.get("cmd", "python3 main.py"))
 
+    # Безопасность импорта ZIP: не привязываем автоматически существующие секреты Beacon и отключаем autostart
+    requested_secrets = yaml_cfg.get("secrets", [])
+    if not isinstance(requested_secrets, list):
+        requested_secrets = []
+    requested_secrets = [str(s) for s in requested_secrets if str(s).strip()]
+
     now = int(time.time())
     proj_id = execute_sql(
         """INSERT INTO projects (
@@ -2182,7 +2203,7 @@ async def api_import_project_archive(request: Request) -> dict[str, Any]:
             cmd,
             str(workdir),
             json.dumps(yaml_cfg.get("env", {}), ensure_ascii=False),
-            json.dumps(yaml_cfg.get("secrets", []), ensure_ascii=False),
+            "[]",
             1 if yaml_cfg.get("use_proxy") else 0,
             int(yaml_cfg.get("ram_limit_mb", 0) or 0),
             imp_port,
@@ -2191,7 +2212,7 @@ async def api_import_project_archive(request: Request) -> dict[str, Any]:
             imp_sexpr,
             secrets.token_hex(16),
             secrets.token_hex(16),
-            1 if yaml_cfg.get("autostart") else 0,
+            0,
             restart_policy,
             int(yaml_cfg.get("min_uptime_sec", 10) or 10),
             int(yaml_cfg.get("max_restarts", 10) or 10),
@@ -2202,7 +2223,12 @@ async def api_import_project_archive(request: Request) -> dict[str, Any]:
         ),
     )
     row = query_one("SELECT * FROM projects WHERE id = ?", (proj_id,))
-    return {"ok": True, "extracted_files": extracted, "project": _enrich_project(row or {})}
+    return {
+        "ok": True,
+        "extracted_files": extracted,
+        "requested_secrets": requested_secrets,
+        "project": _enrich_project(row or {}),
+    }
 
 
 @router.get("/projects/{project_id}/kv")
@@ -2428,13 +2454,14 @@ async def api_save_project_cookies(request: Request, project_id: int) -> dict[st
         )
 
     try:
+        from hub.web_auth_mgr import write_private_file_atomic
+
         local_cookie_path = Path(proj["workdir"]) / "cookies.json"
-        local_cookie_path.write_text(
+        write_private_file_atomic(
+            local_cookie_path,
             raw_json if isinstance(raw_json, str) else json.dumps(raw_json, indent=2, ensure_ascii=False),
-            encoding="utf-8",
         )
-        os.chmod(local_cookie_path, 0o600)
-    except OSError:
+    except (OSError, ValueError):
         pass
 
     updated_proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
@@ -2992,7 +3019,7 @@ async def api_project_git_pull(request: Request, project_id: int) -> dict[str, A
     _invalidate_dir_size_cache(workdir)
 
     restarted = False
-    if rc == 0 and (restart_after or is_project_running(project_id)):
+    if rc == 0 and restart_after:
         if is_project_running(project_id):
             await stop_project(project_id)
         await start_project_run(project_id, trigger="manual")
@@ -3385,9 +3412,15 @@ async def api_get_file_content(request: Request, project_id: int) -> dict[str, A
     target = _safe_project_path(proj["workdir"], rel_path)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail=f"Файл '{rel_path}' не найден")
+    file_size = target.stat().st_size
+    if file_size > _MAX_EDITOR_FILE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Файл слишком большой для встроенного редактора ({file_size // (1024 * 1024)} МБ > лимит 2 МБ)",
+        )
 
     content = target.read_text(encoding="utf-8", errors="replace")
-    return {"path": rel_path, "content": content, "size": target.stat().st_size}
+    return {"path": rel_path, "content": content, "size": file_size}
 
 
 def _snapshot_dir_for_file(workdir: Path, rel_path: str) -> Path:
@@ -4612,7 +4645,7 @@ async def api_analytics_summary(request: Request) -> dict[str, Any]:
             elif st == "killed_oom":
                 oom_cnt += 1
                 fail_cnt += 1
-            elif st == "killed_timeout":
+            elif st in ("timeout", "killed_timeout"):
                 timeout_cnt += 1
                 fail_cnt += 1
             elif st == "crash_loop":
@@ -5282,21 +5315,23 @@ def _inspect_git_update_status(check_remote: bool = False) -> dict[str, Any]:
     """Проверяет статус Git-репозитория панели Beacon и наличие новых коммитов в remote."""
     default_repo = get_setting("git_repo_url", "https://github.com/VoidAruta/Beacon.git") or "https://github.com/VoidAruta/Beacon.git"
     git_dir = BASE_DIR / ".git"
+    from hub import __version__ as _beacon_ver
+
     info: dict[str, Any] = {
         "ok": True,
-        "version": "2.2.0",
+        "version": _beacon_ver,
         "git_available": False,
         "is_git_repo": git_dir.exists(),
         "branch": "main",
         "commit": "standalone",
-        "commit_subject": "Локальная сборка Beacon v2.2.0",
+        "commit_subject": f"Локальная сборка Beacon v{_beacon_ver}",
         "remote_url": default_repo,
         "has_update": False,
         "behind_count": 0,
         "remote_commits": [],
         "dirty_files": 0,
         "checked_at": int(time.time()),
-        "message": "Установлена актуальная версия Beacon v2.2.0",
+        "message": f"Установлена актуальная версия Beacon v{_beacon_ver}",
     }
 
     try:
@@ -5411,7 +5446,25 @@ def _inspect_git_update_status(check_remote: bool = False) -> dict[str, Any]:
 @router.get("/system/update_status")
 async def api_system_update_status(request: Request) -> dict[str, Any]:
     check_remote = request.query_params.get("check_remote", "0") in ("1", "true", "yes")
+    if check_remote:
+        _require_admin_session(request)
     return await asyncio.to_thread(_inspect_git_update_status, check_remote)
+
+
+def _validate_self_update_git_params(repo_url: str, branch: str) -> tuple[str, str]:
+    clean_repo = (repo_url or "").strip()
+    if clean_repo:
+        if clean_repo.startswith("-") or not _SAFE_GIT_URL_RE.match(clean_repo):
+            raise HTTPException(status_code=400, detail="Недопустимый URL Git-репозитория (разрешены только https://, http://, ssh://, git@)")
+    clean_branch = (branch or "main").strip()
+    if (
+        not clean_branch
+        or clean_branch.startswith("-")
+        or ".." in clean_branch
+        or not _SAFE_GIT_BRANCH_RE.match(clean_branch)
+    ):
+        raise HTTPException(status_code=400, detail="Недопустимое имя Git-ветки")
+    return clean_repo, clean_branch
 
 
 def _execute_self_update_sync(repo_url_override: str = "", branch_override: str = "") -> dict[str, Any]:
@@ -5446,14 +5499,14 @@ def _execute_self_update_sync(repo_url_override: str = "", branch_override: str 
         try:
             if repo_url_override.strip():
                 subprocess.run(
-                    ["git", "remote", "set-url", "origin", target_repo],
+                    ["git", "remote", "set-url", "origin", "--", target_repo],
                     cwd=str(BASE_DIR),
                     capture_output=True,
                     text=True,
                     timeout=4,
                 )
             pull_res = subprocess.run(
-                ["git", "pull", "--ff-only", "origin", branch],
+                ["git", "pull", "--ff-only", "origin", "--", branch],
                 cwd=str(BASE_DIR),
                 capture_output=True,
                 text=True,
@@ -5477,7 +5530,7 @@ def _execute_self_update_sync(repo_url_override: str = "", branch_override: str 
     # Шаг 3: Миграция схемы SQLite и перезагрузка кеша редактирования секретов
     init_db()
     reload_redaction_cache()
-    steps_log.append("[3/4] Схема SQLite (WAL) и кеш безопасности 0600 проверены и синхронизированы")
+    steps_log.append("[3/4] Схема SQLite (WAL) и кеш маскировки секретов проверены и синхронизированы")
 
     # Шаг 4: Бесшовный перехват выживших процессов (Direct FD без SIGPIPE)
     rec = recover_running_processes()
@@ -5503,15 +5556,15 @@ async def api_system_self_update(request: Request) -> dict[str, Any]:
         body = await request.json()
     except Exception:
         body = {}
-    repo_url = str(body.get("repo_url") or "") if isinstance(body, dict) else ""
-    branch = str(body.get("branch") or "") if isinstance(body, dict) else ""
+    raw_repo = str(body.get("repo_url") or "") if isinstance(body, dict) else ""
+    raw_branch = str(body.get("branch") or "") if isinstance(body, dict) else ""
+    repo_url, branch = _validate_self_update_git_params(raw_repo, raw_branch)
     res = await asyncio.to_thread(_execute_self_update_sync, repo_url, branch)
     log_audit(
-        actor=_actor_name(request),
-        action="system.self_update",
-        target=res.get("status", {}).get("commit", "HEAD"),
-        details=f"backup={res.get('backup_file')}, recovered={res.get('recovered')}",
-        ip=getattr(request.state, "client_ip", "127.0.0.1"),
+        _client_ip(request),
+        "SYSTEM_SELF_UPDATE",
+        f"commit={res.get('status', {}).get('commit', 'HEAD')}, backup={res.get('backup_file')}, recovered={res.get('recovered')}",
+        actor=_session_actor(request),
     )
     return res
 

@@ -407,7 +407,12 @@ async def _execute_ai_action_direct(action: str, payload: dict[str, Any]) -> dic
         proj = _find_project(payload.get("project"))
         if not proj:
             raise ValueError("Проект не найден")
-        dep_argv = build_install_deps_command(Path(proj["workdir"]), str(proj["runtime"]))
+        dep_argv = build_install_deps_command(
+            Path(proj["workdir"]),
+            str(proj["runtime"]),
+            project_type=str(proj.get("type") or "service"),
+            port=int(proj.get("port") or 0),
+        )
         run = await start_project_run(int(proj["id"]), trigger="ai", custom_argv=dep_argv)
         return {"ok": True, "action": "install_dependencies", "project": proj["name"], "run_id": run["id"]}
 
@@ -589,6 +594,8 @@ async def dispatch_ai_tool(
             target = _safe_ai_project_path(proj["workdir"], rel_path)
             if not target.exists() or not target.is_file():
                 raise FileNotFoundError(f"Файл '{rel_path}' не найден")
+            if target.stat().st_size > 2 * 1024 * 1024:
+                raise ValueError("Файл превышает максимальный размер для чтения через ИИ (2 МБ)")
             raw_text = target.read_text(encoding="utf-8", errors="replace")
             wrapped = _wrap_untrusted(raw_text, f"project:{proj['name']}/file:{rel_path}")
             _log_ai_audit(token_row, client_ip, tool_name, args, "ok", f"Read {rel_path} ({len(raw_text)} chars)")
@@ -1052,7 +1059,7 @@ async def mcp_streamable_http_endpoint(request: Request) -> Response:
                     "result": {
                         "protocolVersion": "2025-03-26",
                         "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
-                        "serverInfo": {"name": "beacon-mcp-server", "version": "2.2.0"},
+                        "serverInfo": {"name": "beacon-mcp-server", "version": "2.4.0"},
                     },
                 }
             )
@@ -1179,7 +1186,7 @@ async def mcp_info_endpoint(request: Request) -> Response:
             "protocol": "mcp-streamable-http",
             "protocolVersion": "2025-03-26",
             "server": "beacon-mcp-server",
-            "version": "2.2.0",
+            "version": "2.4.0",
             "tools_count": len(MCP_TOOLS_SPEC),
         }
     )
@@ -1211,7 +1218,7 @@ async def api_v1_openapi_spec(request: Request) -> dict[str, Any]:
         "openapi": "3.1.0",
         "info": {
             "title": "Beacon Control Panel AI & Automation API",
-            "version": "2.2.0",
+            "version": "2.4.0",
             "description": "Стабильный REST API (/api/v1/) и MCP (/mcp) с поддержкой Bearer-токенов, областей прав (scopes) и очереди подтверждения.",
         },
         "components": {
@@ -1567,9 +1574,12 @@ async def api_ai_list_approvals(request: Request) -> list[dict[str, Any]]:
     rows = query_all("SELECT * FROM ai_approvals ORDER BY created_at DESC LIMIT 50")
     for r in rows:
         try:
-            r["payload"] = json.loads(r.get("payload_json") or "{}")
+            payload_obj = json.loads(r.get("payload_json") or "{}")
         except Exception:
-            r["payload"] = {}
+            payload_obj = {}
+        if r.get("action") == "answer_ask" and isinstance(payload_obj, dict) and "answer" in payload_obj:
+            payload_obj = {**payload_obj, "answer": "***REDACTED***"}
+        r["payload"] = payload_obj
         try:
             r["result"] = json.loads(r.get("result_json") or "{}")
         except Exception:

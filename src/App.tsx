@@ -53,10 +53,10 @@ const TAB_META: Record<
     subtitleEn: 'Syntax code editor, project.yaml, isolated cookies, crash-loop protection, and live SSE logs',
   },
   secrets: {
-    title: 'Куки проектов и Секреты (0600)',
-    subtitle: 'Импорт куки Cookie-Editor с инспектором доменов, хранение API-ключей и привязка доступа по проектам',
-    titleEn: 'Project Cookies & Secrets Vault (0600)',
-    subtitleEn: 'Cookie-Editor JSON import with domain inspector, encrypted API keys, and per-project ACLs',
+    title: 'Куки проектов и Секреты',
+    subtitle: 'Импорт куки Cookie-Editor с инспектором доменов, защищённое хранение API-ключей и привязка доступа по проектам',
+    titleEn: 'Project Cookies & Secrets',
+    subtitleEn: 'Cookie-Editor JSON import with domain inspector, protected API keys, and per-project ACLs',
   },
   ai_access: {
     title: 'Доступ ИИ (MCP и /api/v1/)',
@@ -181,8 +181,17 @@ export function App() {
   const [updateModalOpen, setUpdateModalOpen] = useState<boolean>(false);
 
   const [loginUsername, setLoginUsername] = useState<string>('admin');
-  const [loginPassword, setLoginPassword] = useState<string>('admin');
+  const [loginPassword, setLoginPassword] = useState<string>('');
   const [loginError, setLoginError] = useState<string>('');
+  const [toast, setToast] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const showToast = useCallback((text: string, type: 'ok' | 'err' = 'ok') => {
+    setToast({ text, type });
+  }, []);
+  useEffect(() => {
+    if (!toast) return;
+    const tmr = setTimeout(() => setToast(null), 4200);
+    return () => clearTimeout(tmr);
+  }, [toast]);
 
   const [activeTab, setActiveTabState] = useState<NavTab>(() => {
     try {
@@ -250,11 +259,17 @@ export function App() {
         headers.set('Content-Type', 'application/json; charset=utf-8');
       }
       if (csrfToken) headers.set('X-CSRF-Token', csrfToken);
-      return safeFetch(path, {
+      const res = await safeFetch(path, {
         ...options,
         headers,
         credentials: 'same-origin',
       });
+      if (res.status === 401 && path.startsWith('/api/') && path !== '/api/auth/me' && path !== '/api/auth/login') {
+        setAuthenticated(false);
+        setCsrfToken('');
+        setLoginError('Сессия истекла или была завершена. Войдите снова.');
+      }
+      return res;
     },
     [csrfToken]
   );
@@ -273,6 +288,12 @@ export function App() {
             : Promise.resolve(null),
         ]);
 
+        if (dRes.status === 401) {
+          setAuthenticated(false);
+          setCsrfToken('');
+          setLoginError('Сессия истекла. Войдите снова.');
+          return;
+        }
         let projectsUpdated = false;
         if (dRes.ok) {
           const dData = await dRes.json();
@@ -345,37 +366,6 @@ export function App() {
             break;
           }
 
-          let explicitLogout = false;
-          try {
-            explicitLogout = sessionStorage.getItem('beacon_explicit_logout') === '1';
-          } catch {
-            // ignore
-          }
-
-          // Вход с дефолтным паролем 'admin' (если ещё не изменён владельцем и пользователь не нажал Выйти)
-          if (data?.is_default_password && !explicitLogout) {
-            const loginRes = await safeFetch('/api/auth/login', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-              body: JSON.stringify({ username: 'admin', password: 'admin' }),
-              credentials: 'same-origin',
-            });
-            const loginData = await loginRes.json();
-            if (loginData && loginData.__html_fallback) {
-              await new Promise((r) => setTimeout(r, 600));
-              continue;
-            }
-            if (loginRes.ok && loginData && loginData.authenticated) {
-              const cToken = loginData.csrf_token || '';
-              const rRole = loginData.role || 'admin';
-              setAuthenticated(true);
-              setCsrfToken(cToken);
-              setUserRole(rRole);
-              setUsername(loginData.username || 'admin');
-              setIsDefaultPassword(Boolean(loginData.is_default_password));
-              await loadAllData(cToken, rRole);
-            }
-          }
           break;
         }
       } catch (e) {
@@ -503,7 +493,13 @@ export function App() {
       method: 'POST',
       body: JSON.stringify(params ? { params } : {}),
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = data?.detail || 'Не удалось запустить проект';
+      showToast(msg, 'err');
+      throw new Error(msg);
+    }
+    showToast('Проект запущен', 'ok');
     await loadAllData();
     return data;
   };
@@ -513,7 +509,13 @@ export function App() {
       method: 'POST',
       body: JSON.stringify({}),
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = data?.detail || 'Не удалось остановить проект';
+      showToast(msg, 'err');
+      throw new Error(msg);
+    }
+    showToast('Проект остановлен', 'ok');
     await loadAllData();
     return data;
   };
@@ -523,7 +525,13 @@ export function App() {
       method: 'POST',
       body: JSON.stringify({}),
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = data?.detail || 'Не удалось перезапустить проект';
+      showToast(msg, 'err');
+      throw new Error(msg);
+    }
+    showToast('Проект перезапущен', 'ok');
     await loadAllData();
     return data;
   };
@@ -535,12 +543,33 @@ export function App() {
       body: JSON.stringify({ action, project_ids: projectIds }),
     });
     const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      showToast(data?.detail || 'Ошибка группового действия', 'err');
+    } else {
+      showToast(`Групповое действие (${action}) выполнено`, 'ok');
+    }
     await loadAllData();
     return data;
   };
 
   const handleCreateProject = async (payload: Record<string, any>) => {
-    const { initial_cookies_json, create_from_github, ...projectPayload } = payload;
+    const { initial_cookies_json, initial_bot_token, create_from_github, ...projectPayload } = payload;
+
+    const attachInitialBotSecret = async (proj: ProjectItem) => {
+      if (!initial_bot_token) return;
+      const secretName = `${proj.name}_bot_token`.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const sRes = await apiFetch('/api/secrets', {
+        method: 'POST',
+        body: JSON.stringify({ name: secretName, type: 'text', value: initial_bot_token }),
+      });
+      if (sRes.ok) {
+        const nextSecrets = Array.from(new Set([...(proj.secrets || []), secretName]));
+        await apiFetch(`/api/projects/${proj.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({ secrets: nextSecrets }),
+        });
+      }
+    };
 
     if (create_from_github) {
       const res = await apiFetch('/api/projects/git_clone', {
@@ -562,6 +591,8 @@ export function App() {
           }),
         });
       }
+      await attachInitialBotSecret(created);
+      showToast(`Проект «${created.name}» склонирован`, 'ok');
       await loadAllData();
       setSelectedProject(created);
       setWorkspaceSubTab('terminal_git');
@@ -588,7 +619,9 @@ export function App() {
         }),
       });
     }
+    await attachInitialBotSecret(created);
 
+    showToast(`Проект «${created.name}» создан`, 'ok');
     await loadAllData();
     setSelectedProject(created);
     setWorkspaceSubTab('editor');
@@ -627,16 +660,28 @@ export function App() {
 
   const handleDeleteProject = async (id: number, deleteFiles: boolean = false) => {
     const query = deleteFiles ? '?delete_files=true' : '';
-    await apiFetch(`/api/projects/${id}${query}`, { method: 'DELETE' });
+    const res = await apiFetch(`/api/projects/${id}${query}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      showToast(err.detail || 'Не удалось удалить проект', 'err');
+      return;
+    }
+    showToast('Проект удалён', 'ok');
     await loadAllData();
     setActiveTab('dashboard');
   };
 
   const handleAnswerAsk = async (askId: string, answer: string) => {
-    await apiFetch(`/api/asks/${askId}/answer`, {
+    const res = await apiFetch(`/api/asks/${askId}/answer`, {
       method: 'POST',
       body: JSON.stringify({ answer }),
     });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      showToast(err.detail || 'Не удалось отправить ответ', 'err');
+      return;
+    }
+    showToast('Ответ отправлен процессу', 'ok');
     await loadAllData();
   };
 
@@ -694,17 +739,36 @@ export function App() {
   };
 
   const handleExpireCookie = async (name: string) => {
-    await apiFetch(`/api/secrets/${encodeURIComponent(name)}/expire`, {
+    const res = await apiFetch(`/api/secrets/${encodeURIComponent(name)}/expire`, {
       method: 'POST',
       body: JSON.stringify({ note: 'Вызван сигнал beacon.cookies_expired()' }),
     });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      showToast(err.detail || 'Не удалось обновить статус кук', 'err');
+      return;
+    }
+    showToast(`Секрет «${name}» помечен как устаревший`, 'ok');
     await loadAllData();
   };
 
   const handleDeleteSecret = async (name: string) => {
-    await apiFetch(`/api/secrets/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    const res = await apiFetch(`/api/secrets/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      showToast(err.detail || 'Не удалось удалить секрет', 'err');
+      return;
+    }
+    showToast(`Секрет «${name}» удалён`, 'ok');
     await loadAllData();
   };
+
+  useEffect(() => {
+    const isAdminUser = userRole === 'admin';
+    if (!isAdminUser && (activeTab === 'secrets' || activeTab === 'ai_access' || activeTab === 'settings')) {
+      setActiveTab('dashboard');
+    }
+  }, [userRole, activeTab, setActiveTab]);
 
   useEffect(() => {
     const onGlobalKeyDown = (e: KeyboardEvent) => {
@@ -720,7 +784,20 @@ export function App() {
         return;
       }
 
+      const targetEl = e.target as HTMLElement | null;
+      const isTypingTarget = Boolean(
+        targetEl &&
+          (targetEl.tagName === 'INPUT' ||
+            targetEl.tagName === 'TEXTAREA' ||
+            targetEl.tagName === 'SELECT' ||
+            targetEl.isContentEditable)
+      );
+      if (isTypingTarget) {
+        return;
+      }
+
       if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+        const isAdminUser = userRole === 'admin';
         const codeMap: Record<string, NavTab> = {
           Digit1: 'dashboard',
           Digit2: 'projects',
@@ -739,6 +816,9 @@ export function App() {
         };
         const targetTab = codeMap[e.code] || codeMap[e.key];
         if (targetTab) {
+          if (!isAdminUser && (targetTab === 'secrets' || targetTab === 'ai_access' || targetTab === 'settings')) {
+            return;
+          }
           e.preventDefault();
           setActiveTab(targetTab);
         }
@@ -746,7 +826,7 @@ export function App() {
     };
     window.addEventListener('keydown', onGlobalKeyDown);
     return () => window.removeEventListener('keydown', onGlobalKeyDown);
-  }, []);
+  }, [userRole, setActiveTab]);
 
   const handleImportExamples = async () => {
     const res = await apiFetch('/api/projects/import_examples', {
@@ -827,11 +907,12 @@ export function App() {
 
             <div>
               <label htmlFor="beacon-login-password" className="block text-xs text-slate-300 mb-1">
-                Пароль (по умолчанию <code className="font-mono text-indigo-300">admin</code>, меняется в разделе «Настройки»)
+                Пароль
               </label>
               <input
                 id="beacon-login-password"
                 type="password"
+                autoComplete="current-password"
                 placeholder="Введите пароль..."
                 value={loginPassword}
                 onChange={(e) => setLoginPassword(e.target.value)}
@@ -852,34 +933,9 @@ export function App() {
               Войти в панель
             </button>
 
-            <div className="pt-3 border-t border-slate-800/80 space-y-2 text-[11px] text-slate-400">
-              <div className="flex items-center justify-between gap-2 flex-wrap">
-                <span>Быстрая подстановка для превью / тестов:</span>
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setLoginUsername('admin');
-                      setLoginPassword('admin');
-                    }}
-                    className="px-2 py-0.5 font-mono text-[11px] bg-slate-800 hover:bg-slate-700 text-indigo-300 rounded border border-slate-700 cursor-pointer"
-                  >
-                    admin
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setLoginUsername('admin');
-                      setLoginPassword('BeaconAdmin2026!');
-                    }}
-                    className="px-2 py-0.5 font-mono text-[11px] bg-slate-800 hover:bg-slate-700 text-emerald-300 rounded border border-slate-700 cursor-pointer"
-                  >
-                    BeaconAdmin2026!
-                  </button>
-                </div>
-              </div>
+            <div className="pt-3 border-t border-slate-800/80 text-[11px] text-slate-400">
               <p className="text-[10px] text-slate-500">
-                Сброс пароля на сервере через CLI: <code className="font-mono text-slate-300">python3 -m hub --reset-password</code>
+                Сброс пароля на сервере через CLI: <code className="font-mono text-slate-300">python3 -m beacon --reset-password</code>
               </p>
             </div>
           </form>
@@ -893,7 +949,7 @@ export function App() {
   const pendingAiApprovalsCount = dashboard?.system?.pending_ai_approvals_count || 0;
 
   return (
-    <div className="min-h-screen lg:h-screen lg:overflow-hidden bg-[#0b0f17] text-slate-100 flex flex-col pb-16 lg:pb-0">
+    <div className="min-h-screen lg:h-screen overflow-x-hidden lg:overflow-hidden bg-[#0b0f17] text-slate-100 flex flex-col pb-16 lg:pb-0">
       {/* Свёрнутая компактная полоска системных предупреждений (если пользователь свернул баннеры) */}
       {sysBannersCollapsed && (isDefaultPassword || dashboard?.system?.run_as_user === 'root') && (
         <div className="bg-[#111622] border-b border-slate-800 px-4 py-1 text-[11px] text-slate-300 flex items-center justify-between gap-2">
@@ -1074,7 +1130,7 @@ export function App() {
                 title={t('Проверить обновления и обновить панель в 2 клика', 'Check for updates & self-update in 2 clicks')}
               >
                 <DownloadCloud className="w-3 h-3 text-indigo-400" />
-                <span>v2.2</span>
+                <span>v2.4</span>
               </button>
             </div>
 
@@ -1146,90 +1202,94 @@ export function App() {
                 <kbd className="text-[10px] font-mono opacity-60 shrink-0 mt-0.5">Alt+2</kbd>
               </button>
 
-              <button
-                type="button"
-                onClick={() => setActiveTab('secrets')}
-                title={t('Перейти в Куки и Секреты (Alt+3)', 'Go to Cookies & Secrets (Alt+3)')}
-                className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
-                  activeTab === 'secrets'
-                    ? 'bg-indigo-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
-                }`}
-              >
-                <div className="flex items-start gap-2.5 min-w-0">
-                  <KeyRound className="w-4 h-4 mt-0.5 shrink-0" />
-                  <div className="min-w-0">
-                    <div className="text-xs font-semibold">{t('Куки и Секреты (0600)', 'Cookies & Secrets (0600)')}</div>
-                    <div
-                      className={`text-[11px] leading-snug mt-0.5 truncate ${
-                        activeTab === 'secrets' ? 'text-indigo-100' : 'text-slate-400'
-                      }`}
-                    >
-                      {t('Изоляция секретов и Cookie-Editor', 'Secret isolation & Cookie-Editor')}
+              {userRole === 'admin' && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('secrets')}
+                    title={t('Перейти в Куки и Секреты (Alt+3)', 'Go to Cookies & Secrets (Alt+3)')}
+                    className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
+                      activeTab === 'secrets'
+                        ? 'bg-indigo-600 text-white'
+                        : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
+                    }`}
+                  >
+                    <div className="flex items-start gap-2.5 min-w-0">
+                      <KeyRound className="w-4 h-4 mt-0.5 shrink-0" />
+                      <div className="min-w-0">
+                        <div className="text-xs font-semibold">{t('Куки и Секреты', 'Cookies & Secrets')}</div>
+                        <div
+                          className={`text-[11px] leading-snug mt-0.5 truncate ${
+                            activeTab === 'secrets' ? 'text-indigo-100' : 'text-slate-400'
+                          }`}
+                        >
+                          {t('Защищённые секреты и Cookie-Editor', 'Protected secrets & Cookie-Editor')}
+                        </div>
+                      </div>
                     </div>
-                  </div>
-                </div>
-                <kbd className="text-[10px] font-mono opacity-60 shrink-0 mt-0.5">Alt+3</kbd>
-              </button>
+                    <kbd className="text-[10px] font-mono opacity-60 shrink-0 mt-0.5">Alt+3</kbd>
+                  </button>
 
-              <button
-                type="button"
-                onClick={() => setActiveTab('ai_access')}
-                title={t('Перейти в Доступ ИИ (Alt+4)', 'Go to AI / MCP Access (Alt+4)')}
-                className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
-                  activeTab === 'ai_access'
-                    ? 'bg-indigo-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
-                }`}
-              >
-                <div className="flex items-start gap-2.5 min-w-0">
-                  <Bot className="w-4 h-4 mt-0.5 shrink-0" />
-                  <div className="min-w-0">
-                    <div className="text-xs font-semibold">{t('Доступ ИИ (MCP)', 'AI Access (MCP)')}</div>
-                    <div
-                      className={`text-[11px] leading-snug mt-0.5 truncate ${
-                        activeTab === 'ai_access' ? 'text-indigo-100' : 'text-slate-400'
-                      }`}
-                    >
-                      {t('Токены, diff-одобрение, Kill-Switch', 'Tokens, diff approvals, Kill-Switch')}
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('ai_access')}
+                    title={t('Перейти в Доступ ИИ (Alt+4)', 'Go to AI / MCP Access (Alt+4)')}
+                    className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
+                      activeTab === 'ai_access'
+                        ? 'bg-indigo-600 text-white'
+                        : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
+                    }`}
+                  >
+                    <div className="flex items-start gap-2.5 min-w-0">
+                      <Bot className="w-4 h-4 mt-0.5 shrink-0" />
+                      <div className="min-w-0">
+                        <div className="text-xs font-semibold">{t('Доступ ИИ (MCP)', 'AI Access (MCP)')}</div>
+                        <div
+                          className={`text-[11px] leading-snug mt-0.5 truncate ${
+                            activeTab === 'ai_access' ? 'text-indigo-100' : 'text-slate-400'
+                          }`}
+                        >
+                          {t('Токены, diff-одобрение, Kill-Switch', 'Tokens, diff approvals, Kill-Switch')}
+                        </div>
+                      </div>
                     </div>
-                  </div>
-                </div>
-                <div className="flex items-center gap-1.5 shrink-0 mt-0.5">
-                  {pendingAiApprovalsCount > 0 && (
-                    <span className="px-1.5 py-0.5 text-[10px] font-mono font-bold bg-amber-500 text-slate-950 rounded-full">
-                      {pendingAiApprovalsCount}
-                    </span>
-                  )}
-                  <kbd className="text-[10px] font-mono opacity-60">Alt+4</kbd>
-                </div>
-              </button>
+                    <div className="flex items-center gap-1.5 shrink-0 mt-0.5">
+                      {pendingAiApprovalsCount > 0 && (
+                        <span className="px-1.5 py-0.5 text-[10px] font-mono font-bold bg-amber-500 text-slate-950 rounded-full">
+                          {pendingAiApprovalsCount}
+                        </span>
+                      )}
+                      <kbd className="text-[10px] font-mono opacity-60">Alt+4</kbd>
+                    </div>
+                  </button>
 
-              <button
-                type="button"
-                onClick={() => setActiveTab('settings')}
-                title={t('Перейти в Настройки (Alt+5)', 'Go to Settings (Alt+5)')}
-                className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
-                  activeTab === 'settings'
-                    ? 'bg-indigo-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
-                }`}
-              >
-                <div className="flex items-start gap-2.5 min-w-0">
-                  <Settings className="w-4 h-4 mt-0.5 shrink-0" />
-                  <div className="min-w-0">
-                    <div className="text-xs font-semibold">{t('Настройки, Пароль и RBAC', 'Settings, Password & RBAC')}</div>
-                    <div
-                      className={`text-[11px] leading-snug mt-0.5 truncate ${
-                        activeTab === 'settings' ? 'text-indigo-100' : 'text-slate-400'
-                      }`}
-                    >
-                      {t('Смена пароля, Tailscale, роли, бэкап', 'Password, Tailscale, roles, backup')}
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('settings')}
+                    title={t('Перейти в Настройки (Alt+5)', 'Go to Settings (Alt+5)')}
+                    className={`w-full flex items-start justify-between gap-2 px-3 py-2 rounded-xl text-left transition-colors cursor-pointer ${
+                      activeTab === 'settings'
+                        ? 'bg-indigo-600 text-white'
+                        : 'text-slate-300 hover:bg-slate-800/70 hover:text-white'
+                    }`}
+                  >
+                    <div className="flex items-start gap-2.5 min-w-0">
+                      <Settings className="w-4 h-4 mt-0.5 shrink-0" />
+                      <div className="min-w-0">
+                        <div className="text-xs font-semibold">{t('Настройки, Пароль и RBAC', 'Settings, Password & RBAC')}</div>
+                        <div
+                          className={`text-[11px] leading-snug mt-0.5 truncate ${
+                            activeTab === 'settings' ? 'text-indigo-100' : 'text-slate-400'
+                          }`}
+                        >
+                          {t('Смена пароля, Tailscale, роли, бэкап', 'Password, Tailscale, roles, backup')}
+                        </div>
+                      </div>
                     </div>
-                  </div>
-                </div>
-                <kbd className="text-[10px] font-mono opacity-60 shrink-0 mt-0.5">Alt+5</kbd>
-              </button>
+                    <kbd className="text-[10px] font-mono opacity-60 shrink-0 mt-0.5">Alt+5</kbd>
+                  </button>
+                </>
+              )}
 
               {!productionMode && (
                 <button
@@ -1351,24 +1411,26 @@ export function App() {
                 <span>{lang.toUpperCase()}</span>
               </button>
 
-              {/* Кнопка проверки и установки обновлений в 2 клика */}
-              <button
-                type="button"
-                onClick={() => setUpdateModalOpen(true)}
-                aria-label={t('Обновление панели Beacon', 'Beacon Self-Update')}
-                className="px-2.5 py-1.5 text-xs font-semibold text-indigo-200 hover:text-white bg-indigo-950/50 hover:bg-indigo-900/60 border border-indigo-800/60 rounded-lg inline-flex items-center gap-1.5 cursor-pointer"
-                title={t('Проверить обновления в Git и обновить панель в 2 клика', 'Check Git updates & update panel in 2 clicks')}
-              >
-                <DownloadCloud className="w-3.5 h-3.5 text-indigo-400" />
-                <span className="hidden sm:inline">{t('Обновить', 'Update')}</span>
-              </button>
+              {/* Кнопка проверки и установки обновлений в 2 клика (только admin) */}
+              {userRole === 'admin' && (
+                <button
+                  type="button"
+                  onClick={() => setUpdateModalOpen(true)}
+                  aria-label={t('Обновление панели Beacon', 'Beacon Self-Update')}
+                  className="hidden sm:inline-flex px-2.5 py-1.5 text-xs font-semibold text-indigo-200 hover:text-white bg-indigo-950/50 hover:bg-indigo-900/60 border border-indigo-800/60 rounded-lg items-center gap-1.5 cursor-pointer"
+                  title={t('Проверить обновления в Git и обновить панель в 2 клика', 'Check Git updates & update panel in 2 clicks')}
+                >
+                  <DownloadCloud className="w-3.5 h-3.5 text-indigo-400" />
+                  <span className="hidden sm:inline">{t('Обновить', 'Update')}</span>
+                </button>
+              )}
 
               {/* Кнопка тихого режима (Пауза внешних уведомлений на 1 час во время техработ) */}
               {userRole !== 'viewer' && (
                 <button
                   type="button"
                   onClick={handleToggleMaintenanceMute}
-                  className={`px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition-colors inline-flex items-center gap-1.5 cursor-pointer ${
+                  className={`hidden sm:inline-flex px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition-colors items-center gap-1.5 cursor-pointer ${
                     isMaintenanceMuted
                       ? 'bg-amber-950/80 text-amber-300 border-amber-500/50 hover:bg-amber-900'
                       : 'bg-[#111622] text-slate-300 hover:text-white border-slate-800'
@@ -1392,29 +1454,31 @@ export function App() {
                 </button>
               )}
 
-              {/* Кнопка экстренной блокировки ИИ (Пауза ИИ) в шапке (Фаза B.6) */}
-              <button
-                type="button"
-                onClick={handleToggleAiPauseHeader}
-                className={`px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition-colors inline-flex items-center gap-1.5 cursor-pointer ${
-                  dashboard?.system?.ai_access_paused
-                    ? 'bg-amber-950/80 text-amber-300 border-amber-500/50 hover:bg-amber-900'
-                    : 'bg-[#111622] text-slate-300 hover:text-white border-slate-800'
-                }`}
-                title={t('Мгновенно заблокировать или возобновить все запросы ИИ (/mcp и /api/v1/)', 'Immediately pause or resume all AI requests (/mcp & /api/v1/)')}
-              >
-                {dashboard?.system?.ai_access_paused ? (
-                  <>
-                    <PlayCircle className="w-3.5 h-3.5 text-amber-400" />
-                    <span className="hidden sm:inline">{t('ИИ на паузе', 'AI Paused')}</span>
-                  </>
-                ) : (
-                  <>
-                    <PauseCircle className="w-3.5 h-3.5 text-rose-400" />
-                    <span className="hidden sm:inline">{t('Пауза ИИ', 'Pause AI')}</span>
-                  </>
-                )}
-              </button>
+              {/* Кнопка экстренной блокировки ИИ (Пауза ИИ) — только admin */}
+              {userRole === 'admin' && (
+                <button
+                  type="button"
+                  onClick={handleToggleAiPauseHeader}
+                  className={`hidden sm:inline-flex px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition-colors items-center gap-1.5 cursor-pointer ${
+                    dashboard?.system?.ai_access_paused
+                      ? 'bg-amber-950/80 text-amber-300 border-amber-500/50 hover:bg-amber-900'
+                      : 'bg-[#111622] text-slate-300 hover:text-white border-slate-800'
+                  }`}
+                  title={t('Мгновенно заблокировать или возобновить все запросы ИИ (/mcp и /api/v1/)', 'Immediately pause or resume all AI requests (/mcp & /api/v1/)')}
+                >
+                  {dashboard?.system?.ai_access_paused ? (
+                    <>
+                      <PlayCircle className="w-3.5 h-3.5 text-amber-400" />
+                      <span className="hidden sm:inline">{t('ИИ на паузе', 'AI Paused')}</span>
+                    </>
+                  ) : (
+                    <>
+                      <PauseCircle className="w-3.5 h-3.5 text-rose-400" />
+                      <span className="hidden sm:inline">{t('Пауза ИИ', 'Pause AI')}</span>
+                    </>
+                  )}
+                </button>
+              )}
 
               <button
                 type="button"
@@ -1426,13 +1490,26 @@ export function App() {
                 <span className="hidden sm:inline">Ctrl+K</span>
               </button>
 
+              {userRole === 'admin' && (
+                <button
+                  type="button"
+                  onClick={() => setCreateModalOpen(true)}
+                  className="px-3.5 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition-colors whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">{t('Новый проект', 'New Project')}</span>
+                </button>
+              )}
+
+              {/* Кнопка выхода на мобильных экранах (< lg), где скрыт сайдбар */}
               <button
                 type="button"
-                onClick={() => setCreateModalOpen(true)}
-                className="px-3.5 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition-colors whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 cursor-pointer"
+                onClick={handleLogout}
+                aria-label={t('Выйти из аккаунта', 'Log out')}
+                title={`${username} (${userRole}) — ${t('Выйти', 'Log out')}`}
+                className="lg:hidden p-1.5 text-slate-300 hover:text-rose-300 bg-[#111622] border border-slate-800 rounded-lg cursor-pointer"
               >
-                <Plus className="w-3.5 h-3.5" />
-                {t('Новый проект', 'New Project')}
+                <LogOut className="w-4 h-4" />
               </button>
             </div>
           </header>
@@ -1472,6 +1549,7 @@ export function App() {
                 projects={projects}
                 secrets={secrets}
                 system={dashboard?.system || null}
+                userRole={userRole}
                 selectedProject={selectedProject}
                 initialSubTab={workspaceSubTab}
                 onSelectProject={setSelectedProject}
@@ -1540,15 +1618,38 @@ export function App() {
         </div>
       </div>
 
-      {/* Нижний таб-бар только на мобильных экранах (< lg) */}
+      {/* Глобальные Toast-уведомления о результатах действий */}
+      {toast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`fixed right-4 bottom-20 lg:bottom-5 z-50 max-w-sm px-3.5 py-2.5 rounded-xl border shadow-xl text-xs font-medium flex items-center gap-2.5 ${
+            toast.type === 'ok'
+              ? 'bg-emerald-950/95 border-emerald-500/50 text-emerald-100'
+              : 'bg-rose-950/95 border-rose-500/50 text-rose-100'
+          }`}
+        >
+          <span className="flex-1">{toast.text}</span>
+          <button
+            type="button"
+            onClick={() => setToast(null)}
+            aria-label="Закрыть уведомление"
+            className="text-slate-300 hover:text-white text-xs cursor-pointer"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* Нижний таб-бар только на мобильных экранах (< lg), с учётом роли и горизонтальной прокрутки */}
       <nav
         aria-label="Мобильная навигация"
-        className="lg:hidden fixed bottom-0 inset-x-0 z-40 h-14 bg-[#111622] border-t border-slate-800 grid grid-cols-7"
+        className="lg:hidden fixed bottom-0 inset-x-0 z-40 h-14 bg-[#111622] border-t border-slate-800 flex items-stretch overflow-x-auto"
       >
         <button
           type="button"
           onClick={() => setActiveTab('dashboard')}
-          className={`flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium ${
+          className={`flex-1 min-w-[68px] flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium px-1.5 ${
             activeTab === 'dashboard' ? 'text-indigo-400' : 'text-slate-400'
           }`}
         >
@@ -1558,57 +1659,65 @@ export function App() {
         <button
           type="button"
           onClick={() => setActiveTab('projects')}
-          className={`flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium ${
+          className={`flex-1 min-w-[68px] flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium px-1.5 ${
             activeTab === 'projects' ? 'text-indigo-400' : 'text-slate-400'
           }`}
         >
           <FolderCode className="w-4 h-4" />
           Проекты
         </button>
-        <button
-          type="button"
-          onClick={() => setActiveTab('secrets')}
-          className={`flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium ${
-            activeTab === 'secrets' ? 'text-indigo-400' : 'text-slate-400'
-          }`}
-        >
-          <KeyRound className="w-4 h-4" />
-          Секреты
-        </button>
-        <button
-          type="button"
-          onClick={() => setActiveTab('ai_access')}
-          className={`flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium ${
-            activeTab === 'ai_access' ? 'text-indigo-400' : 'text-slate-400'
-          }`}
-        >
-          <Bot className="w-4 h-4" />
-          MCP / ИИ
-        </button>
-        <button
-          type="button"
-          onClick={() => setActiveTab('settings')}
-          className={`flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium ${
-            activeTab === 'settings' ? 'text-indigo-400' : 'text-slate-400'
-          }`}
-        >
-          <Settings className="w-4 h-4" />
-          Настройки
-        </button>
-        <button
-          type="button"
-          onClick={() => setActiveTab('acceptance')}
-          className={`flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium ${
-            activeTab === 'acceptance' ? 'text-indigo-400' : 'text-slate-400'
-          }`}
-        >
-          <CheckSquare className="w-4 h-4" />
-          Doctor
-        </button>
+        {userRole === 'admin' && (
+          <button
+            type="button"
+            onClick={() => setActiveTab('secrets')}
+            className={`flex-1 min-w-[68px] flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium px-1.5 ${
+              activeTab === 'secrets' ? 'text-indigo-400' : 'text-slate-400'
+            }`}
+          >
+            <KeyRound className="w-4 h-4" />
+            Секреты
+          </button>
+        )}
+        {userRole === 'admin' && (
+          <button
+            type="button"
+            onClick={() => setActiveTab('ai_access')}
+            className={`flex-1 min-w-[68px] flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium px-1.5 ${
+              activeTab === 'ai_access' ? 'text-indigo-400' : 'text-slate-400'
+            }`}
+          >
+            <Bot className="w-4 h-4" />
+            ИИ
+          </button>
+        )}
+        {userRole === 'admin' && (
+          <button
+            type="button"
+            onClick={() => setActiveTab('settings')}
+            className={`flex-1 min-w-[68px] flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium px-1.5 ${
+              activeTab === 'settings' ? 'text-indigo-400' : 'text-slate-400'
+            }`}
+          >
+            <Settings className="w-4 h-4" />
+            Настройки
+          </button>
+        )}
+        {!productionMode && (
+          <button
+            type="button"
+            onClick={() => setActiveTab('acceptance')}
+            className={`flex-1 min-w-[68px] flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium px-1.5 ${
+              activeTab === 'acceptance' ? 'text-indigo-400' : 'text-slate-400'
+            }`}
+          >
+            <CheckSquare className="w-4 h-4" />
+            Doctor
+          </button>
+        )}
         <button
           type="button"
           onClick={() => setActiveTab('docs')}
-          className={`flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium ${
+          className={`flex-1 min-w-[68px] flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium px-1.5 ${
             activeTab === 'docs' ? 'text-indigo-400' : 'text-slate-400'
           }`}
         >
@@ -1636,6 +1745,7 @@ export function App() {
         isOpen={commandPaletteOpen}
         onClose={() => setCommandPaletteOpen(false)}
         projects={projects}
+        userRole={userRole}
         onNavigateTab={(tab) => setActiveTab(tab as NavTab)}
         onOpenProject={(p, subTab = 'editor') => {
           setSelectedProject(p);
