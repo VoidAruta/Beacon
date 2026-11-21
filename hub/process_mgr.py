@@ -1291,7 +1291,16 @@ def send_stdin_to_run(run_id: int, text: str, echo_to_log: bool = True) -> bool:
     return False
 
 
-async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str = "") -> bool:
+_STOPPING_RUNS: set[int] = set()
+_BG_TASKS: set[asyncio.Task[Any]] = set()
+
+
+async def stop_run(
+    run_id: int,
+    final_status: str = "stopped",
+    reason_note: str = "",
+    grace_sec: float = 5.0,
+) -> bool:
     """
     Останавливает дерево процессов по PGID + добивает сирот конкретного запуска (_BEACON_RUN_ID),
     а .tmp чистит только если у проекта нет других активных запусков (P0-3).
@@ -1302,7 +1311,10 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
 
     project_id = int(row["project_id"])
     proj = query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
-    if proj and proj["type"] in ("service", "web") and final_status == "stopped" and not _has_other_active_runs(project_id, exclude_run_id=run_id):
+    should_mark_stopped = final_status == "stopped" or (
+        final_status == "killed_oom" and proj is not None and str(proj.get("restart_policy") or "on-failure") == "no"
+    )
+    if proj and proj["type"] in ("service", "web") and should_mark_stopped and not _has_other_active_runs(project_id, exclude_run_id=run_id):
         execute_sql(
             "UPDATE projects SET desired_state = 'stopped', health_status = 'stopped', updated_at = ? WHERE id = ?",
             (int(time.time()), project_id),
@@ -1327,13 +1339,15 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
                 if _get_pgid_processes(int(pgid)):
                     can_signal = True
 
+        escalated_sigkill = False
         if can_signal:
             try:
                 os.killpg(int(pgid), signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
 
-            for _ in range(25):
+            wait_steps = max(1, int(round(max(0.2, float(grace_sec)) / 0.2)))
+            for _ in range(wait_steps):
                 if popen_obj is not None:
                     popen_obj.poll()
                 _reap_zombies()
@@ -1343,6 +1357,7 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
                 await asyncio.sleep(0.2)
 
             if _get_pgid_processes(int(pgid)):
+                escalated_sigkill = True
                 try:
                     os.killpg(int(pgid), signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
@@ -1351,6 +1366,8 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
                 if popen_obj is not None:
                     popen_obj.poll()
                 _reap_zombies()
+    else:
+        escalated_sigkill = False
 
     # Убиваем сирот ТОЛЬКО этого запуска по _BEACON_RUN_ID / _HUB_RUN_ID (P0-3)
     await asyncio.to_thread(kill_orphan_processes_by_run_id, run_id, project_id)
@@ -1372,10 +1389,11 @@ async def stop_run(run_id: int, final_status: str = "stopped", reason_note: str 
         except OSError:
             pass
 
+    term_exit_code = -9 if escalated_sigkill else -15
     execute_sql(
-        """UPDATE runs SET status = ?, finished_at = ?, exit_code = COALESCE(exit_code, -15), error_summary = ?
+        """UPDATE runs SET status = ?, finished_at = ?, exit_code = COALESCE(exit_code, ?), error_summary = ?
            WHERE id = ?""",
-        (final_status, now, reason_note, run_id),
+        (final_status, now, term_exit_code, reason_note, run_id),
     )
     execute_sql(
         "UPDATE pending_asks SET status = 'cancelled' WHERE run_id = ? AND status = 'pending'",
@@ -1649,20 +1667,43 @@ async def watch_processes_loop() -> None:
                         del rss_hist[:-16]
                     info["rss_history"] = rss_hist
 
-                    # 3. Контроль лимита ОЗУ (ram_limit_mb)
+                    # 3. Контроль лимита ОЗУ (ram_limit_mb) — не блокируем сторож на 5 с при остановке
                     ram_limit_mb = int(project.get("ram_limit_mb") or 0)
-                    if ram_limit_mb > 0 and rss_mb > ram_limit_mb:
+                    if ram_limit_mb > 0 and rss_mb > ram_limit_mb and run_id not in _STOPPING_RUNS:
+                        _STOPPING_RUNS.add(run_id)
                         oom_msg = f"Превышен лимит памяти PGID: {rss_mb} МБ > {ram_limit_mb} МБ"
-                        await stop_run(run_id, final_status="killed_oom", reason_note=oom_msg)
-                        tail = _read_log_tail(info["log_path"], max_lines=15)
-                        await send_notification(
-                            f"{oom_msg}. Группа процессов PGID={pgid} принудительно остановлена.",
-                            level="oom",
-                            project_name=project["name"],
-                            log_tail=tail,
-                        )
-                        if _ON_FINISH_CALLBACK and not info.get("is_deps_install"):
-                            await _ON_FINISH_CALLBACK(project, -9, "killed_oom", tail)
+                        proj_snap = dict(project)
+                        log_path_snap = str(info["log_path"])
+                        is_aux_snap = bool(info.get("is_deps_install"))
+                        pgid_snap = pgid
+
+                        async def _handle_oom_kill(
+                            rid: int = run_id,
+                            p_snap: dict[str, Any] = proj_snap,
+                            lp_snap: str = log_path_snap,
+                            aux_snap: bool = is_aux_snap,
+                            pg_snap: int = pgid_snap,
+                            msg_snap: str = oom_msg,
+                        ) -> None:
+                            try:
+                                await stop_run(rid, final_status="killed_oom", reason_note=msg_snap, grace_sec=1.0)
+                                tail = _read_log_tail(lp_snap, max_lines=15)
+                                await send_notification(
+                                    f"{msg_snap}. Группа процессов PGID={pg_snap} принудительно остановлена.",
+                                    level="oom",
+                                    project_name=p_snap["name"],
+                                    log_tail=tail,
+                                )
+                                if _ON_FINISH_CALLBACK and not aux_snap:
+                                    await _ON_FINISH_CALLBACK(p_snap, -9, "killed_oom", tail)
+                            except Exception:
+                                logger.exception("Ошибка обработки OOM для run_id=%s", rid)
+                            finally:
+                                _STOPPING_RUNS.discard(rid)
+
+                        oom_task = asyncio.create_task(_handle_oom_kill())
+                        _BG_TASKS.add(oom_task)
+                        oom_task.add_done_callback(_BG_TASKS.discard)
                         continue
 
                     # 4. Контроль таймаута для задач (type == 'job')

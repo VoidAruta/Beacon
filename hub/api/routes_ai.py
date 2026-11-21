@@ -33,6 +33,7 @@ from hub.db import execute_rowcount, execute_sql, get_setting, log_audit, query_
 from hub.disk_guard import get_disk_status
 from hub.doctor import run_hub_doctor
 from hub.env_detect import get_environment_profile
+from hub.executors import run_in_io_executor
 from hub.notifier import send_notification
 from hub.process_mgr import (
     ACTIVE_RUNS,
@@ -97,8 +98,8 @@ def _scrub_cli_secrets(text: str) -> str:
 def _wrap_untrusted(content: str, source: str) -> str:
     """Оборачивает логи и содержимое файлов проекта в защитный контейнер от prompt injection (P2-02)."""
     redacted = redact_log_text(content or "")
-    # Экранируем любые вхождения тега <untrusted_content> / </untrusted_content> в любом регистре
-    redacted = re.sub(r"<(/?\s*untrusted_content)", r"&lt;\1", redacted, flags=re.IGNORECASE)
+    # Экранируем любые вхождения тега <untrusted_content> / </untrusted_content> / < /untrusted_content> в любом регистре
+    redacted = re.sub(r"<(\s*/?\s*untrusted_content)", r"&lt;\1", redacted, flags=re.IGNORECASE)
     if len(redacted) > MAX_AI_TEXT_CHARS:
         redacted = redacted[:MAX_AI_TEXT_CHARS] + "\n...[TRUNCATED BY BEACON AI SANDBOX]..."
     safe_source = html.escape(str(source or ""), quote=True)
@@ -444,7 +445,7 @@ async def _execute_ai_action_direct(action: str, payload: dict[str, Any]) -> dic
         if runtime not in ("python", "node", "bash"):
             runtime = "python"
         template = str(payload.get("template", runtime)).strip()
-        tpl_info = create_project_from_template(name, template=template, runtime=runtime, proj_type=proj_type)
+        tpl_info = await run_in_io_executor(create_project_from_template, name, template, runtime, proj_type)
         now = int(time.time())
         pid = execute_sql(
             """INSERT INTO projects (
@@ -1059,7 +1060,7 @@ async def mcp_streamable_http_endpoint(request: Request) -> Response:
                     "result": {
                         "protocolVersion": "2025-03-26",
                         "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
-                        "serverInfo": {"name": "beacon-mcp-server", "version": "2.4.0"},
+                        "serverInfo": {"name": "beacon-mcp-server", "version": "2.4.1"},
                     },
                 }
             )
@@ -1186,7 +1187,7 @@ async def mcp_info_endpoint(request: Request) -> Response:
             "protocol": "mcp-streamable-http",
             "protocolVersion": "2025-03-26",
             "server": "beacon-mcp-server",
-            "version": "2.4.0",
+            "version": "2.4.1",
             "tools_count": len(MCP_TOOLS_SPEC),
         }
     )
@@ -1218,7 +1219,7 @@ async def api_v1_openapi_spec(request: Request) -> dict[str, Any]:
         "openapi": "3.1.0",
         "info": {
             "title": "Beacon Control Panel AI & Automation API",
-            "version": "2.4.0",
+            "version": "2.4.1",
             "description": "Стабильный REST API (/api/v1/) и MCP (/mcp) с поддержкой Bearer-токенов, областей прав (scopes) и очереди подтверждения.",
         },
         "components": {

@@ -2,6 +2,22 @@
 
 All notable changes to **Beacon** are documented in this file.
 
+## [2.4.1] - 2026-11-21
+
+### Memory, SQLite WAL & Event-Loop Performance
+- **Single-Thread `scrypt` Executor & `malloc_trim(0)` (`hub/executors.py`, `hub/api/routes_ui.py`):** Routed `verify_password`, `hash_password`, and `verify_dummy_password` through a dedicated single-threaded executor with Linux `malloc_trim(0)` and added `MALLOC_ARENA_MAX=2` to `scripts/zstart_line.sh` and `scripts/beacon.service.template`, reducing post-login panel RSS from ~107.6 MB to ~38.1 MB.
+- **Explicit 2-Worker IO Executor (`hub/executors.py`, `hub/api/routes_ui.py`, `hub/api/routes_ai.py`, `hub/disk_guard.py`):** Offloaded `.venv` project creation (UI and MCP), `/api/logs/search` disk scanning, and disk maintenance to `ThreadPoolExecutor(max_workers=2)` via `loop.run_in_executor`, cutting MCP read latency during concurrent `.venv` creation from 1,428 ms to 4.6 ms p50 and `/api/metrics` / `/api/analytics/summary` p50 under stress from ~315 ms to ~25–27 ms.
+- **SQLite FD Hygiene & Atomic KV Writes (`hub/db.py`, `hub/api/routes_internal.py`):** Closed worker-thread SQLite connections at the end of `db_session()` (eliminating `hub.db`/`hub.db-wal` FD leaks), lowered automatic WAL `TRUNCATE` checkpoint threshold to `2.0 MB`, eliminated the `N+1` query in `/api/logs/search`, and made `PUT /internal/kv/{key}` quota check + upsert atomic in a single transaction.
+
+### Console SSE Streaming & Web UI
+- **Flood-Proof Live Console (`hub/api/routes_ui.py`, `src/components/ProjectsWorkspace.tsx`, `src/utils/hubLogic.ts`):** Capped SSE log reads to `64 KB`/tick with backlog skip (`> 512 KB` → last `256 KB`), offloaded `>= 16 KB` chunk redaction to the IO executor, emitted explicit `"eof": true` terminal events, and added `100 ms` SSE batching, `requestAnimationFrame` scroll coalescing, memoized log filtering, bounded console buffer (`trimConsoleBuffer`: 2,500 lines / 384 KB), and clean `EventSource` shutdown with zero post-completion fallback polling.
+- **Editor Project-Switch Guard & Toast Placement (`src/components/ProjectsWorkspace.tsx`, `src/App.tsx`):** Eliminated stale file content races when switching projects rapidly (`activeProjectIdRef` + `fileLoadSeqRef`) and relocated global Toast notifications to top-center so they do not overlap action buttons.
+
+### Supervisor, Security & Documentation
+- **Expanded Secret Redaction & Anti-Oracle Log Search (`hub/secrets_mgr.py`, `hub/api/routes_ui.py`, `hub/api/routes_ai.py`):** Added URL userinfo (`scheme://user:pass@`), CLI secret flag (`--api-key`, `--password`, `--token`), small UTF-8 `file`-type secret (`<= 64 KB`), and `SECRETS_DIR` path redaction; enforced redact-before-match in `/api/logs/search` so raw secret queries return `0` matches; tightened MCP `<untrusted_content>` escaping to catch `< /untrusted_content>`.
+- **Non-Blocking OOM Kills & Orphan-Safe Boot Autostart (`hub/process_mgr.py`, `hub/scheduler.py`):** Moved OOM kills (`grace_sec=1.0`) to tracked async tasks, recorded `-9` exit code on `SIGKILL` escalation, set `desired_state='stopped'` on `killed_oom` with `restart_policy='no'`, and skipped recovered orphans before `autostart_stagger_sec` with post-sleep DB re-checks.
+- **Version Sync & Docs:** Bumped unified version strings to `2.4.1` across Python packages, MCP/OpenAPI, `package.json`, Web UI, and docs; updated canonical DB path in `AGENTS.md` to `data/hub.db`.
+
 ## [2.4.0] - 2026-11-20
 
 ### Security Audit & Hardening (5-Phase Review)

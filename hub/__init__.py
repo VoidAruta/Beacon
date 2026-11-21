@@ -6,5 +6,5 @@
 
 from sdk.python.beacon import BeaconApiError, ask, cookies_expired, notify, ping, secret, state
 
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 __all__ = ["BeaconApiError", "notify", "secret", "cookies_expired", "ask", "ping", "state", "__version__"]

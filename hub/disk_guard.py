@@ -13,6 +13,7 @@ from typing import Any
 from hub.compat import psutil
 from hub.config import BASE_DIR, DB_PATH, LOGS_DIR
 from hub.db import checkpoint_wal, execute_sql, get_all_settings, query_all
+from hub.executors import run_in_io_executor
 from hub.notifier import send_notification
 
 _LAST_DISK_WARN_TS: float = 0.0
@@ -176,19 +177,19 @@ def rotate_and_prune_logs() -> dict[str, int]:
 
 
 async def check_disk_and_maintain() -> None:
-    """Периодическая проверка диска, ротация логов, чекпоинт SQLite WAL и автобэкап (в worker-потоке)."""
+    """Периодическая проверка диска, ротация логов, чекпоинт SQLite WAL и автобэкап (в ограниченном IO-пуле)."""
     global _LAST_DISK_WARN_TS
-    await asyncio.to_thread(rotate_and_prune_logs)
-    await asyncio.to_thread(checkpoint_wal, 4.0)
+    await run_in_io_executor(rotate_and_prune_logs)
+    await run_in_io_executor(checkpoint_wal, 2.0)
     try:
         from hub.backup_mgr import run_auto_backup_if_due
 
-        await asyncio.to_thread(run_auto_backup_if_due)
+        await run_in_io_executor(run_auto_backup_if_due)
     except Exception:
         from hub.log import get_logger
 
         get_logger("disk_guard").exception("Ошибка выполнения планового автобэкапа")
-    st = await asyncio.to_thread(get_disk_status)
+    st = await run_in_io_executor(get_disk_status)
     now = time.time()
     if st["state"] in ("warning", "critical") and (now - _LAST_DISK_WARN_TS > 3600):
         _LAST_DISK_WARN_TS = now

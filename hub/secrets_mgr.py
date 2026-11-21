@@ -43,6 +43,13 @@ _REGEX_REDACTORS: list[tuple[re.Pattern[str], str]] = [
     ),
     # Authorization: Bearer / Basic <token>
     (re.compile(r"(?i)(Bearer\s+|Basic\s+)[A-Za-z0-9_\-\.~+/=]{12,}"), r"\1***REDACTED_AUTH***"),
+    # Учётные данные в URL (scheme://user:pass@host)
+    (re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s:@]+):([^/\s@]+)@"), r"\1***:***@"),
+    # Секреты в CLI-флагах (--password=..., --api-key=..., --token=...)
+    (
+        re.compile(r"(?i)(--?(?:token|password|passwd|secret|api[-_]?key|auth|bearer)\s*[=\s]\s*)([^\s\"'`]+)"),
+        r"\1***REDACTED_CLI_SECRET***",
+    ),
 ]
 
 # Кэш вариантов секретов (сырых и кодированных) длиной >= 8 символов: list[(secret_name, candidate_str)]
@@ -151,6 +158,37 @@ def reload_redaction_cache() -> None:
         if not fpath.exists():
             continue
         try:
+            if sec_type == "file":
+                try:
+                    fsize = fpath.stat().st_size
+                except OSError:
+                    continue
+                if fsize <= 64 * 1024:
+                    raw_bytes = fpath.read_bytes()
+                    try:
+                        file_text = raw_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        # Бинарный файл (ключ/сертификат DER и т.п.) не индексируем как текст
+                        file_text = ""
+                    if file_text:
+                        stripped_full = file_text.strip()
+                        if _MIN_PLAIN_SECRET_LEN <= len(stripped_full) <= 4096:
+                            items.extend(_expand_secret_variants(name, stripped_full))
+                        for raw_line in file_text.splitlines():
+                            ln = raw_line.strip()
+                            if not ln or ln.startswith("#"):
+                                continue
+                            if ln.startswith("-----BEGIN ") or ln.startswith("-----END "):
+                                continue
+                            if "=" in ln:
+                                _, rhs = ln.split("=", 1)
+                                rhs_clean = rhs.strip().strip('"').strip("'")
+                                if len(rhs_clean) >= _MIN_PLAIN_SECRET_LEN:
+                                    items.extend(_expand_secret_variants(name, rhs_clean))
+                            if len(ln) >= _MIN_PLAIN_SECRET_LEN:
+                                items.extend(_expand_secret_variants(name, ln))
+                continue
+
             content = fpath.read_text(encoding="utf-8", errors="ignore").strip()
             if sec_type == "text" and len(content) >= _MIN_PLAIN_SECRET_LEN:
                 items.extend(_expand_secret_variants(name, content))
@@ -177,7 +215,7 @@ def reload_redaction_cache() -> None:
 def redact_log_text(text: str) -> str:
     """
     Заменяет вхождения значений секретов длиной >= 8 символов (и их URL/JSON/base64 представлений)
-    на ***SECRET:<name>*** и дополнительно маскирует токены по регулярным выражениям.
+    на ***SECRET:<name>***, скрывает путь SECRETS_DIR и маскирует токены/URL/CLI-флаги по регуляркам.
     """
     if not text:
         return text
@@ -187,6 +225,9 @@ def redact_log_text(text: str) -> str:
     for name, secret_val in _REDACTION_CACHE:
         if secret_val and secret_val in result:
             result = result.replace(secret_val, f"***SECRET:{name}***")
+    for sec_dir_str in {str(SECRETS_DIR), str(SECRETS_DIR.resolve())}:
+        if sec_dir_str and sec_dir_str in result:
+            result = result.replace(sec_dir_str, "***SECRETS_DIR***")
     for pattern, replacement in _REGEX_REDACTORS:
         result = pattern.sub(replacement, result)
     return result

@@ -1618,12 +1618,13 @@ export function App() {
         </div>
       </div>
 
-      {/* Глобальные Toast-уведомления о результатах действий */}
+      {/* Глобальные Toast-уведомления о результатах действий (по центру сверху — не перекрывают кнопки консоли и таблиц) */}
       {toast && (
         <div
           role="status"
           aria-live="polite"
-          className={`fixed right-4 bottom-20 lg:bottom-5 z-50 max-w-sm px-3.5 py-2.5 rounded-xl border shadow-xl text-xs font-medium flex items-center gap-2.5 ${
+          data-testid="global-toast"
+          className={`fixed top-16 lg:top-4 left-1/2 -translate-x-1/2 z-50 max-w-md px-3.5 py-2 rounded-xl border shadow-xl text-xs font-medium flex items-center gap-2.5 backdrop-blur-md ${
             toast.type === 'ok'
               ? 'bg-emerald-950/95 border-emerald-500/50 text-emerald-100'
               : 'bg-rose-950/95 border-rose-500/50 text-rose-100'

@@ -373,3 +373,34 @@ test('getRunStatusBadge and getSlaStatusBarColor treat timeout and killed_timeou
   assert.equal(getSlaStatusBarColor('killed_timeout'), 'bg-amber-400');
 });
 
+import { trimConsoleBuffer, isTerminalRunStatus } from './hubLogic';
+
+test('trimConsoleBuffer bounds line and char count while preserving latest tail lines', () => {
+  const shortText = 'line 1\nline 2\nline 3';
+  assert.equal(trimConsoleBuffer(shortText, 10, 1000), shortText);
+
+  const manyLines = Array.from({ length: 120 }, (_, idx) => `row-${idx}`).join('\n');
+  const trimmedByLines = trimConsoleBuffer(manyLines, 20, 100_000);
+  assert.ok(trimmedByLines.startsWith('[Beacon: показан хвост'));
+  assert.ok(trimmedByLines.includes('row-119'));
+  assert.ok(!trimmedByLines.includes('row-0\n'));
+  assert.ok(trimmedByLines.split('\n').length <= 22);
+
+  const hugeChars = Array.from({ length: 200 }, (_, idx) => `chunk-${idx}-` + 'x'.repeat(80)).join('\n');
+  const trimmedByChars = trimConsoleBuffer(hugeChars, 500, 1024);
+  assert.ok(trimmedByChars.length <= 1200);
+  assert.ok(trimmedByChars.includes('chunk-199-'));
+});
+
+test('isTerminalRunStatus distinguishes active vs finished run states', () => {
+  assert.equal(isTerminalRunStatus('running'), false);
+  assert.equal(isTerminalRunStatus('waiting_input'), false);
+  assert.equal(isTerminalRunStatus(''), false);
+  assert.equal(isTerminalRunStatus(null), false);
+  assert.equal(isTerminalRunStatus('success'), true);
+  assert.equal(isTerminalRunStatus('failed'), true);
+  assert.equal(isTerminalRunStatus('stopped'), true);
+  assert.equal(isTerminalRunStatus('killed_oom'), true);
+});
+
+

@@ -62,12 +62,14 @@ import {
   filterLogLinesByLevel,
   formatBytes,
   isSensitiveEnvKey,
+  isTerminalRunStatus,
   LogLevelFilter,
   normalizeProjectGroupTag,
   parseDotEnvText,
   resolveNextSelectedRunId,
   ReverseProxyProvider,
   SCHEDULE_PRESETS,
+  trimConsoleBuffer,
 } from '../utils/hubLogic';
 import {
   DEFAULTS,
@@ -259,6 +261,8 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   const [stdinInput, setStdinInput] = useState<string>('');
   const [stdinStatus, setStdinStatus] = useState<string>('');
   const logBoxRef = useRef<HTMLPreElement | null>(null);
+  const activeProjectIdRef = useRef<number | null>(activeProj?.id ?? null);
+  const fileLoadSeqRef = useRef<number>(0);
 
   useEffect(() => {
     autoSwitchNewRunRef.current = autoSwitchNewRun;
@@ -400,6 +404,10 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
   const [consoleExpanded, setConsoleExpanded] = useState<boolean>(false);
   const [logSearchQuery, setLogSearchQuery] = useState<string>('');
   const [logLevelFilter, setLogLevelFilter] = useState<LogLevelFilter>('all');
+  const filteredLogData = useMemo(
+    () => filterLogLinesByLevel(logText || '', logLevelFilter, logSearchQuery),
+    [logText, logLevelFilter, logSearchQuery]
+  );
   const [webhookDeliveries, setWebhookDeliveries] = useState<
     Array<{
       timestamp: number;
@@ -583,8 +591,14 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     setZipUploadStatus('');
     setWebAuthSession(null);
     setWebAuthStatusMsg('');
+    activeProjectIdRef.current = activeProj.id;
+    fileLoadSeqRef.current += 1;
+
     setSelectedDir('');
     setExplorerFilter('');
+    setActiveFilePath('');
+    setFileContent('');
+    setFileStatus('');
     setOpenTabs([]);
     setSavedContents({});
     setDraftContents({});
@@ -599,7 +613,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     pendingSwitchToNewRunRef.current = false;
     setSelectedRunId(null);
 
-    loadProjectFiles(activeProj.id);
+    loadProjectFiles(activeProj.id, undefined, true);
     loadProjectRuns(activeProj.id);
     loadProjectKv(activeProj.id);
   }, [activeProj?.id]);
@@ -1002,11 +1016,18 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     });
   };
 
-  const loadProjectFiles = async (projId: number, preferPath?: string) => {
+  const loadProjectFiles = async (projId: number, preferPath?: string, resetEditor = false) => {
+    const reqSeq = fileLoadSeqRef.current;
     try {
       const res = await apiFetch(`/api/projects/${projId}/files`);
+      if (activeProjectIdRef.current !== projId || (resetEditor && reqSeq !== fileLoadSeqRef.current)) {
+        return;
+      }
       if (res.ok) {
         const data = await res.json();
+        if (activeProjectIdRef.current !== projId || (resetEditor && reqSeq !== fileLoadSeqRef.current)) {
+          return;
+        }
         const treeNodes: FileTreeNode[] = Array.isArray(data.tree) ? data.tree : [];
         const list: FlatFileEntry[] =
           treeNodes.length > 0
@@ -1030,27 +1051,31 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
 
         const onlyFiles = list.filter((f) => !f.is_dir);
         if (preferPath && onlyFiles.some((f) => f.path === preferPath)) {
-          loadSingleFile(projId, preferPath);
-        } else if (activeFilePath && onlyFiles.some((f) => f.path === activeFilePath)) {
-          loadSingleFile(projId, activeFilePath);
+          loadSingleFile(projId, preferPath, resetEditor);
+        } else if (!resetEditor && activeFilePath && onlyFiles.some((f) => f.path === activeFilePath)) {
+          loadSingleFile(projId, activeFilePath, false);
         } else if (onlyFiles.length > 0) {
           const mainFile =
             onlyFiles.find(
               (f) => f.path === 'main.py' || f.path === 'bot.py' || f.path === 'index.js' || f.path === 'main.sh'
             ) || onlyFiles[0];
-          loadSingleFile(projId, mainFile.path);
+          loadSingleFile(projId, mainFile.path, resetEditor);
         } else {
           setActiveFilePath('');
           setFileContent('');
         }
       }
     } catch (err: any) {
-      setFileStatus(`Ошибка загрузки дерева файлов: ${err?.message || 'Сбой сети'}`);
+      if (activeProjectIdRef.current === projId) {
+        setFileStatus(`Ошибка загрузки дерева файлов: ${err?.message || 'Сбой сети'}`);
+      }
     }
   };
 
   const loadSingleFile = async (projId: number, relPath: string, forceReload = false) => {
     if (!relPath) return;
+    if (activeProjectIdRef.current !== projId) return;
+    const reqSeq = fileLoadSeqRef.current;
     setActiveFilePath(relPath);
     expandParentDirsForPath(relPath);
     if (relPath.includes('/')) {
@@ -1068,8 +1093,14 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     setFileStatus(LABELS.LOADING);
     try {
       const res = await apiFetch(`/api/projects/${projId}/files/content?path=${encodeURIComponent(relPath)}`);
+      if (activeProjectIdRef.current !== projId || reqSeq !== fileLoadSeqRef.current) {
+        return;
+      }
       if (res.ok) {
         const data = await res.json();
+        if (activeProjectIdRef.current !== projId || reqSeq !== fileLoadSeqRef.current) {
+          return;
+        }
         const text = data.content ?? '';
         setFileContent(text);
         setSavedContents((prev) => ({ ...prev, [relPath]: text }));
@@ -1079,7 +1110,9 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
         setFileStatus('Ошибка: не удалось прочитать файл');
       }
     } catch {
-      setFileStatus('Ошибка чтения файла (проверьте сеть)');
+      if (activeProjectIdRef.current === projId) {
+        setFileStatus('Ошибка чтения файла (проверьте сеть)');
+      }
     }
   };
 
@@ -1487,23 +1520,67 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
     return () => clearInterval(timer);
   }, [activeProj?.id, subTab]);
 
-  // Загрузка лога и live-обновление: SSE по умолчанию, а setInterval ТОЛЬКО как fallback при ошибке SSE (Audit #4)
+  // Загрузка лога и live-обновление: SSE с батчингом + кольцевым буфером; fallback-опрос ТОЛЬКО при обрыве активного SSE
   useEffect(() => {
     if (!selectedRunId) return;
     let es: EventSource | null = null;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    let scrollRaf: number | null = null;
+    let pendingChunk = '';
+    let closedByServer = false;
     let cancelled = false;
 
+    const flushPendingChunks = () => {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      if (!pendingChunk || cancelled) {
+        pendingChunk = '';
+        return;
+      }
+      const batch = pendingChunk;
+      pendingChunk = '';
+      setLogText((prev) => trimConsoleBuffer(prev + batch));
+      if (scrollRaf === null) {
+        scrollRaf = requestAnimationFrame(() => {
+          scrollRaf = null;
+          if (logBoxRef.current) {
+            logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
+          }
+        });
+      }
+    };
+
+    const enqueueChunk = (chunk: string) => {
+      if (!chunk || cancelled) return;
+      pendingChunk += chunk;
+      if (pendingChunk.length > 256 * 1024) {
+        pendingChunk = trimConsoleBuffer(pendingChunk);
+      }
+      if (!flushTimer) {
+        flushTimer = setTimeout(flushPendingChunks, 100);
+      }
+    };
+
     const startFallbackPolling = () => {
-      if (cancelled || pollTimer) return;
+      if (cancelled || closedByServer || pollTimer) return;
       pollTimer = setInterval(async () => {
-        if (cancelled) return;
+        if (cancelled || closedByServer) return;
         try {
           const rRes = await apiFetch(`/api/runs/${selectedRunId}/log`);
           if (rRes.ok && !cancelled) {
             const rData = await rRes.json();
             if (typeof rData.log === 'string') {
-              setLogText(rData.log);
+              setLogText(trimConsoleBuffer(rData.log));
+            }
+            if (isTerminalRunStatus(rData.status)) {
+              closedByServer = true;
+              if (pollTimer) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+              }
             }
           }
         } catch {
@@ -1514,18 +1591,22 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
 
     const loadLogAndStream = async () => {
       let startOffset = 0;
+      let alreadyFinished = false;
       try {
         const res = await apiFetch(`/api/runs/${selectedRunId}/log`);
         if (res.ok && !cancelled) {
           const data = await res.json();
-          setLogText(data.log || '');
+          setLogText(trimConsoleBuffer(data.log || ''));
           startOffset = Number(data.log_size || 0);
+          if (isTerminalRunStatus(data.status)) {
+            alreadyFinished = true;
+          }
         }
       } catch {
         // ignore initial log fetch error
       }
 
-      if (cancelled) return;
+      if (cancelled || alreadyFinished) return;
 
       let ticket = '';
       try {
@@ -1552,21 +1633,26 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
           try {
             const payload = JSON.parse(ev.data);
             if (payload.type === 'log' && payload.data) {
-              setLogText((prev) => prev + payload.data);
-              if (logBoxRef.current) {
-                logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
-              }
+              enqueueChunk(String(payload.data));
             } else if (payload.chunk) {
-              setLogText((prev) => prev + payload.chunk);
+              enqueueChunk(String(payload.chunk));
             }
-            if (payload.type === 'eof' || payload.eof) {
+            if (
+              payload.type === 'eof' ||
+              payload.eof ||
+              (payload.type === 'status' && isTerminalRunStatus(payload.status))
+            ) {
+              closedByServer = true;
+              flushPendingChunks();
               es?.close();
+              es = null;
             }
           } catch {
             // ignore malformed event
           }
         };
         es.onerror = () => {
+          if (cancelled || closedByServer) return;
           // Если SSE недоступен или оборвался за прокси — закрываем EventSource и включаем fallback-опрос
           es?.close();
           es = null;
@@ -1583,6 +1669,8 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
       cancelled = true;
       if (es) es.close();
       if (pollTimer) clearInterval(pollTimer);
+      if (flushTimer) clearTimeout(flushTimer);
+      if (scrollRaf !== null) cancelAnimationFrame(scrollRaf);
     };
   }, [selectedRunId]);
 
@@ -3340,9 +3428,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                     </button>
                   </div>
 
-                  {bottomConsoleTab === 'logs' && (() => {
-                    const logStats = filterLogLinesByLevel(logText || '', logLevelFilter, logSearchQuery);
-                    return (
+                  {bottomConsoleTab === 'logs' && (
                       <div className="flex flex-wrap items-center gap-1.5">
                         <div className="inline-flex items-center rounded-lg bg-[#111622] border border-[#1e2638] p-0.5 text-[11px] font-mono">
                           <button
@@ -3352,7 +3438,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                               logLevelFilter === 'all' ? 'bg-indigo-600 text-white font-semibold' : 'text-slate-400 hover:text-white'
                             }`}
                           >
-                            Все ({logStats.totalLines})
+                            Все ({filteredLogData.totalLines})
                           </button>
                           <button
                             type="button"
@@ -3361,7 +3447,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                               logLevelFilter === 'warn_error' ? 'bg-amber-600 text-slate-950 font-semibold' : 'text-amber-300/80 hover:text-amber-200'
                             }`}
                           >
-                            WARN+ ({logStats.warnCount + logStats.errorCount})
+                            WARN+ ({filteredLogData.warnCount + filteredLogData.errorCount})
                           </button>
                           <button
                             type="button"
@@ -3370,7 +3456,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                               logLevelFilter === 'error_only' ? 'bg-rose-600 text-white font-semibold' : 'text-rose-300/80 hover:text-rose-200'
                             }`}
                           >
-                            ERROR ({logStats.errorCount})
+                            ERROR ({filteredLogData.errorCount})
                           </button>
                         </div>
                         <input
@@ -3466,19 +3552,16 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                           </button>
                         )}
                       </div>
-                    );
-                  })()}
+                  )}
                 </div>
 
-                {bottomConsoleTab === 'logs' && (() => {
-                  const filteredLog = filterLogLinesByLevel(logText || '', logLevelFilter, logSearchQuery);
-                  return (
+                {bottomConsoleTab === 'logs' && (
                     <div className="flex flex-col flex-1 min-h-0">
                       <pre
                         ref={logBoxRef}
                         className={`p-3.5 text-xs font-mono text-slate-200 overflow-y-auto whitespace-pre-wrap leading-relaxed bg-[#070b14] ${logHeightCls}`}
                       >
-                        {filteredLog.text || (logLevelFilter !== 'all' || logSearchQuery.trim() ? 'Нет строк лога, совпадающих с выбранным фильтром.' : 'Ожидание вывода процесса...')}
+                        {filteredLogData.text || (logLevelFilter !== 'all' || logSearchQuery.trim() ? 'Нет строк лога, совпадающих с выбранным фильтром.' : 'Ожидание вывода процесса...')}
                       </pre>
 
                     <form
@@ -3503,8 +3586,7 @@ export const ProjectsWorkspace: React.FC<ProjectsWorkspaceProps> = ({
                       </button>
                     </form>
                   </div>
-                  );
-                })()}
+                )}
 
                 {bottomConsoleTab === 'kv' && (
                   <div className="p-3.5 space-y-3 bg-[#070b14] flex-1 overflow-y-auto">

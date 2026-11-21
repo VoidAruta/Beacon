@@ -10,6 +10,7 @@ WorkingDirectory=__BEACON_DIR__
 Environment="BEACON_DIR=__BEACON_DIR__"
 Environment="BEACON_PORT=__BEACON_PORT__"
 Environment="PYTHONUNBUFFERED=1"
+Environment="MALLOC_ARENA_MAX=2"
 ExecStart=__PYTHON_EXEC__ -m beacon
 Restart=always
 RestartSec=3

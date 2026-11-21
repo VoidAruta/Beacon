@@ -331,10 +331,10 @@ const beacon = require('beacon');
         import beacon as top_beacon_pkg
         import hub as top_hub_pkg
 
-        # 1. Top-level packages export ping, BeaconApiError, and version 2.4.0
+        # 1. Top-level packages export ping, BeaconApiError, and version 2.4.1
         self.assertTrue(callable(getattr(top_beacon_pkg, "ping", None)))
         self.assertTrue(callable(getattr(top_hub_pkg, "ping", None)))
-        self.assertEqual(top_hub_pkg.__version__, "2.4.0")
+        self.assertEqual(top_hub_pkg.__version__, "2.4.1")
 
         # 2. Python SDK refuses non-loopback BEACON_API_URL unless BEACON_ALLOW_REMOTE_API=1
         os.environ["BEACON_API_URL"] = "https://evil.example.com/internal"

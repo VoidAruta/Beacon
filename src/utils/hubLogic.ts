@@ -616,6 +616,57 @@ export function filterLogLinesByLevel(
   };
 }
 
+export const CONSOLE_MAX_LINES = 2500;
+export const CONSOLE_MAX_CHARS = 384 * 1024;
+
+/**
+ * Ограничивает размер буфера живой консоли в браузере (кольцевой хвост по символам и строкам),
+ * чтобы поток 5 000+ строк/с не замораживал DOM и главный поток React.
+ */
+export function trimConsoleBuffer(
+  raw: string,
+  maxLines: number = CONSOLE_MAX_LINES,
+  maxChars: number = CONSOLE_MAX_CHARS
+): string {
+  if (!raw) return '';
+  let text = raw;
+  let trimmed = false;
+
+  if (text.length > maxChars) {
+    text = text.slice(text.length - maxChars);
+    const firstNl = text.indexOf('\n');
+    if (firstNl !== -1 && firstNl < text.length - 1) {
+      text = text.slice(firstNl + 1);
+    }
+    trimmed = true;
+  }
+
+  let nlCount = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text.charCodeAt(i) === 10) nlCount += 1;
+  }
+  if (nlCount >= maxLines) {
+    const lines = text.split(/\r?\n/);
+    if (lines.length > maxLines) {
+      text = lines.slice(lines.length - maxLines).join('\n');
+      trimmed = true;
+    }
+  }
+
+  if (!trimmed) return text;
+  const notice = `[Beacon: показан хвост последних ${maxLines} строк — скачайте .log для полной истории]\n`;
+  if (text.startsWith('[Beacon: показан хвост')) {
+    return text;
+  }
+  return notice + text;
+}
+
+/** Возвращает true, если статус запуска терминальный (процесс уже завершён и SSE/поллинг не нужны). */
+export function isTerminalRunStatus(status?: string | null): boolean {
+  if (!status) return false;
+  return status !== 'running' && status !== 'waiting_input';
+}
+
 export const SCHEDULE_PRESETS = [
   { label: 'Каждые 5 мин', type: 'interval' as const, expr: '300' },
   { label: 'Каждые 15 мин', type: 'cron' as const, expr: '*/15 * * * *' },

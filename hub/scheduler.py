@@ -365,29 +365,43 @@ async def autostart_services_on_boot() -> None:
     except ValueError:
         min_free_ram_mb = 64.0
 
-    now = int(time.time())
-    for idx, svc in enumerate(services):
-        proj_id = svc["id"]
-        if idx > 0 and stagger_sec > 0:
+    started_count = 0
+    for svc in services:
+        proj_id = int(svc["id"])
+        if is_project_running(proj_id):
+            continue
+
+        if started_count > 0 and stagger_sec > 0:
             await asyncio.sleep(stagger_sec)
 
+        fresh = query_one("SELECT * FROM projects WHERE id = ?", (proj_id,))
+        if not fresh:
+            continue
+        if fresh["type"] not in ("service", "web"):
+            continue
+        if int(fresh.get("autostart") or 0) != 1 and fresh.get("desired_state") != "running":
+            continue
+        if is_project_running(proj_id):
+            continue
+
         avail_mb = psutil.virtual_memory().available / (1024.0 * 1024.0)
-        req_mb = max(min_free_ram_mb, float(svc.get("ram_limit_mb") or 0))
+        req_mb = max(min_free_ram_mb, float(fresh.get("ram_limit_mb") or 0))
         if req_mb > 0 and avail_mb < req_mb:
             msg = (
-                f"Автозапуск «{svc.get('name')}» пропущен: свободно {round(avail_mb, 1)} МБ ОЗУ "
+                f"Автозапуск «{fresh.get('name')}» пропущен: свободно {round(avail_mb, 1)} МБ ОЗУ "
                 f"(требуется >= {round(req_mb, 1)} МБ)."
             )
             logger.warning(msg)
-            await send_notification(msg, level="warn", project_name=str(svc.get("name") or ""))
+            await send_notification(msg, level="warn", project_name=str(fresh.get("name") or ""))
             continue
 
+        now = int(time.time())
         execute_sql("UPDATE projects SET desired_state = 'running', updated_at = ? WHERE id = ?", (now, proj_id))
-        if not is_project_running(proj_id):
-            try:
-                await start_project_run(proj_id, trigger="autostart")
-            except Exception:
-                logger.exception("Ошибка автозапуска проекта %s (id=%s)", svc.get("name"), proj_id)
+        try:
+            await start_project_run(proj_id, trigger="autostart")
+            started_count += 1
+        except Exception:
+            logger.exception("Ошибка автозапуска проекта %s (id=%s)", fresh.get("name"), proj_id)
 
 
 def get_upcoming_runs(limit: int = 5) -> list[dict[str, Any]]:

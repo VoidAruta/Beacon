@@ -28,6 +28,7 @@ if pgrep -f "python.*-m (beacon|hub)" >/dev/null 2>&1; then
 fi
 
 cd "${BEACON_DIR}" || exit 1
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 export BEACON_DIR BEACON_PORT
 if [ -x "${BEACON_DIR}/.venv/bin/python" ]; then
     nohup "${BEACON_DIR}/.venv/bin/python" -m beacon --port "${BEACON_PORT}" >> "${LOG_FILE}" 2>&1 < /dev/null &

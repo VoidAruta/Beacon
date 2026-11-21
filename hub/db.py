@@ -305,7 +305,10 @@ def db_session() -> Iterator[sqlite3.Connection]:
                 pass
         raise
     finally:
-        _THREAD_LOCAL.tx_depth = max(0, int(getattr(_THREAD_LOCAL, "tx_depth", 1)) - 1)
+        new_depth = max(0, int(getattr(_THREAD_LOCAL, "tx_depth", 1)) - 1)
+        _THREAD_LOCAL.tx_depth = new_depth
+        if new_depth == 0 and threading.current_thread() is not threading.main_thread():
+            close_thread_connection()
 
 
 def query_all(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
@@ -633,10 +636,10 @@ def init_db() -> None:
     invalidate_settings_cache()
 
 
-def checkpoint_wal(truncate_threshold_mb: float = 4.0) -> dict[str, Any]:
+def checkpoint_wal(truncate_threshold_mb: float = 2.0) -> dict[str, Any]:
     """
     Контролирует размер файла data/hub.db-wal и выполняет PRAGMA wal_checkpoint(TRUNCATE)
-    при превышении порога (по умолчанию 4 МБ).
+    при превышении порога (по умолчанию 2 МБ — ниже порога wal_autocheckpoint SQLite).
     """
     wal_path = DB_PATH.with_name(f"{DB_PATH.name}-wal")
     size_before = wal_path.stat().st_size if wal_path.exists() else 0

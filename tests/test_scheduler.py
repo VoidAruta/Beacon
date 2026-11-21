@@ -475,6 +475,43 @@ class TestSchedulerAndTelegram(unittest.TestCase):
 
             asyncio.run(_run())
 
+    def test_autostart_skips_orphans_without_stagger_and_rechecks_db(self) -> None:
+        with temp_hub_env():
+            p_orphan = make_project("orphan-svc", proj_type="service", cmd="sleep 60", autostart=1)
+            p_live = make_project("live-svc", proj_type="service", cmd="sleep 60", autostart=1)
+            p_deleted = make_project("deleted-during-stagger", proj_type="service", cmd="sleep 60", autostart=1)
+            for p in (p_orphan, p_live, p_deleted):
+                execute_sql("UPDATE projects SET autostart = 1, desired_state = 'running' WHERE id = ?", (p["id"],))
+
+            # Mark p_orphan as already running (recovered orphan)
+            ACTIVE_RUNS[7001] = {"run_id": 7001, "project_id": int(p_orphan["id"]), "pid": 54321}
+            set_setting("autostart_stagger_sec", "5")
+
+            sleeps: list[float] = []
+            started_ids: list[int] = []
+
+            async def _fake_sleep(sec: float) -> None:
+                sleeps.append(sec)
+                # Simulate user deleting p_deleted during stagger sleep
+                execute_sql("DELETE FROM projects WHERE id = ?", (p_deleted["id"],))
+
+            async def _fake_start(project_id: int, trigger: str = "manual") -> dict:
+                started_ids.append(project_id)
+                return {"id": 8000 + project_id, "project_id": project_id}
+
+            async def _run() -> None:
+                with patch("hub.scheduler.asyncio.sleep", side_effect=_fake_sleep), patch(
+                    "hub.scheduler.start_project_run", side_effect=_fake_start
+                ):
+                    await sched.autostart_services_on_boot()
+
+            asyncio.run(_run())
+            # Orphan was skipped without starting and without triggering stagger sleep before p_live
+            self.assertEqual(started_ids, [int(p_live["id"])])
+            # Only 1 stagger sleep occurred (before p_deleted, which was then deleted and skipped)
+            self.assertEqual(sleeps, [5.0])
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -2,7 +2,7 @@
 
 # Beacon — Containerless PaaS, супервизор процессов и MCP-сервер (`< 80 МБ ОЗУ`)
 
-[![Version: 2.4.0](https://img.shields.io/badge/Version-2.4.0-indigo.svg)](RELEASE_NOTES.md)
+[![Version: 2.4.1](https://img.shields.io/badge/Version-2.4.1-indigo.svg)](RELEASE_NOTES.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-slate.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Platform: Linux / Raspberry Pi / Android chroot](https://img.shields.io/badge/Platform-Linux%20%7C%20RPi%20%7C%20Android%20chroot-emerald.svg)](#быстрый-старт-установка-в-1-команду)
@@ -228,7 +228,7 @@ python3 -m beacon ai-pause / ai-resume         # Экстренная блоки
 
 ## Безопасность и документация
 
-- **Заметки о релизе (v2.4.0):** [`RELEASE_NOTES.md`](RELEASE_NOTES.md)
+- **Заметки о релизе (v2.4.1):** [`RELEASE_NOTES.md`](RELEASE_NOTES.md)
 - **Политика безопасности:** [`SECURITY.md`](SECURITY.md)
 - **История изменений:** [`CHANGELOG.md`](CHANGELOG.md)
 - **Руководство для контрибьюторов:** [`CONTRIBUTING.md`](CONTRIBUTING.md)

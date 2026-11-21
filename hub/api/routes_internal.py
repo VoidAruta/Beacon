@@ -18,7 +18,7 @@ from typing import Any
 
 from hub.api import APIRouter, HTTPException, Request, parse_int_param, read_json
 from hub.ask_broker import create_ask, poll_ask
-from hub.db import execute_sql, log_audit, query_one
+from hub.db import db_session, execute_sql, log_audit, query_one
 from hub.notifier import send_notification
 from hub.secrets_mgr import get_secret_raw, mark_cookies_expired, validate_secret_name
 
@@ -241,18 +241,25 @@ async def internal_kv_put(request: Request, key: str) -> dict[str, Any]:
     if len(val_json.encode("utf-8")) > 256 * 1024:
         raise HTTPException(status_code=413, detail="Размер значения state превышает лимит 256 КБ")
     proj_id = int(ctx["project_id"])
-    existing_kv = query_one("SELECT 1 FROM project_kv WHERE project_id = ? AND key = ?", (proj_id, clean_key))
-    if not existing_kv:
-        cnt_row = query_one("SELECT COUNT(*) AS cnt FROM project_kv WHERE project_id = ?", (proj_id,))
-        if int((cnt_row or {}).get("cnt") or 0) >= 1000:
-            raise HTTPException(status_code=400, detail="Достигнут лимит 1000 ключей KV на проект")
     now = int(time.time())
-    execute_sql(
-        """INSERT INTO project_kv (project_id, key, value_json, updated_at)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(project_id, key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at""",
-        (proj_id, clean_key, val_json, now),
-    )
+    with db_session() as conn:
+        existing_kv = conn.execute(
+            "SELECT 1 FROM project_kv WHERE project_id = ? AND key = ?",
+            (proj_id, clean_key),
+        ).fetchone()
+        if not existing_kv:
+            cnt_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM project_kv WHERE project_id = ?",
+                (proj_id,),
+            ).fetchone()
+            if int((cnt_row["cnt"] if cnt_row else 0) or 0) >= 1000:
+                raise HTTPException(status_code=400, detail="Достигнут лимит 1000 ключей KV на проект")
+        conn.execute(
+            """INSERT INTO project_kv (project_id, key, value_json, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(project_id, key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at""",
+            (proj_id, clean_key, val_json, now),
+        )
     return {"ok": True, "key": clean_key, "value": val, "updated_at": now}
 
 

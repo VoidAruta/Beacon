@@ -2,7 +2,7 @@
 
 # Beacon — Containerless PaaS, Process Supervisor & MCP Server (`< 80 MB RAM`)
 
-[![Version: 2.4.0](https://img.shields.io/badge/Version-2.4.0-indigo.svg)](RELEASE_NOTES.md)
+[![Version: 2.4.1](https://img.shields.io/badge/Version-2.4.1-indigo.svg)](RELEASE_NOTES.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-slate.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Platform: Linux / Raspberry Pi / Android chroot](https://img.shields.io/badge/Platform-Linux%20%7C%20RPi%20%7C%20Android%20chroot-emerald.svg)](#quick-start-1-command-install)
@@ -228,7 +228,7 @@ See [`.env.example`](.env.example) for the complete template:
 
 ## Security & Documentation
 
-- **Release Notes (v2.4.0):** [`RELEASE_NOTES.md`](RELEASE_NOTES.md)
+- **Release Notes (v2.4.1):** [`RELEASE_NOTES.md`](RELEASE_NOTES.md)
 - **Security Policy:** [`SECURITY.md`](SECURITY.md)
 - **Changelog:** [`CHANGELOG.md`](CHANGELOG.md)
 - **Contributing Guide:** [`CONTRIBUTING.md`](CONTRIBUTING.md)

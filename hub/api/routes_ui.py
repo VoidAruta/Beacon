@@ -81,6 +81,7 @@ from hub.db import execute_sql, get_all_settings, get_setting, init_db, log_audi
 from hub.disk_guard import cleanup_system_caches, get_disk_status
 from hub.doctor import run_hub_doctor
 from hub.env_detect import get_environment_profile
+from hub.executors import run_in_io_executor, run_in_scrypt_executor
 from hub.log import get_logger
 from hub.notifier import RECENT_NOTIFICATIONS, send_notification
 from hub.process_mgr import (
@@ -763,28 +764,28 @@ async def api_login(request: Request) -> Response:
     async with _AUTH_SCRYPT_SEMAPHORE:
         if username in ("", "admin"):
             stored_hash = get_setting("password_hash", "")
-            if await asyncio.to_thread(verify_password, password, stored_hash):
+            if await run_in_scrypt_executor(verify_password, password, stored_hash):
                 auth_ok = True
                 authenticated_role = "admin"
                 authenticated_user = "admin"
                 if needs_password_rehash(stored_hash):
-                    set_setting("password_hash", await asyncio.to_thread(hash_password, password))
+                    set_setting("password_hash", await run_in_scrypt_executor(hash_password, password))
         else:
             user_row = query_one("SELECT * FROM users WHERE username = ?", (username,))
             if user_row:
-                if await asyncio.to_thread(verify_password, password, user_row["password_hash"]):
+                if await run_in_scrypt_executor(verify_password, password, user_row["password_hash"]):
                     auth_ok = True
                     authenticated_role = str(user_row.get("role") or "viewer")
                     authenticated_user = str(user_row["username"])
                     if needs_password_rehash(str(user_row["password_hash"])):
-                        new_h = await asyncio.to_thread(hash_password, password)
+                        new_h = await run_in_scrypt_executor(hash_password, password)
                         execute_sql(
                             "UPDATE users SET password_hash = ? WHERE id = ?",
                             (new_h, int(user_row["id"])),
                         )
             else:
                 # Выравнивание времени ответа при несуществующем пользователе (P1-2)
-                await asyncio.to_thread(verify_dummy_password, password)
+                await run_in_scrypt_executor(verify_dummy_password, password)
 
     if not auth_ok:
         now_blocked, block_sec = record_login_failure(client_ip, username)
@@ -852,12 +853,14 @@ async def api_change_initial_password(request: Request) -> Response:
     if new_password.lower() == "admin":
         raise HTTPException(status_code=400, detail="Новый пароль не может совпадать со стандартным 'admin'")
 
-    if not is_default_password():
-        curr_pw = str(body.get("current_password", ""))
-        if not curr_pw or not verify_password(curr_pw, get_setting("password_hash", "")):
-            raise HTTPException(status_code=400, detail="Укажите действующий текущий пароль (current_password)")
+    async with _AUTH_SCRYPT_SEMAPHORE:
+        if not is_default_password():
+            curr_pw = str(body.get("current_password", ""))
+            if not curr_pw or not await run_in_scrypt_executor(verify_password, curr_pw, get_setting("password_hash", "")):
+                raise HTTPException(status_code=400, detail="Укажите действующий текущий пароль (current_password)")
 
-    set_setting("password_hash", hash_password(new_password))
+        new_hash = await run_in_scrypt_executor(hash_password, new_password)
+    set_setting("password_hash", new_hash)
     set_setting("must_change_password", "0")
     bump_session_epoch()
     log_audit(client_ip, "PASSWORD_CHANGED", "Пароль администратора успешно изменён", actor=_session_actor(request))
@@ -972,9 +975,11 @@ async def api_create_user(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"Пользователь «{username}» уже существует")
 
     now = int(time.time())
+    async with _AUTH_SCRYPT_SEMAPHORE:
+        pw_hash = await run_in_scrypt_executor(hash_password, password)
     uid = execute_sql(
         "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
-        (username, hash_password(password), role, now),
+        (username, pw_hash, role, now),
     )
     invalidate_user_cache(username)
     log_audit(_client_ip(request), "USER_CREATED", f"Создан пользователь {username} (роль: {role})", actor=_session_actor(request))
@@ -997,9 +1002,11 @@ async def api_update_user(request: Request, user_id: int) -> dict[str, Any]:
     if new_password:
         if len(new_password) < 8:
             raise HTTPException(status_code=400, detail="Пароль должен содержать минимум 8 символов")
+        async with _AUTH_SCRYPT_SEMAPHORE:
+            new_pw_hash = await run_in_scrypt_executor(hash_password, new_password)
         execute_sql(
             "UPDATE users SET role = ?, password_hash = ? WHERE id = ?",
-            (new_role, hash_password(new_password), user_id),
+            (new_role, new_pw_hash, user_id),
         )
     else:
         execute_sql("UPDATE users SET role = ? WHERE id = ?", (new_role, user_id))
@@ -1327,7 +1334,7 @@ async def api_create_project(request: Request) -> dict[str, Any]:
     _validate_project_workdir(requested_workdir, name)
 
     template = str(body.get("template", "web" if proj_type == "web" else runtime)).strip()
-    tpl_info = create_project_from_template(name, template=template, runtime=runtime, proj_type=proj_type)
+    tpl_info = await run_in_io_executor(create_project_from_template, name, template, runtime, proj_type)
 
     cmd = str(body.get("cmd") or tpl_info["cmd"]).strip()
     workdir = _validate_project_workdir(str(body.get("workdir") or tpl_info["workdir"]).strip(), name)
@@ -2386,7 +2393,7 @@ async def api_import_example_projects(request: Request) -> dict[str, Any]:
 
         workdir = PROJECTS_DIR / spec["name"]
         if not (workdir / "main.py").exists():
-            create_project_from_template(spec["name"], spec["template"], spec["runtime"], spec["type"])
+            await run_in_io_executor(create_project_from_template, spec["name"], spec["template"], spec["runtime"], spec["type"])
             if spec["code"]:
                 (workdir / "main.py").write_text(spec["code"], encoding="utf-8")
         (LOGS_DIR / spec["name"]).mkdir(parents=True, exist_ok=True)
@@ -3392,7 +3399,7 @@ async def api_project_files(request: Request, project_id: int) -> dict[str, Any]
     tree = _build_file_tree(workdir)
     if not tree:
         tpl = "web" if proj.get("type") == "web" else str(proj.get("runtime") or "python")
-        create_project_from_template(proj["name"], tpl, str(proj.get("runtime") or "python"), str(proj.get("type") or "service"))
+        await run_in_io_executor(create_project_from_template, proj["name"], tpl, str(proj.get("runtime") or "python"), str(proj.get("type") or "service"))
         _invalidate_dir_size_cache(workdir)
         tree = _build_file_tree(workdir)
     return {"workdir": str(workdir), "tree": tree}
@@ -3775,18 +3782,28 @@ async def api_stream_run_log(request: Request, run_id: int) -> StreamingResponse
         offset = initial_offset
         idle_ticks = 0
         line_buf = ""
+        max_sse_chunk = 64 * 1024
+        max_sse_backlog = 512 * 1024
+        keep_tail_on_skip = 256 * 1024
 
-        def _flush_complete_lines(buf: str, flush_all: bool = False) -> tuple[str, str]:
+        async def _redact_maybe_offload(raw_text: str) -> str:
+            if not raw_text:
+                return ""
+            if len(raw_text) >= 16384:
+                return await run_in_io_executor(redact_log_text, raw_text)
+            return redact_log_text(raw_text)
+
+        async def _flush_complete_lines(buf: str, flush_all: bool = False) -> tuple[str, str]:
             if not buf:
                 return "", ""
             if flush_all or len(buf) >= 16384:
-                return redact_log_text(buf), ""
+                return await _redact_maybe_offload(buf), ""
             idx = buf.rfind("\n")
             if idx == -1:
                 return "", buf
             ready = buf[: idx + 1]
             rem = buf[idx + 1 :]
-            return redact_log_text(ready), rem
+            return await _redact_maybe_offload(ready), rem
 
         while True:
             if log_path.exists():
@@ -3796,12 +3813,28 @@ async def api_stream_run_log(request: Request, run_id: int) -> StreamingResponse
                         offset = 0
                         line_buf = ""
                     if sz > offset:
+                        backlog = sz - offset
+                        skip_banner = ""
+                        if backlog > max_sse_backlog:
+                            new_offset = max(offset, sz - keep_tail_on_skip)
+                            skipped_kb = round((new_offset - offset) / 1024.0, 1)
+                            offset = new_offset
+                            line_buf = ""
+                            skip_banner = f"\n--- [Beacon SSE: пропущено {skipped_kb} КБ быстрого вывода] ---\n"
+                        to_read = min(sz - offset, max_sse_chunk)
                         with open(log_path, "rb") as f:
                             f.seek(offset)
-                            chunk = f.read(sz - offset)
+                            chunk = f.read(to_read)
                             offset = f.tell()
-                        line_buf += chunk.decode("utf-8", errors="replace")
-                        out_text, line_buf = _flush_complete_lines(line_buf, flush_all=False)
+                        decoded = chunk.decode("utf-8", errors="replace")
+                        if skip_banner:
+                            nl_pos = decoded.find("\n")
+                            if nl_pos != -1:
+                                decoded = decoded[nl_pos + 1 :]
+                            line_buf = skip_banner + decoded
+                        else:
+                            line_buf += decoded
+                        out_text, line_buf = await _flush_complete_lines(line_buf, flush_all=False)
                         if out_text:
                             payload = json.dumps({"type": "log", "data": out_text}, ensure_ascii=False)
                             yield f"data: {payload}\n\n"
@@ -3814,13 +3847,26 @@ async def api_stream_run_log(request: Request, run_id: int) -> StreamingResponse
                     try:
                         sz = log_path.stat().st_size
                         if sz > offset:
+                            drain_start = offset
+                            drain_skip = ""
+                            if sz - offset > keep_tail_on_skip:
+                                drain_start = sz - keep_tail_on_skip
+                                skipped_kb = round((drain_start - offset) / 1024.0, 1)
+                                drain_skip = f"\n--- [Beacon SSE: пропущено {skipped_kb} КБ быстрого вывода] ---\n"
                             with open(log_path, "rb") as f:
-                                f.seek(offset)
-                                chunk = f.read(sz - offset)
-                            line_buf += chunk.decode("utf-8", errors="replace")
+                                f.seek(drain_start)
+                                chunk = f.read(keep_tail_on_skip)
+                            decoded = chunk.decode("utf-8", errors="replace")
+                            if drain_skip:
+                                nl_pos = decoded.find("\n")
+                                if nl_pos != -1:
+                                    decoded = decoded[nl_pos + 1 :]
+                                line_buf = drain_skip + decoded
+                            else:
+                                line_buf += decoded
                     except OSError:
                         pass
-                out_text, line_buf = _flush_complete_lines(line_buf, flush_all=True)
+                out_text, line_buf = await _flush_complete_lines(line_buf, flush_all=True)
                 if out_text:
                     payload = json.dumps({"type": "log", "data": out_text}, ensure_ascii=False)
                     yield f"data: {payload}\n\n"
@@ -3829,6 +3875,7 @@ async def api_stream_run_log(request: Request, run_id: int) -> StreamingResponse
                         "type": "status",
                         "status": curr["status"] if curr else "stopped",
                         "exit_code": curr["exit_code"] if curr else None,
+                        "eof": True,
                     },
                     ensure_ascii=False,
                 )
@@ -3974,7 +4021,9 @@ async def api_update_settings(request: Request) -> Any:
             raise HTTPException(status_code=400, detail="Новый пароль не может совпадать со стандартным 'admin'")
         if not is_default_password():
             curr_pw = str(body.get("current_password", ""))
-            if not curr_pw or not verify_password(curr_pw, get_setting("password_hash", "")):
+            async with _AUTH_SCRYPT_SEMAPHORE:
+                pw_ok = bool(curr_pw) and await run_in_scrypt_executor(verify_password, curr_pw, get_setting("password_hash", ""))
+            if not pw_ok:
                 raise HTTPException(status_code=400, detail="Укажите действующий текущий пароль (current_password)")
 
     reserved_str = str(body.get("reserved_ports", get_setting("reserved_ports", "")))
@@ -4129,7 +4178,9 @@ async def api_update_settings(request: Request) -> Any:
 
     pw_changed = False
     if new_password:
-        set_setting("password_hash", hash_password(new_password))
+        async with _AUTH_SCRYPT_SEMAPHORE:
+            new_pw_hash = await run_in_scrypt_executor(hash_password, new_password)
+        set_setting("password_hash", new_pw_hash)
         set_setting("must_change_password", "0")
         bump_session_epoch()
         pw_changed = True
@@ -4501,11 +4552,82 @@ _LOG_ERROR_RE = re.compile(r"\b(error|exception|traceback|critical|fatal|errno|o
 _LOG_WARN_RE = re.compile(r"\b(warn|warning|deprecated|retry|timeout)\b|\[warn", re.IGNORECASE)
 
 
+def _scan_project_logs_sync(
+    targets: list[dict[str, Any]],
+    q_lower: str,
+    level: str,
+    limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """
+    Синхронное сканирование хвостов логов (до 256 КБ на файл) в IO-пуле.
+    ВАЖНО (безопасность): redact_log_text() всегда выполняется ДО поиска подстроки q_lower,
+    чтобы исключить side-channel перебор значений секретов через поисковый запрос.
+    """
+    matches: list[dict[str, Any]] = []
+    scanned_projects = 0
+    max_tail_bytes = 256 * 1024
+
+    for item in targets:
+        log_path_raw = item.get("log_path")
+        if not log_path_raw:
+            continue
+        lp = Path(str(log_path_raw))
+        if not lp.exists() or not lp.is_file():
+            continue
+        scanned_projects += 1
+        try:
+            fsize = lp.stat().st_size
+            with lp.open("rb") as fh:
+                if fsize > max_tail_bytes:
+                    fh.seek(fsize - max_tail_bytes)
+                raw_chunk = fh.read(max_tail_bytes)
+            text = redact_log_text(raw_chunk.decode("utf-8", errors="replace"))
+        except OSError:
+            continue
+
+        pid = int(item["project_id"])
+        pname = str(item["project_name"])
+        rid = int(item["run_id"])
+        rstatus = str(item.get("run_status") or "")
+        lines = text.splitlines()
+        for idx in range(len(lines) - 1, -1, -1):
+            ln = lines[idx]
+            if not ln.strip():
+                continue
+            is_err = bool(_LOG_ERROR_RE.search(ln))
+            is_warn = bool(_LOG_WARN_RE.search(ln))
+            line_level = "error" if is_err else ("warn" if is_warn else "info")
+            if level == "error_only" and not is_err:
+                continue
+            if level == "warn_error" and not (is_err or is_warn):
+                continue
+            if q_lower and q_lower not in ln.lower():
+                continue
+            matches.append(
+                {
+                    "project_id": pid,
+                    "project_name": pname,
+                    "run_id": rid,
+                    "run_status": rstatus,
+                    "line_number": idx + 1,
+                    "level": line_level,
+                    "text": ln[:320],
+                }
+            )
+            if len(matches) >= limit:
+                break
+        if len(matches) >= limit:
+            break
+
+    return matches, scanned_projects
+
+
 @router.get("/logs/search")
 async def api_search_all_logs(request: Request) -> dict[str, Any]:
     """
     Кросс-поиск по последним файлам логов всех проектов сразу.
-    Читает только хвост до 256 КБ на файл (без перерасхода ОЗУ) и автоматически редактирует секреты.
+    Выполняется в выделенном IO-пуле (max_workers=2), читает хвост до 256 КБ на файл
+    и маскирует секреты через redact_log_text() ДО поиска подстроки.
     """
     q = (request.query_params.get("q") or "").strip()
     level = (request.query_params.get("level") or "all").strip().lower()
@@ -4526,66 +4648,30 @@ async def api_search_all_logs(request: Request) -> dict[str, Any]:
         }
 
     q_lower = q.lower()
-    projects = query_all("SELECT id, name FROM projects ORDER BY id ASC")
     if proj_filter > 0:
-        projects = [p for p in projects if int(p["id"]) == proj_filter]
-
-    matches: list[dict[str, Any]] = []
-    scanned_projects = 0
-    max_tail_bytes = 256 * 1024
-
-    for proj in projects:
-        pid = int(proj["id"])
-        latest_run = query_one(
-            "SELECT id, status, log_path, started_at FROM runs WHERE project_id = ? AND log_path != '' ORDER BY id DESC LIMIT 1",
-            (pid,),
+        targets = query_all(
+            """SELECT p.id AS project_id, p.name AS project_name,
+                      r.id AS run_id, r.status AS run_status, r.log_path
+               FROM projects p
+               JOIN runs r ON r.id = (
+                   SELECT MAX(r2.id) FROM runs r2 WHERE r2.project_id = p.id AND r2.log_path != ''
+               )
+               WHERE p.id = ?
+               ORDER BY p.id ASC""",
+            (proj_filter,),
         )
-        if not latest_run or not latest_run.get("log_path"):
-            continue
-        lp = Path(str(latest_run["log_path"]))
-        if not lp.exists() or not lp.is_file():
-            continue
-        scanned_projects += 1
-        try:
-            fsize = lp.stat().st_size
-            with lp.open("rb") as fh:
-                if fsize > max_tail_bytes:
-                    fh.seek(fsize - max_tail_bytes)
-                raw_chunk = fh.read(max_tail_bytes)
-            text = redact_log_text(raw_chunk.decode("utf-8", errors="replace"))
-        except OSError:
-            continue
+    else:
+        targets = query_all(
+            """SELECT p.id AS project_id, p.name AS project_name,
+                      r.id AS run_id, r.status AS run_status, r.log_path
+               FROM projects p
+               JOIN runs r ON r.id = (
+                   SELECT MAX(r2.id) FROM runs r2 WHERE r2.project_id = p.id AND r2.log_path != ''
+               )
+               ORDER BY p.id ASC"""
+        )
 
-        lines = text.splitlines()
-        # Сканируем с конца, чтобы сначала показать самые свежие совпадения
-        for idx in range(len(lines) - 1, -1, -1):
-            ln = lines[idx]
-            if not ln.strip():
-                continue
-            is_err = bool(_LOG_ERROR_RE.search(ln))
-            is_warn = bool(_LOG_WARN_RE.search(ln))
-            line_level = "error" if is_err else ("warn" if is_warn else "info")
-            if level == "error_only" and not is_err:
-                continue
-            if level == "warn_error" and not (is_err or is_warn):
-                continue
-            if q_lower and q_lower not in ln.lower():
-                continue
-            matches.append(
-                {
-                    "project_id": pid,
-                    "project_name": proj["name"],
-                    "run_id": int(latest_run["id"]),
-                    "run_status": str(latest_run.get("status") or ""),
-                    "line_number": idx + 1,
-                    "level": line_level,
-                    "text": ln[:320],
-                }
-            )
-            if len(matches) >= limit:
-                break
-        if len(matches) >= limit:
-            break
+    matches, scanned_projects = await run_in_io_executor(_scan_project_logs_sync, targets, q_lower, level, limit)
 
     return {
         "ok": True,
